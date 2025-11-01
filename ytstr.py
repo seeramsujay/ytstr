@@ -7,7 +7,7 @@ import queue
 import time
 import json # Added for JSON parsing
 import logging # Added for logging
-import rich # Color coding
+from rich import print # Color coding
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
