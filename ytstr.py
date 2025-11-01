@@ -7,6 +7,7 @@ import queue
 import time
 import json # Added for JSON parsing
 import logging # Added for logging
+import rich # Color coding
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -97,7 +98,7 @@ class YouTubePlayer:
         download_temp_dir = "/dev/shm/ytstr_download"
         os.makedirs(download_temp_dir, exist_ok=True)
         
-        logging.info(f"Downloading audio for '{title}' to temporary directory {download_temp_dir}...")
+        logging.info(f"[cyan]Downloading audio for '{title}' to temporary directory {download_temp_dir}...[/cyan]")
         try:
             # Use yt-dlp to download audio only, without forcing mp3 format
             # yt-dlp will name the file, we will read its name later
@@ -190,7 +191,7 @@ class YouTubePlayer:
             self.player_process.terminate()
             self.player_process.wait() # Wait for the previous mpv process to terminate
 
-        print(f"Playing: {audio_path}")
+        print(f"[bright_green]Playing: {audio_path} [/bright_green]")
         try:
             self.player_process = subprocess.Popen(
                 ["mpv", "--no-video", "--really-quiet", audio_path],
