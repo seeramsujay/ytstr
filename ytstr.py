@@ -7,6 +7,8 @@ import queue
 import time
 import json # Added for JSON parsing
 import logging # Added for logging
+import argparse # Added for argument parsing
+import random # Added for shuffling
 from rich import print # Color coding
 
 # Configure logging
@@ -291,9 +293,17 @@ class YouTubePlayer:
                 print(f"Error in input listener: {e}")
                 self.stop_event.set()
 
-    def run(self, playlist_url):
+    def shuffle_playlist(self):
+        if self.playlist_info:
+            random.shuffle(self.playlist_info)
+            logging.info("Playlist shuffled.")
+
+    def run(self, playlist_url, shuffle=True):
         if not self.fetch_playlist_urls(playlist_url):
             return
+
+        if shuffle:
+            self.shuffle_playlist()
 
         self.current_index = 0
         self.play_current_song()
@@ -356,14 +366,15 @@ class YouTubePlayer:
 
 if __name__ == "__main__":
     print("ytstr.py script started.") # Added print statement to confirm execution
-    if len(sys.argv) != 2:
-        logging.error("Usage: python ytstr.py <youtube_playlist_url>")
-        sys.exit(1)
 
-    playlist_url = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Play YouTube playlists in the terminal.")
+    parser.add_argument("playlist_url", help="The URL of the YouTube playlist.")
+    parser.add_argument("--no-shuffle", action="store_true", help="Do not shuffle the playlist.")
+    args = parser.parse_args()
+
     player = YouTubePlayer()
     try:
-        player.run(playlist_url)
+        player.run(args.playlist_url, shuffle=not args.no_shuffle)
     except KeyboardInterrupt:
         print("\nExiting player due to user interruption.")
     finally:
