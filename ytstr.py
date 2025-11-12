@@ -1,6 +1,5 @@
 import shutil
 import subprocess
-import os
 import sys
 import threading
 import queue
@@ -10,6 +9,8 @@ import logging # Added for logging
 import argparse # Added for argument parsing
 import random # Added for shuffling
 from rich import print # Color coding
+import mpv # Import the mpv library
+import os # Keep os for file system operations
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,7 +19,18 @@ class YouTubePlayer:
     def __init__(self):
         self.playlist_info = [] # Stores dicts of {'url': url, 'title': title}
         self.current_index = -1
-        self.player_process = None
+        self.player = mpv.MPV(
+            input_default_bindings=True,
+            input_vo_keyboard=True,
+            osc=True, # On-screen controller
+            video='no', # Use 'video=no' instead of 'no_video=True'
+            ytdl=False, # Disable mpv's internal youtube-dl
+            log_handler=logging.debug,
+            loglevel='warn'
+        )
+        self.player.observe_property('time-pos', self._on_time_pos_change)
+        self.player.observe_property('pause', self._on_pause_change)
+        self.player.observe_property('eof-reached', self._on_eof_reached)
         self.cache = {} # Stores paths to downloaded audio files
         self.temp_dir = "/dev/shm/ytstr_cache" # Using RAM for caching
         self.stop_event = threading.Event()
@@ -189,22 +201,13 @@ class YouTubePlayer:
             return None
 
     def play_audio(self, audio_path):
-        if self.player_process and self.player_process.poll() is None:
-            self.player_process.terminate()
-            self.player_process.wait() # Wait for the previous mpv process to terminate
-
         print(f"[bright_green]Playing: {audio_path} [/bright_green]")
         try:
-            self.player_process = subprocess.Popen(
-                ["mpv", "--no-video", "--really-quiet", audio_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except FileNotFoundError:
-            print("Error: mpv not found. Please install mpv to play audio.")
-            sys.exit(1)
+            self.player.command('loadfile', audio_path) # Use command to load file
+            self.player.play()
         except Exception as e:
-            print(f"An error occurred while trying to play audio: {e}")
+            print(f"An error occurred while trying to play audio with mpv: {e}")
+            logging.error(f"MPV playback error: {e}", exc_info=True)
 
     def load_next_prev_cache(self):
         # Determine the range of songs to cache: 1 previous, current, 2 next
@@ -283,14 +286,50 @@ class YouTubePlayer:
             self.play_current_song()
         else:
             print("End of playlist.")
+            self.stop_event.set() # Stop playback when playlist ends
+
+    def previous_song(self):
+        if self.current_index - 1 >= 0:
+            self.current_index -= 1
+            self.play_current_song()
+        else:
+            print("Beginning of playlist.")
+            self.player.seek(0, reference='absolute', precision='exact') # Replay current song from start
+
+    def toggle_pause(self):
+        self.player.pause = not self.player.pause
+        print(f"User: {'Paused' if self.player.pause else 'Resumed'}")
+
+    def _on_time_pos_change(self, property, value):
+        # This callback is triggered when 'time-pos' property changes
+        # Can be used for displaying progress, but for now, just log
+        logging.debug(f"Time position: {value}")
+
+    def _on_pause_change(self, property, value):
+        # This callback is triggered when 'pause' property changes
+        logging.debug(f"Pause state: {value}")
+
+    def _on_eof_reached(self, property, value):
+        # This callback is triggered when end of file is reached
+        if value: # True when EOF is reached
+            print("Current song finished, playing next.")
+            self.next_song()
 
     def _input_listener(self):
+        # This input listener will now primarily handle custom commands
+        # mpv itself will handle its own keybindings for playback control
         while not self.stop_event.is_set():
             try:
+                # Use a non-blocking read if possible, or a small timeout
+                # For simplicity, we'll keep the blocking read for now,
+                # but in a real interactive app, you'd use a library like curses or prompt_toolkit
+                # to handle input without blocking the main thread.
+                # For now, we'll rely on mpv's own input handling for basic controls.
+                # This thread will primarily be for custom commands like next/prev/quit.
                 command = sys.stdin.read(1) # Read one character at a time
                 self.user_input_queue.put(command)
             except Exception as e:
-                print(f"Error in input listener: {e}")
+                logging.error(f"Error in input listener: {e}")
                 self.stop_event.set()
 
     def shuffle_playlist(self):
@@ -314,33 +353,37 @@ class YouTubePlayer:
 
         while not self.stop_event.is_set():
             try:
-                # Check if mpv process has finished
-                if self.player_process and self.player_process.poll() is not None:
-                    print("Current song finished, playing next.")
-                    self.next_song()
-
-                # Process user input
+                # Process user input for custom commands
                 command = self.user_input_queue.get(timeout=0.1)
                 if command == '>':
                     print("User: Next song (>)")
                     self.next_song()
                 elif command == '<':
                     print("User: Previous song (<)")
-                    current_time = self._get_mpv_time_pos() # This will always be 0 now
-                    if current_time < 5: # If within first 5 seconds
+                    # Check if current song is near the beginning to go to previous
+                    if self.player.time_pos is not None and self.player.time_pos < 5:
                         self.previous_song()
                     else:
-                        # Replay current song (by restarting mpv with current song)
-                        self.play_current_song()
+                        # Replay current song
+                        self.player.seek(0, reference='absolute', precision='exact')
+                        print("User: Replaying current song.")
+                elif command == ' ': # Spacebar for pause/resume
+                    self.toggle_pause()
                 elif command == 'q':
                     print("User: Quit (q)")
                     self.stop_event.set()
-                # Add other key bindings here if needed, e.g., for pause/resume
-                # For rewind/forward, mpv's default keybindings will work directly in the terminal
+                elif command == 'r': # Rewind 10 seconds
+                    self.player.seek(-10)
+                    print("User: Rewind 10 seconds (r)")
+                elif command == 'f': # Forward 10 seconds
+                    self.player.seek(10)
+                    print("User: Forward 10 seconds (f)")
             except queue.Empty:
-                pass # No input, continue loop
+                # Check if mpv has finished playing the current song
+                # This is handled by the _on_eof_reached observer now
+                pass
             except Exception as e:
-                print(f"Error in main loop: {e}")
+                logging.error(f"Error in main loop: {e}")
                 self.stop_event.set()
 
         self.cleanup()
@@ -350,13 +393,10 @@ class YouTubePlayer:
         print("Cleaning up temporary files...")
         self.stop_event.set() # Signal listener thread to stop
         
-        # Terminate mpv process if still running
-        if self.player_process and self.player_process.poll() is None:
-            print("Terminating mpv process in cleanup")
-            self.player_process.terminate()
-            self.player_process.wait() # Ensure mpv process is terminated
-        else:
-            print("No mpv process to terminate in cleanup")
+        # Terminate mpv player
+        if self.player:
+            print("Stopping mpv player in cleanup")
+            self.player.quit()
 
         for _, path in self.cache.items():
             if os.path.exists(path):
