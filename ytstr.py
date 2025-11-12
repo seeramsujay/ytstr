@@ -203,8 +203,8 @@ class YouTubePlayer:
     def play_audio(self, audio_path):
         print(f"[bright_green]Playing: {audio_path} [/bright_green]")
         try:
-            self.player.command('loadfile', audio_path) # Use command to load file
-            self.player.play()
+            self.player.command('loadfile', audio_path) # Use command to load file and start playback
+            # self.player.play() # Removed as loadfile command should initiate playback
         except Exception as e:
             print(f"An error occurred while trying to play audio with mpv: {e}")
             logging.error(f"MPV playback error: {e}", exc_info=True)
