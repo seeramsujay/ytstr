@@ -1,0 +1,326 @@
+#!/bin/bash
+
+# ytstr - YouTube Streamer with Playlist Management
+# Stream YouTube playlists with intelligent caching
+
+CACHE_DIR="/dev/shm/ytstr_$$"
+PLAYLIST_FILE="$HOME/.config/ytstr/playlists"
+SHUFFLE=true
+
+# Ensure config directory exists
+mkdir -p "$(dirname "$PLAYLIST_FILE")"
+touch "$PLAYLIST_FILE"
+
+# Colors for better UI
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Show usage
+show_usage() {
+    echo "Usage: $0 [OPTIONS] [PLAYLIST_NUMBER|URL]"
+    echo ""
+    echo "Options:"
+    echo "  --list              List saved playlists"
+    echo "  --add <name> <url>  Add a new playlist"
+    echo "  --remove <number>   Remove a playlist"
+    echo "  --no-shuffle        Disable playlist shuffling"
+    echo ""
+    echo "Examples:"
+    echo "  $0                           # Interactive playlist selection"
+    echo "  $0 1                         # Play playlist #1"
+    echo "  $0 'https://youtube.com/...' # Play URL directly"
+    echo "  $0 --add 'Chill' 'https://youtube.com/playlist?list=...'"
+    echo "  $0 --remove 2"
+}
+
+# List playlists
+list_playlists() {
+    if [[ ! -s "$PLAYLIST_FILE" ]]; then
+        echo -e "${YELLOW}No playlists saved yet.${NC}"
+        echo "Add one with: $0 --add <name> <url>"
+        return
+    fi
+    
+    echo -e "${CYAN}Saved Playlists:${NC}"
+    local i=1
+    while IFS='|' read -r name url; do
+        echo -e "${GREEN}$i.${NC} $name"
+        echo -e "   ${BLUE}$url${NC}"
+        ((i++))
+    done < "$PLAYLIST_FILE"
+}
+
+# Add playlist
+add_playlist() {
+    local name="$1"
+    local url="$2"
+    
+    if [[ -z "$name" || -z "$url" ]]; then
+        echo -e "${RED}Error: Both name and URL are required${NC}"
+        echo "Usage: $0 --add <name> <url>"
+        exit 1
+    fi
+    
+    echo "$name|$url" >> "$PLAYLIST_FILE"
+    echo -e "${GREEN}✓ Added playlist: $name${NC}"
+}
+
+# Remove playlist
+remove_playlist() {
+    local num="$1"
+    
+    if [[ ! "$num" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Error: Please provide a valid playlist number${NC}"
+        exit 1
+    fi
+    
+    local total=$(wc -l < "$PLAYLIST_FILE")
+    if [[ $num -lt 1 || $num -gt $total ]]; then
+        echo -e "${RED}Error: Playlist number out of range (1-$total)${NC}"
+        exit 1
+    fi
+    
+    local name=$(sed -n "${num}p" "$PLAYLIST_FILE" | cut -d'|' -f1)
+    sed -i "${num}d" "$PLAYLIST_FILE"
+    echo -e "${GREEN}✓ Removed playlist: $name${NC}"
+}
+
+# Select playlist interactively
+select_playlist() {
+    if [[ ! -s "$PLAYLIST_FILE" ]]; then
+        echo -e "${YELLOW}No playlists saved yet.${NC}"
+        echo "Add one with: $0 --add <name> <url>"
+        exit 0
+    fi
+    
+    echo -e "${CYAN}Select a playlist:${NC}"
+    local i=1
+    while IFS='|' read -r name url; do
+        echo -e "${GREEN}$i.${NC} $name"
+        ((i++))
+    done < "$PLAYLIST_FILE"
+    
+    echo -ne "\n${YELLOW}Enter playlist number:${NC} "
+    read -r choice
+    
+    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Invalid choice${NC}"
+        exit 1
+    fi
+    
+    local selected=$(sed -n "${choice}p" "$PLAYLIST_FILE")
+    if [[ -z "$selected" ]]; then
+        echo -e "${RED}Invalid playlist number${NC}"
+        exit 1
+    fi
+    
+    echo "$selected" | cut -d'|' -f2
+}
+
+# Get playlist by number
+get_playlist_by_number() {
+    local num="$1"
+    local selected=$(sed -n "${num}p" "$PLAYLIST_FILE")
+    
+    if [[ -z "$selected" ]]; then
+        echo -e "${RED}Error: Playlist #$num not found${NC}"
+        exit 1
+    fi
+    
+    echo "$selected" | cut -d'|' -f2
+}
+
+# Parse arguments
+PLAYLIST_URL=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --list)
+            list_playlists
+            exit 0
+            ;;
+        --add)
+            add_playlist "$2" "$3"
+            exit 0
+            ;;
+        --remove)
+            remove_playlist "$2"
+            exit 0
+            ;;
+        --no-shuffle)
+            SHUFFLE=false
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                # It's a playlist number
+                PLAYLIST_URL=$(get_playlist_by_number "$1")
+            else
+                # It's a URL
+                PLAYLIST_URL="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# If no URL provided, show interactive selection
+if [[ -z "$PLAYLIST_URL" ]]; then
+    PLAYLIST_URL=$(select_playlist)
+fi
+
+# Create cache directory
+mkdir -p "$CACHE_DIR"
+
+# Cleanup function
+cleanup() {
+    echo -e "\n${YELLOW}Cleaning up cache...${NC}"
+    rm -rf "$CACHE_DIR"
+    exit 0
+}
+
+trap cleanup EXIT INT TERM
+
+# Get playlist items
+echo -e "${CYAN}Fetching playlist...${NC}"
+mapfile -t PLAYLIST < <(yt-dlp --flat-playlist --get-id "$PLAYLIST_URL")
+
+if [[ ${#PLAYLIST[@]} -eq 0 ]]; then
+    echo -e "${RED}Error: Could not fetch playlist or playlist is empty${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Found ${#PLAYLIST[@]} videos${NC}"
+
+# Shuffle if enabled
+if [[ "$SHUFFLE" == true ]]; then
+    echo -e "${YELLOW}Shuffling playlist...${NC}"
+    PLAYLIST=($(printf '%s\n' "${PLAYLIST[@]}" | shuf))
+fi
+
+# Download function
+download_video() {
+    local video_id="$1"
+    local output_file="$CACHE_DIR/${video_id}.opus"
+    
+    if [[ ! -f "$output_file" ]]; then
+        yt-dlp -f 'bestaudio' -x --audio-format opus \
+            -o "$output_file" \
+            "https://www.youtube.com/watch?v=${video_id}" \
+            --no-playlist --quiet 2>/dev/null &
+    fi
+}
+
+# Preload function - downloads current, next 2, and previous 1
+preload_songs() {
+    local current_idx=$1
+    
+    # Download current
+    download_video "${PLAYLIST[$current_idx]}"
+    
+    # Download next 2
+    for i in 1 2; do
+        local next_idx=$((current_idx + i))
+        if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
+            download_video "${PLAYLIST[$next_idx]}"
+        fi
+    done
+    
+    # Download previous 1
+    if [[ $current_idx -gt 0 ]]; then
+        local prev_idx=$((current_idx - 1))
+        download_video "${PLAYLIST[$prev_idx]}"
+    fi
+}
+
+# Cleanup old cache files
+cleanup_cache() {
+    local current_idx=$1
+    local keep_files=()
+    
+    # Keep current song
+    keep_files+=("${PLAYLIST[$current_idx]}")
+    
+    # Keep next 2
+    for i in 1 2; do
+        local next_idx=$((current_idx + i))
+        if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
+            keep_files+=("${PLAYLIST[$next_idx]}")
+        fi
+    done
+    
+    # Keep previous 1
+    if [[ $current_idx -gt 0 ]]; then
+        local prev_idx=$((current_idx - 1))
+        keep_files+=("${PLAYLIST[$prev_idx]}")
+    fi
+    
+    # Remove files not in keep list
+    for file in "$CACHE_DIR"/*.opus; do
+        [[ -f "$file" ]] || continue
+        local basename=$(basename "$file" .opus)
+        local keep=false
+        for id in "${keep_files[@]}"; do
+            if [[ "$basename" == "$id" ]]; then
+                keep=true
+                break
+            fi
+        done
+        if [[ "$keep" == false ]]; then
+            rm -f "$file"
+        fi
+    done
+}
+
+# Main playback loop
+current_idx=0
+
+echo -e "${CYAN}Starting playback...${NC}"
+echo -e "${YELLOW}Tip: Use all your favorite mpv shortcuts! (Space=pause, 9/0=volume, <>=prev/next, q=quit song, Shift+q=quit player)${NC}\n"
+
+while [[ $current_idx -ge 0 && $current_idx -lt ${#PLAYLIST[@]} ]]; do
+    video_id="${PLAYLIST[$current_idx]}"
+    audio_file="$CACHE_DIR/${video_id}.opus"
+    
+    # Start preloading
+    preload_songs "$current_idx"
+    
+    # Wait for current file to be ready
+    while [[ ! -f "$audio_file" ]]; do
+        sleep 0.5
+    done
+    
+    # Wait a bit more to ensure file is complete
+    sleep 1
+    
+    # Play with mpv - full interactive mode with all shortcuts!
+    mpv --no-video \
+        --term-playing-msg="${GREEN}[${playlist-pos-1}/${playlist-count}]${NC} ${media-title}" \
+        --input-ipc-server="$CACHE_DIR/mpv-socket" \
+        "$audio_file"
+    
+    exit_code=$?
+    
+    # Cleanup old cache
+    cleanup_cache "$current_idx"
+    
+    # Handle mpv exit code
+    # 0 = normal exit (song ended, move to next)
+    # 4 = user pressed Shift+q (quit completely)
+    if [[ $exit_code -eq 4 ]]; then
+        echo -e "${YELLOW}Quitting...${NC}"
+        break
+    fi
+    
+    # Default: move to next song
+    current_idx=$((current_idx + 1))
+done
+
+echo -e "${GREEN}Playlist finished!${NC}"

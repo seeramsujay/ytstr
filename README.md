@@ -35,12 +35,40 @@ Before you can use `ytstr`, you need to have the following installed:
    ```
 2. Ensure `yt-dlp` and `mpv` are installed as per the prerequisites.
 
+## Making `ytstr` Executable and Available in Your Environment
+
+To use `ytstr` seamlessly from any directory, you can make the `ytstr` script executable and add it to your system's PATH.
+
+1.  **Make the script executable:**
+    ```bash
+    chmod +x ytstr
+    ```
+
+2.  **Move the script to a directory in your PATH:**
+    You can move it to `/usr/local/bin` (for system-wide access) or `~/.local/bin` (for user-specific access). If `~/.local/bin` is not in your PATH, you'll need to add it.
+
+    For system-wide access (requires sudo):
+    ```bash
+    sudo mv ytstr /usr/local/bin/
+    ```
+
+    For user-specific access:
+    ```bash
+    mkdir -p ~/.local/bin
+    mv ytstr ~/.local/bin/
+    ```
+    If `~/.local/bin` is not already in your PATH, add the following line to your shell's configuration file (e.g., `~/.bashrc`, `~/.zshrc`, or `~/.profile`):
+    ```bash
+    export PATH="$HOME/.local/bin:$PATH"
+    ```
+    After adding, apply the changes by running `source ~/.bashrc` (or your respective config file).
+
 ## Usage
 
-To play a YouTube playlist, simply run the script with the playlist URL as an argument:
+To play a YouTube playlist, simply run `ytstr` with the playlist URL as an argument:
 
 ```bash
-python ytstr.py "YOUR_YOUTUBE_PLAYLIST_URL"
+ytstr "YOUR_YOUTUBE_PLAYLIST_URL"
 ```
 
 By default, the playlist will be shuffled.
