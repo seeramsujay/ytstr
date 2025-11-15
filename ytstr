@@ -188,9 +188,15 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# Get playlist items
+# Get playlist items with titles in ONE call
 echo -e "${CYAN}Fetching playlist...${NC}"
-mapfile -t PLAYLIST < <(yt-dlp --flat-playlist --get-id "$PLAYLIST_URL")
+declare -A VIDEO_TITLES
+
+# Fetch IDs and titles together
+while IFS='|' read -r video_id title; do
+    PLAYLIST+=("$video_id")
+    VIDEO_TITLES["$video_id"]="$title"
+done < <(yt-dlp --flat-playlist --print "%(id)s|%(title)s" "$PLAYLIST_URL")
 
 if [[ ${#PLAYLIST[@]} -eq 0 ]]; then
     echo -e "${RED}Error: Could not fetch playlist or playlist is empty${NC}"
@@ -279,31 +285,58 @@ cleanup_cache() {
     done
 }
 
+# Create MPV input config for next/previous
+MPV_INPUT_CONF="$CACHE_DIR/input.conf"
+cat > "$MPV_INPUT_CONF" << 'EOF'
+> quit 0
+< quit 2
+NEXT quit 0
+PREV quit 2
+EOF
+
 # Main playback loop
 current_idx=0
 
 echo -e "${CYAN}Starting playback...${NC}"
-echo -e "${YELLOW}Tip: Use all your favorite mpv shortcuts! (Space=pause, 9/0=volume, <>=prev/next, q=quit song, Shift+q=quit player)${NC}\n"
+echo -e "${YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit${NC}\n"
 
 while [[ $current_idx -ge 0 && $current_idx -lt ${#PLAYLIST[@]} ]]; do
     video_id="${PLAYLIST[$current_idx]}"
     audio_file="$CACHE_DIR/${video_id}.opus"
     
-    # Start preloading
+    # Start preloading first
     preload_songs "$current_idx"
     
     # Wait for current file to be ready
     while [[ ! -f "$audio_file" ]]; do
-        sleep 0.5
+        sleep 0.1
     done
     
     # Wait a bit more to ensure file is complete
-    sleep 1
+    sleep 0.5
     
-    # Play with mpv - full interactive mode with all shortcuts!
+    # Display song title (already fetched!)
+    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    song_title="${VIDEO_TITLES[$video_id]}"
+    echo -e "${GREEN}[$((current_idx + 1))/${#PLAYLIST[@]}]${NC} ${YELLOW}${song_title}${NC}"
+    
+    # Show next song if cached
+    next_idx=$((current_idx + 1))
+    if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
+        next_video_id="${PLAYLIST[$next_idx]}"
+        next_audio_file="$CACHE_DIR/${next_video_id}.opus"
+        if [[ -f "$next_audio_file" ]]; then
+            next_title="${VIDEO_TITLES[$next_video_id]}"
+            echo -e "\033[2m  ↪ Next: ${next_title}\033[0m"
+        fi
+    fi
+    
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Play with mpv
     mpv --no-video \
-        --term-playing-msg="${GREEN}[${playlist-pos-1}/${playlist-count}]${NC} ${media-title}" \
-        --input-ipc-server="$CACHE_DIR/mpv-socket" \
+        --input-conf="$MPV_INPUT_CONF" \
+        --term-status-msg='Time: ${time-pos} / ${duration}' \
         "$audio_file"
     
     exit_code=$?
@@ -311,16 +344,22 @@ while [[ $current_idx -ge 0 && $current_idx -lt ${#PLAYLIST[@]} ]]; do
     # Cleanup old cache
     cleanup_cache "$current_idx"
     
-    # Handle mpv exit code
-    # 0 = normal exit (song ended, move to next)
-    # 4 = user pressed Shift+q (quit completely)
+    # Handle mpv exit codes
+    # 0 = normal exit or '>' pressed (next)
+    # 2 = '<' pressed (previous)
+    # 4 = Shift+q pressed (quit)
     if [[ $exit_code -eq 4 ]]; then
         echo -e "${YELLOW}Quitting...${NC}"
         break
+    elif [[ $exit_code -eq 2 ]]; then
+        # Previous song
+        if [[ $current_idx -gt 0 ]]; then
+            current_idx=$((current_idx - 1))
+        fi
+    else
+        # Next song (exit code 0 or anything else)
+        current_idx=$((current_idx + 1))
     fi
-    
-    # Default: move to next song
-    current_idx=$((current_idx + 1))
 done
 
 echo -e "${GREEN}Playlist finished!${NC}"
