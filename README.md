@@ -30,7 +30,7 @@ Before you can use `ytstr`, you need to have the following installed:
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/SuzayKid/ytstr.git
+   git clone https://github.com/seeramsujay/ytstr.git
    cd ytstr
    ```
 2. Ensure `yt-dlp` and `mpv` are installed as per the prerequisites.
