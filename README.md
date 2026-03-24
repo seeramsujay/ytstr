@@ -2,7 +2,7 @@
 
 A fast, terminal-native YouTube playlist streamer with intelligent RAM caching and Spotify-style crossfade mixing.
 
-`ytstr` streams YouTube playlists through `yt-dlp` and `mpv`, caching audio in `/dev/shm` (RAM) for instant playback. It preloads upcoming tracks, evicts old ones automatically, and supports seamless crossfade transitions between songs — just like Spotify's mix feature.
+`ytstr` streams YouTube playlists through the `yt_dlp` and `python-mpv` libraries, caching audio in `/dev/shm` (RAM) for instant playback. It completely bypasses terminal execution limits by controlling dual `libmpv` player instances directly in Python, seamlessly crossfading transitions between songs — just like Spotify's mix feature.
 
 ## Features
 
@@ -16,11 +16,12 @@ A fast, terminal-native YouTube playlist streamer with intelligent RAM caching a
 
 ## Prerequisites
 
+This is a Python 3 based tool.
+
 | Tool | Install |
 |------|---------|
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | `pip install yt-dlp` or `sudo pacman -S yt-dlp` |
-| [mpv](https://mpv.io/) | `sudo apt install mpv` / `sudo pacman -S mpv` / `brew install mpv` |
-| coreutils (`shuf`) | Pre-installed on most Linux distros |
+| Python Deps | `pip install yt-dlp python-mpv` |
+| [mpv](https://mpv.io/) | `sudo apt install libmpv-dev mpv` |
 
 ## Installation
 
@@ -120,11 +121,11 @@ ytstr --remove 2
 
 ### Crossfade Pipeline
 
-1. A Lua script inside mpv polls `time-remaining` every 200ms
-2. When remaining time ≤ 5 seconds, it applies a fade-out filter and writes a trigger file
-3. The main bash loop detects the trigger and immediately starts the next track with a fade-in filter
-4. Leading silence is stripped via `silenceremove` so the new track's audio starts instantly
-5. Both tracks briefly overlap, creating a smooth Spotify-like transition
+1. The Python `YtstrPlayer` orchestrates two distinct `python-mpv` `MPV` instances (`player_a` and `player_b`).
+2. An event listener attached to the active player's `time-remaining` property monitors playback globally.
+3. When remaining time ≤ 5 seconds, Python triggers a seamless fadeout filter on the active player and immediately starts the next track on the standby player with a fade-in filter.
+4. Leading silence is stripped natively via `silenceremove` so the new track's audio starts instantly.
+5. Both player decoders actively stream directly from the RAM cache simultaneously, achieving an authentic Spotify-like transition.
 
 ### Caching Strategy
 

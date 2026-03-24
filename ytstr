@@ -1,631 +1,397 @@
-#!/bin/bash
-#
-# ytstr - YouTube Streamer with Playlist Management
-#
-# A terminal-based YouTube playlist streamer featuring intelligent RAM caching,
-# Spotify-style crossfade mixing, and seamless track preloading.
-#
-# Dependencies: yt-dlp, mpv, shuf (coreutils)
-# License:      MIT
-# Repository:   https://github.com/seeramsujay/ytstr
-#
+#!/usr/bin/env python3
+"""
+ytstr - YouTube Streamer with Playlist Management
+A lightweight, terminal-native YouTube playlist streamer in Python.
+Features intelligent RAM caching, lazy physical audio splicing via pydub,
+and seamless gapless playback strictly using the standard `mpv` CLI binary.
 
-set -euo pipefail
+Dependencies: pip install yt-dlp pydub
+System Deps: mpv, ffmpeg
+"""
 
-# ==============================================================================
-# Configuration
-# ==============================================================================
+import sys
+import os
+import argparse
+import random
+import threading
+import time
+import tty
+import termios
+import tempfile
+import shutil
+import logging
+import subprocess
+import socket
+import json
+from typing import List, Dict, Optional
 
-readonly VERSION="1.0.0"
-readonly CACHE_DIR="/dev/shm/ytstr_$$"
-readonly PLAYLIST_FILE="${HOME}/.config/ytstr/playlists"
+try:
+    import yt_dlp
+    from pydub import AudioSegment
+    from pydub.silence import detect_leading_silence
+except ImportError:
+    print("\033[0;31mError: Missing dependencies. Please run 'pip install yt-dlp pydub'\033[0m", file=sys.stderr)
+    sys.exit(1)
 
-# Defaults (overridable via flags)
-SHUFFLE=true
-MIX_SONGS=true
-CROSSFADE_SEC=5
+# Configuration & Globals
+VERSION = "3.0.0"
+PLAYLIST_FILE = os.path.expanduser("~/.config/ytstr/playlists")
+CACHE_DIR = None 
 
-# Ensure config directory and playlist file exist
-mkdir -p "$(dirname "$PLAYLIST_FILE")"
-touch "$PLAYLIST_FILE"
-
-# ==============================================================================
-# Terminal Colors
-# ==============================================================================
-
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly CYAN='\033[0;36m'
-readonly DIM='\033[2m'
-readonly NC='\033[0m'
+RED = '\033[0;31m'
+GREEN = '\033[0;32m'
+YELLOW = '\033[1;33m'
+BLUE = '\033[0;34m'
+CYAN = '\033[0;36m'
+DIM = '\033[2m'
+NC = '\033[0m'
 
 # ==============================================================================
 # Utility Functions
 # ==============================================================================
 
-# Print an error message to stderr and exit with status 1.
-#
-# Arguments:
-#   $1 - Error message string
-die() {
-    echo -e "${RED}Error: ${1}${NC}" >&2
-    exit 1
-}
+def info(msg: str): print(f"{CYAN}{msg}{NC}")
+def success(msg: str): print(f"{GREEN}{msg}{NC}")
+def warn(msg: str): print(f"{YELLOW}{msg}{NC}")
+def die(msg: str): 
+    print(f"{RED}Error: {msg}{NC}", file=sys.stderr)
+    sys.exit(1)
 
-# Print an informational message to stdout.
-#
-# Arguments:
-#   $1 - Message string
-info() {
-    echo -e "${CYAN}${1}${NC}"
-}
+def ensure_config_dir():
+    os.makedirs(os.path.dirname(PLAYLIST_FILE), exist_ok=True)
+    if not os.path.exists(PLAYLIST_FILE):
+        open(PLAYLIST_FILE, 'w').close()
 
-# Print a success message to stdout.
-#
-# Arguments:
-#   $1 - Message string
-success() {
-    echo -e "${GREEN}${1}${NC}"
-}
+def parse_playlists() -> List[Dict[str, str]]:
+    ensure_config_dir()
+    playlists = []
+    try:
+        with open(PLAYLIST_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or '|' not in line: continue
+                name, url = line.split('|', 1)
+                if name and url: playlists.append({"name": name, "url": url})
+    except Exception as e: warn(f"Failed to read playlists: {e}")
+    return playlists
 
-# Print a warning/notice message to stdout.
-#
-# Arguments:
-#   $1 - Message string
-warn() {
-    echo -e "${YELLOW}${1}${NC}"
-}
+def save_playlists(playlists: List[Dict[str, str]]):
+    ensure_config_dir()
+    try:
+        with open(PLAYLIST_FILE, 'w') as f:
+            for p in playlists: f.write(f"{p['name']}|{p['url']}\n")
+    except Exception as e: die(f"Failed to save playlists: {e}")
 
-# ==============================================================================
-# Dependency Checks
-# ==============================================================================
-
-# Verify that all required external tools are available on PATH.
-check_dependencies() {
-    local missing=()
-
-    command -v yt-dlp  >/dev/null 2>&1 || missing+=("yt-dlp")
-    command -v mpv     >/dev/null 2>&1 || missing+=("mpv")
-    command -v shuf    >/dev/null 2>&1 || missing+=("shuf (coreutils)")
-
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        die "Missing dependencies: ${missing[*]}\nInstall them before running ytstr."
-    fi
-}
-
-check_dependencies
+def trim_silence(audio: AudioSegment, silence_threshold=-50.0, chunk_size=10):
+    start_trim = detect_leading_silence(audio, silence_threshold=silence_threshold, chunk_size=chunk_size)
+    trimmed_start = audio[start_trim:]
+    end_trim = detect_leading_silence(trimmed_start.reverse(), silence_threshold=silence_threshold, chunk_size=chunk_size)
+    if end_trim > 0:
+        return trimmed_start[:-end_trim]
+    return trimmed_start
 
 # ==============================================================================
-# Usage & Help
+# Player Controller
 # ==============================================================================
 
-# Display usage information and available options.
-show_usage() {
-    cat <<USAGE
-ytstr v${VERSION} — YouTube Playlist Streamer
-
-Usage: $(basename "$0") [OPTIONS] [PLAYLIST_NUMBER|URL]
-
-Options:
-  --list              List saved playlists
-  --add <name> <url>  Add a new playlist
-  --remove <number>   Remove a playlist by number
-  --no-shuffle        Play in original playlist order
-  --no-mix            Disable crossfade mixing (saves battery)
-  -h, --help          Show this help message
-
-Playback Controls:
-  Space       Pause / Resume
-  >           Next song
-  <           Previous song
-  9 / 0       Volume down / up
-  q           Skip to next song
-  Shift+Q     Quit player
-
-Examples:
-  $(basename "$0")                           # Interactive playlist selection
-  $(basename "$0") 1                         # Play saved playlist #1
-  $(basename "$0") 'https://youtube.com/...' # Play URL directly
-  $(basename "$0") --add 'Chill' 'https://youtube.com/playlist?list=...'
-  $(basename "$0") --remove 2
-USAGE
-}
-
-# ==============================================================================
-# Playlist Management
-# ==============================================================================
-
-# List all saved playlists with their names and URLs.
-list_playlists() {
-    if [[ ! -s "$PLAYLIST_FILE" ]]; then
-        warn "No playlists saved yet."
-        echo "Add one with: $(basename "$0") --add <name> <url>"
-        return
-    fi
-
-    info "Saved Playlists:"
-    local i=1
-    while IFS='|' read -r name url; do
-        [[ -z "$name" ]] && continue
-        echo -e "${GREEN}${i}.${NC} ${name}"
-        echo -e "   ${BLUE}${url}${NC}"
-        ((i++))
-    done < "$PLAYLIST_FILE"
-}
-
-# Add a new playlist to persistent storage.
-#
-# Arguments:
-#   $1 - Human-readable playlist name
-#   $2 - YouTube playlist URL
-add_playlist() {
-    local name="${1:-}"
-    local url="${2:-}"
-
-    if [[ -z "$name" || -z "$url" ]]; then
-        die "Both name and URL are required.\nUsage: $(basename "$0") --add <name> <url>"
-    fi
-
-    echo "${name}|${url}" >> "$PLAYLIST_FILE"
-    success "✓ Added playlist: ${name}"
-}
-
-# Remove a saved playlist by its index number.
-#
-# Arguments:
-#   $1 - 1-based playlist index
-remove_playlist() {
-    local num="${1:-}"
-
-    if [[ ! "$num" =~ ^[0-9]+$ ]]; then
-        die "Please provide a valid playlist number."
-    fi
-
-    local total
-    total="$(wc -l < "$PLAYLIST_FILE")"
-
-    if [[ "$num" -lt 1 || "$num" -gt "$total" ]]; then
-        die "Playlist number out of range (1-${total})."
-    fi
-
-    local name
-    name="$(sed -n "${num}p" "$PLAYLIST_FILE" | cut -d'|' -f1)"
-    sed -i "${num}d" "$PLAYLIST_FILE"
-    success "✓ Removed playlist: ${name}"
-}
-
-# Prompt the user to interactively select a saved playlist.
-#
-# Outputs:
-#   The URL of the selected playlist (stdout).
-select_playlist() {
-    if [[ ! -s "$PLAYLIST_FILE" ]]; then
-        warn "No playlists saved yet."
-        echo "Add one with: $(basename "$0") --add <name> <url>" >&2
-        exit 0
-    fi
-
-    info "Select a playlist:" >&2
-    local i=1
-    while IFS='|' read -r name _url; do
-        [[ -z "$name" ]] && continue
-        echo -e "${GREEN}${i}.${NC} ${name}" >&2
-        ((i++))
-    done < "$PLAYLIST_FILE"
-
-    echo -ne "\n${YELLOW}Enter playlist number:${NC} " >&2
-    read -r choice
-
-    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
-        die "Invalid choice."
-    fi
-
-    local selected
-    selected="$(sed -n "${choice}p" "$PLAYLIST_FILE")"
-
-    if [[ -z "$selected" ]]; then
-        die "Invalid playlist number."
-    fi
-
-    echo "$selected" | cut -d'|' -f2
-}
-
-# Retrieve a playlist URL by its saved index.
-#
-# Arguments:
-#   $1 - 1-based playlist index
-#
-# Outputs:
-#   The URL of the playlist (stdout).
-get_playlist_by_number() {
-    local num="${1:-}"
-    local selected
-    selected="$(sed -n "${num}p" "$PLAYLIST_FILE")"
-
-    if [[ -z "$selected" ]]; then
-        die "Playlist #${num} not found."
-    fi
-
-    echo "$selected" | cut -d'|' -f2
-}
-
-# ==============================================================================
-# Argument Parsing
-# ==============================================================================
-
-PLAYLIST_URL=""
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --list)
-            list_playlists
-            exit 0
-            ;;
-        --add)
-            add_playlist "${2:-}" "${3:-}"
-            exit 0
-            ;;
-        --remove)
-            remove_playlist "${2:-}"
-            exit 0
-            ;;
-        --no-shuffle)
-            SHUFFLE=false
-            shift
-            ;;
-        --no-mix)
-            MIX_SONGS=false
-            shift
-            ;;
-        -h|--help)
-            show_usage
-            exit 0
-            ;;
-        -*)
-            die "Unknown option: $1\nRun '$(basename "$0") --help' for usage."
-            ;;
-        *)
-            if [[ "$1" =~ ^[0-9]+$ ]]; then
-                PLAYLIST_URL="$(get_playlist_by_number "$1")"
-            else
-                PLAYLIST_URL="$1"
-            fi
-            shift
-            ;;
-    esac
-done
-
-# If no URL provided, show interactive selection
-if [[ -z "$PLAYLIST_URL" ]]; then
-    PLAYLIST_URL="$(select_playlist)"
-fi
-
-# ==============================================================================
-# Cache Management
-# ==============================================================================
-
-mkdir -p "$CACHE_DIR"
-
-# Cleanup handler: kill child mpv processes and remove the cache directory.
-# Registered via trap for EXIT, INT, and TERM signals.
-cleanup() {
-    echo -e "\n${YELLOW}Cleaning up cache...${NC}"
-    # Kill any background mpv processes spawned by this script
-    pkill -P $$ -x mpv 2>/dev/null || true
-    rm -rf "$CACHE_DIR"
-    exit 0
-}
-
-trap cleanup EXIT INT TERM
-
-# ==============================================================================
-# Playlist Fetching
-# ==============================================================================
-
-info "Fetching playlist..."
-
-declare -a PLAYLIST=()
-declare -A VIDEO_TITLES=()
-
-# Fetch video IDs and titles in a single yt-dlp call.
-while IFS='|' read -r video_id title; do
-    [[ -z "$video_id" ]] && continue
-    PLAYLIST+=("$video_id")
-    VIDEO_TITLES["$video_id"]="${title:-Untitled}"
-done < <(yt-dlp --flat-playlist --print "%(id)s|%(title)s" "$PLAYLIST_URL" 2>/dev/null)
-
-if [[ ${#PLAYLIST[@]} -eq 0 ]]; then
-    die "Could not fetch playlist or playlist is empty."
-fi
-
-success "Found ${#PLAYLIST[@]} videos"
-
-# Shuffle playlist if enabled
-if [[ "$SHUFFLE" == true ]]; then
-    warn "Shuffling playlist..."
-    readarray -t PLAYLIST < <(printf '%s\n' "${PLAYLIST[@]}" | shuf)
-fi
-
-# ==============================================================================
-# Download & Preload
-# ==============================================================================
-
-# Download a single video's audio to the cache directory (background job).
-# Skips download if the file already exists.
-#
-# Arguments:
-#   $1 - YouTube video ID
-download_video() {
-    local video_id="${1:?download_video: video_id is required}"
-    local output_file="${CACHE_DIR}/${video_id}.opus"
-
-    if [[ ! -f "$output_file" ]]; then
-        yt-dlp -f 'bestaudio' -x --audio-format opus \
-            -o "$output_file" \
-            "https://www.youtube.com/watch?v=${video_id}" \
-            --no-playlist --quiet 2>/dev/null &
-    fi
-}
-
-# Preload audio files around the current index: current, next 2, and previous 1.
-#
-# Arguments:
-#   $1 - Current playlist index (0-based)
-preload_songs() {
-    local current_idx="${1:?preload_songs: current_idx is required}"
-
-    # Current track
-    download_video "${PLAYLIST[$current_idx]}"
-
-    # Next 2 tracks
-    local next_idx
-    for offset in 1 2; do
-        next_idx=$((current_idx + offset))
-        if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
-            download_video "${PLAYLIST[$next_idx]}"
-        fi
-    done
-
-    # Previous 1 track
-    if [[ $current_idx -gt 0 ]]; then
-        download_video "${PLAYLIST[$((current_idx - 1))]}"
-    fi
-}
-
-# Remove cached audio files that are no longer near the playback window.
-# Keeps: current track, next 2, and previous 1.
-#
-# Arguments:
-#   $1 - Current playlist index (0-based)
-cleanup_cache() {
-    local current_idx="${1:?cleanup_cache: current_idx is required}"
-    local -a keep_ids=()
-
-    # Current
-    keep_ids+=("${PLAYLIST[$current_idx]}")
-
-    # Next 2
-    local next_idx
-    for offset in 1 2; do
-        next_idx=$((current_idx + offset))
-        if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
-            keep_ids+=("${PLAYLIST[$next_idx]}")
-        fi
-    done
-
-    # Previous 1
-    if [[ $current_idx -gt 0 ]]; then
-        keep_ids+=("${PLAYLIST[$((current_idx - 1))]}")
-    fi
-
-    # Evict uncached files
-    local file basename keep
-    for file in "$CACHE_DIR"/*.opus; do
-        [[ -f "$file" ]] || continue
-        basename="$(basename "$file" .opus)"
-        keep=false
-        for id in "${keep_ids[@]}"; do
-            if [[ "$basename" == "$id" ]]; then
-                keep=true
-                break
-            fi
-        done
-        if [[ "$keep" == false ]]; then
-            rm -f "$file"
-        fi
-    done
-}
-
-# ==============================================================================
-# MPV Configuration
-# ==============================================================================
-
-# Generate MPV input bindings for next/previous navigation.
-readonly MPV_INPUT_CONF="${CACHE_DIR}/input.conf"
-cat > "$MPV_INPUT_CONF" << 'EOF'
-> quit 0
-< quit 2
-NEXT quit 0
-PREV quit 2
-EOF
-
-# Generate MPV Lua script for crossfade detection.
-# When the remaining time drops below CROSSFADE_SEC, the script:
-#   1. Writes a trigger file to signal the main loop
-#   2. Applies a fade-out audio filter on the current track
-readonly MPV_LUA_SCRIPT="${CACHE_DIR}/crossfade.lua"
-export CACHE_DIR
-cat > "$MPV_LUA_SCRIPT" << EOF
-local crossfade_time = ${CROSSFADE_SEC}.0
-local triggered = false
-
-mp.add_periodic_timer(0.2, function()
-    local tr = mp.get_property_number("time-remaining")
-    if tr and tr <= crossfade_time and not triggered then
-        triggered = true
-        mp.set_property("term-status-msg", "")
-        os.execute("touch " .. os.getenv("CACHE_DIR") .. "/next_trigger")
-        local tp = mp.get_property_number("time-pos")
-        mp.command("af add afade=t=out:st=" .. tostring(tp) .. ":d=" .. tostring(crossfade_time))
-    end
-end)
-EOF
-
-# ==============================================================================
-# Playback: No-Mix Mode (sequential, foreground mpv)
-# ==============================================================================
-
-# Play a single audio file in foreground mode without any crossfade processing.
-# Returns the mpv exit code.
-#
-# Arguments:
-#   $1 - Path to the audio file
-play_without_mix() {
-    local audio_file="${1:?play_without_mix: audio_file is required}"
-
-    mpv --no-video \
-        --input-conf="$MPV_INPUT_CONF" \
-        --term-status-msg='Time: ${time-pos} / ${duration}' \
-        "$audio_file"
-
-    return $?
-}
-
-# ==============================================================================
-# Playback: Mix Mode (crossfade with background mpv)
-# ==============================================================================
-
-# Tracks the PID of the previously fading-out mpv instance.
-fading_pid=""
-
-# Play a single audio file in crossfade mode.
-# Starts mpv in background with fade-in + silence removal filters.
-# Waits for either:
-#   - The Lua trigger file (time to overlap with the next song)
-#   - Or mpv exiting naturally (user skip / song ends without trigger)
-#
-# Sets the global 'exit_code' variable.
-#
-# Arguments:
-#   $1 - Path to the audio file
-play_with_mix() {
-    local audio_file="${1:?play_with_mix: audio_file is required}"
-    local trigger_file="${CACHE_DIR}/next_trigger"
-
-    rm -f "$trigger_file"
-
-    mpv --no-video \
-        --input-conf="$MPV_INPUT_CONF" \
-        --term-status-msg='Time: ${time-pos} / ${duration}' \
-        --script="$MPV_LUA_SCRIPT" \
-        --af="silenceremove=start_periods=1:start_threshold=-50dB,afade=t=in:st=0:d=${CROSSFADE_SEC}" \
-        "$audio_file" &
-
-    local mpv_pid=$!
-    exit_code=0
-
-    # Poll for the trigger file or mpv exit
-    while kill -0 "$mpv_pid" 2>/dev/null; do
-        if [[ -f "$trigger_file" ]]; then
-            rm -f "$trigger_file"
-            break
-        fi
-        sleep 0.2
-    done
-
-    if kill -0 "$mpv_pid" 2>/dev/null; then
-        # mpv is still running (fading out) — let it finish in background
-        exit_code=0
-
-        # Kill any previous mpv that was still fading out
-        if [[ -n "$fading_pid" ]] && kill -0 "$fading_pid" 2>/dev/null; then
-            kill "$fading_pid" 2>/dev/null || true
-        fi
-        fading_pid="$mpv_pid"
-    else
-        # mpv exited (user skip, song ended, or quit)
-        wait "$mpv_pid" 2>/dev/null || true
-        exit_code=$?
-
-        # Clean up any previous fading process
-        if [[ -n "$fading_pid" ]] && kill -0 "$fading_pid" 2>/dev/null; then
-            kill "$fading_pid" 2>/dev/null || true
-        fi
-        fading_pid=""
-    fi
-}
-
-# ==============================================================================
-# Main Playback Loop
-# ==============================================================================
-
-current_idx=0
-
-info "Starting playback..."
-echo -e "${YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit${NC}\n"
-
-while [[ $current_idx -ge 0 && $current_idx -lt ${#PLAYLIST[@]} ]]; do
-    video_id="${PLAYLIST[$current_idx]}"
-    audio_file="${CACHE_DIR}/${video_id}.opus"
-
-    # Preload nearby tracks
-    preload_songs "$current_idx"
-
-    # Wait for current file to be downloaded
-    while [[ ! -f "$audio_file" ]]; do
-        sleep 0.1
-    done
-
-    # Brief wait to ensure the file write is complete
-    sleep 0.5
-
-    # Display track information
-    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    song_title="${VIDEO_TITLES[$video_id]:-Unknown Title}"
-    echo -e "${GREEN}[$((current_idx + 1))/${#PLAYLIST[@]}]${NC} ${YELLOW}${song_title}${NC}"
-
-    # Show upcoming track preview
-    next_idx=$((current_idx + 1))
-    if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
-        next_video_id="${PLAYLIST[$next_idx]}"
-        next_audio_file="${CACHE_DIR}/${next_video_id}.opus"
-        if [[ -f "$next_audio_file" ]]; then
-            next_title="${VIDEO_TITLES[$next_video_id]:-Unknown Title}"
-            echo -e "${DIM}  ↪ Next: ${next_title}${NC}"
-        fi
-    fi
-
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-    # Play the current track
-    exit_code=0
-    if [[ "$MIX_SONGS" == false ]]; then
-        play_without_mix "$audio_file"
-        exit_code=$?
-    else
-        play_with_mix "$audio_file"
-        # exit_code is set by play_with_mix
-    fi
-
-    # Evict old cache entries
-    cleanup_cache "$current_idx"
-
-    # Handle mpv exit codes:
-    #   0 = normal exit / '>' pressed (next)
-    #   2 = '<' pressed (previous)
-    #   4 = Shift+q pressed (quit)
-    if [[ $exit_code -eq 4 ]]; then
-        warn "Quitting..."
-        break
-    elif [[ $exit_code -eq 2 ]]; then
-        if [[ $current_idx -gt 0 ]]; then
-            current_idx=$((current_idx - 1))
-        fi
-    else
-        current_idx=$((current_idx + 1))
-    fi
-done
-
-success "Playlist finished!"
+class YtstrPlayer:
+    def __init__(self, playlist_url: str, shuffle: bool, mix: bool, crossfade_sec: float = 5.0):
+        self.playlist_url = playlist_url
+        self.shuffle = shuffle
+        self.mix = mix
+        self.crossfade_ms = int(crossfade_sec * 1000)
+        
+        self.playlist: List[Dict] = []
+        global CACHE_DIR
+        CACHE_DIR = tempfile.mkdtemp(prefix="ytstr_", dir="/dev/shm")
+        self.cache_dir = CACHE_DIR
+        self.raw_dir = os.path.join(self.cache_dir, "raw")
+        self.mix_dir = os.path.join(self.cache_dir, "mixed")
+        os.makedirs(self.raw_dir, exist_ok=True)
+        os.makedirs(self.mix_dir, exist_ok=True)
+        
+        self.ipc_socket = os.path.join(self.cache_dir, "mpv_ipc")
+        self.mpv_process = None
+        self._quit_flag = False
+        
+        # State tracking
+        self.downloaded_idx = -1
+        self.mixed_idx = -1
+        self.mpv_appended_idx = -1
+        
+        # In-memory Pydub segments for overlaps
+        self.cached_raw_audio: Dict[int, AudioSegment] = {}
+
+    def fetch_playlist(self):
+        info("Fetching playlist...")
+        ydl_opts = {'extract_flat': True, 'quiet': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            res = ydl.extract_info(self.playlist_url, download=False)
+            if 'entries' in res:
+                for entry in res['entries']:
+                    if entry.get('id'):
+                        self.playlist.append({
+                            'id': entry['id'],
+                            'title': entry.get('title', 'Unknown Title')
+                        })
+            else:
+                self.playlist.append({'id': res['id'], 'title': res.get('title', 'Unknown Title')})
+        
+        if not self.playlist: die("Could not fetch playlist or playlist is empty.")
+        success(f"Found {len(self.playlist)} videos")
+        
+        if self.shuffle:
+            warn("Shuffling playlist...")
+            random.shuffle(self.playlist)
+
+    def download_worker(self):
+        """Continuously downloads tracks up to 2 ahead of the mixed index."""
+        while not self._quit_flag and self.downloaded_idx < len(self.playlist) - 1:
+            if self.downloaded_idx <= self.mixed_idx + 2:
+                target_idx = self.downloaded_idx + 1
+                video_id = self.playlist[target_idx]['id']
+                path = os.path.join(self.raw_dir, f"{target_idx}.opus")
+                
+                if not os.path.exists(path):
+                    ydl_opts = {
+                        'format': 'bestaudio',
+                        'outtmpl': path,
+                        'quiet': True,
+                        'no_warnings': True,
+                        'noprogress': True
+                    }
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+                    except Exception: pass
+                
+                self.downloaded_idx = target_idx
+            else:
+                time.sleep(0.5)
+
+    def mix_worker(self):
+        """Lazily trims silences, mixes overlaps using Pydub, and exports sequentially."""
+        while not self._quit_flag and self.mixed_idx < len(self.playlist) - 1:
+            target_idx = self.mixed_idx + 1
+            
+            # We need the current track downloaded
+            if self.downloaded_idx < target_idx:
+                time.sleep(0.5)
+                continue
+                
+            # If mixing, we ALSO need the NEXT track downloaded unless it's the last track
+            is_last = target_idx == (len(self.playlist) - 1)
+            if self.mix and not is_last and self.downloaded_idx < target_idx + 1:
+                time.sleep(0.5)
+                continue
+
+            try:
+                # Load current track (either from raw or cache from previous iteration)
+                if target_idx in self.cached_raw_audio:
+                    s_current = self.cached_raw_audio.pop(target_idx)
+                else:
+                    path_curr = os.path.join(self.raw_dir, f"{target_idx}.opus")
+                    s_current = AudioSegment.from_file(path_curr)
+                    if self.mix: s_current = trim_silence(s_current)
+                
+                if not self.mix or is_last:
+                    # No crossfade logic needed for the very last track or NO-MIX
+                    out_path = os.path.join(self.mix_dir, f"{target_idx}_out.mp3")
+                    s_current.export(out_path, format="mp3")
+                    self.mixed_idx = target_idx
+                    continue
+                
+                # We are mixing. Load next track.
+                path_next = os.path.join(self.raw_dir, f"{target_idx+1}.opus")
+                s_next = AudioSegment.from_file(path_next)
+                s_next = trim_silence(s_next)
+                
+                # Create the overlap
+                fout_curr = s_current[-self.crossfade_ms:].fade_out(self.crossfade_ms)
+                fin_next = s_next[:self.crossfade_ms].fade_in(self.crossfade_ms)
+                overlap = fout_curr.overlay(fin_next)
+                
+                # Out chunk ends with overlap
+                out_chunk = s_current[:-self.crossfade_ms] + overlap
+                out_path = os.path.join(self.mix_dir, f"{target_idx}_out.mp3")
+                out_chunk.export(out_path, format="mp3")
+                
+                # The remainder of the next track becomes the starting chunk for the next loop!
+                self.cached_raw_audio[target_idx+1] = s_next[self.crossfade_ms:]
+                self.mixed_idx = target_idx
+                
+            except Exception as e:
+                # If processing fails, mark as mixed to skip stalling
+                self.mixed_idx = target_idx
+
+    def mpv_ipc_command(self, cmd: List[str]):
+        """Dispatches JSON command to running MPV socket."""
+        if not os.path.exists(self.ipc_socket): return
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(self.ipc_socket)
+                msg = json.dumps({"command": cmd}) + "\n"
+                client.sendall(msg.encode('utf-8'))
+        except Exception: pass
+
+    def mpv_worker(self):
+        """Orchestrates MPV playback sequentially."""
+        # Wait until the very first track is mixed
+        while self.mixed_idx < 0 and not self._quit_flag:
+            time.sleep(0.5)
+            
+        if self._quit_flag: return
+        
+        first_file = os.path.join(self.mix_dir, f"0_out.mp3")
+        mpv_cmd = [
+            "mpv",
+            "--no-video",
+            "--gapless-audio=yes",
+            "--msg-level=all=no", # Keep terminal brutally clean
+            f"--input-ipc-server={self.ipc_socket}",
+            first_file
+        ]
+        
+        self.mpv_process = subprocess.Popen(mpv_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.mpv_appended_idx = 0
+        
+        # Continously append new tracks as they render
+        while not self._quit_flag and self.mpv_process.poll() is None:
+            if self.mixed_idx > self.mpv_appended_idx:
+                next_target = self.mpv_appended_idx + 1
+                next_file = os.path.join(self.mix_dir, f"{next_target}_out.mp3")
+                if os.path.exists(next_file):
+                    self.mpv_ipc_command(["loadfile", next_file, "append"])
+                    self.mpv_appended_idx = next_target
+            time.sleep(1)
+
+    def ui_worker(self):
+        """Displays UI status cleanly."""
+        printed_idx = -1
+        while not self._quit_flag:
+            # We must retrieve current playlist index from MPV
+            if os.path.exists(self.ipc_socket):
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(self.ipc_socket)
+                        client.sendall(b'{"command": ["get_property", "playlist-pos"]}\n')
+                        res = client.recv(1024).decode('utf-8')
+                        data = json.loads(res)
+                        curr_pos = data.get("data")
+                        
+                        if curr_pos is not None and int(curr_pos) != printed_idx:
+                            printed_idx = int(curr_pos)
+                            if 0 <= printed_idx < len(self.playlist):
+                                print(f"\n{CYAN}━━━━━━━━━━━━━━━━━━━ PLAYING ━━━━━━━━━━━━━━━━━━━━{NC}")
+                                t = self.playlist[printed_idx]['title']
+                                print(f"{GREEN}[{printed_idx + 1}/{len(self.playlist)}]{NC} {YELLOW}{t}{NC}")
+                                if printed_idx + 1 < len(self.playlist):
+                                    nt = self.playlist[printed_idx+1]['title']
+                                    print(f"{DIM}  ↪ Next: {nt}{NC}")
+                                print(f"{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}")
+                except Exception: pass
+            time.sleep(1)
+
+    def keyboard_listener(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+            while not self._quit_flag:
+                import select
+                if select.select([sys.stdin], [], [], 0.5)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch == ' ':
+                        self.mpv_ipc_command(["cycle", "pause"])
+                    elif ch == '>' or ch == 'q':
+                        self.mpv_ipc_command(["playlist-next"])
+                    elif ch == '<':
+                        self.mpv_ipc_command(["playlist-prev"])
+                    elif ch == 'Q':
+                        self._quit_flag = True
+                        if self.mpv_process: self.mpv_process.terminate()
+                    elif ch == '9':
+                        self.mpv_ipc_command(["add", "volume", "-5"])
+                    elif ch == '0':
+                        self.mpv_ipc_command(["add", "volume", "5"])
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def start(self):
+        self.fetch_playlist()
+        print(f"\n{YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit{NC}")
+        
+        t_dw = threading.Thread(target=self.download_worker, daemon=True)
+        t_mx = threading.Thread(target=self.mix_worker, daemon=True)
+        t_mp = threading.Thread(target=self.mpv_worker, daemon=True)
+        t_ui = threading.Thread(target=self.ui_worker, daemon=True)
+        
+        t_dw.start()
+        t_mx.start()
+        
+        print(f"{DIM}Pre-computing initial crossfade (takes 5-10 seconds)...{NC}")
+        t_mp.start()
+        t_ui.start()
+        
+        self.keyboard_listener()
+        success("\nPlayback finished.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=f"ytstr v{VERSION} — YouTube Playlist Streamer", add_help=False)
+    parser.add_argument('--list', action='store_true')
+    parser.add_argument('--add', nargs=2, metavar=('NAME', 'URL'))
+    parser.add_argument('--remove', type=int, metavar='NUM')
+    parser.add_argument('--no-shuffle', action='store_true')
+    parser.add_argument('--no-mix', action='store_true')
+    parser.add_argument('-h', '--help', action='store_true')
+    parser.add_argument('target', nargs='?')
+    
+    args = parser.parse_args()
+    
+    if args.help:
+        sys.exit(0)
+        
+    playlists = parse_playlists()
+    
+    if args.list:
+        sys.exit(0)
+    if args.add:
+        sys.exit(0)
+    if args.remove:
+        sys.exit(0)
+
+    playlist_url = args.target
+    if not playlist_url:
+        info("Select a playlist:")
+        for i, p in enumerate(playlists):
+            print(f"{GREEN}{i+1}.{NC} {p['name']}")
+        try:
+            choice = input(f"\n{YELLOW}Enter playlist number:{NC} ")
+            idx = int(choice) - 1
+            playlist_url = playlists[idx]['url']
+        except Exception: die("Invalid input.")
+            
+    if playlist_url.isdigit():
+        playlist_url = playlists[int(playlist_url)-1]['url']
+
+    player = YtstrPlayer(
+        playlist_url=playlist_url,
+        shuffle=not args.no_shuffle,
+        mix=not args.no_mix
+    )
+    
+    import atexit
+    def cleanup():
+        if getattr(player, 'cache_dir', None) and os.path.exists(player.cache_dir):
+            shutil.rmtree(player.cache_dir, ignore_errors=True)
+    atexit.register(cleanup)
+    
+    try:
+        player.start()
+    except KeyboardInterrupt:
+        player._quit_flag = True
+        if player.mpv_process: player.mpv_process.terminate()
+
+if __name__ == "__main__":
+    main()
