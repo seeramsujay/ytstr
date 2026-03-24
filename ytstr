@@ -1,169 +1,295 @@
 #!/bin/bash
-
+#
 # ytstr - YouTube Streamer with Playlist Management
-# Stream YouTube playlists with intelligent caching
+#
+# A terminal-based YouTube playlist streamer featuring intelligent RAM caching,
+# Spotify-style crossfade mixing, and seamless track preloading.
+#
+# Dependencies: yt-dlp, mpv, shuf (coreutils)
+# License:      MIT
+# Repository:   https://github.com/seeramsujay/ytstr
+#
 
-CACHE_DIR="/dev/shm/ytstr_$$"
-PLAYLIST_FILE="$HOME/.config/ytstr/playlists"
+set -euo pipefail
+
+# ==============================================================================
+# Configuration
+# ==============================================================================
+
+readonly VERSION="1.0.0"
+readonly CACHE_DIR="/dev/shm/ytstr_$$"
+readonly PLAYLIST_FILE="${HOME}/.config/ytstr/playlists"
+
+# Defaults (overridable via flags)
 SHUFFLE=true
+MIX_SONGS=true
+CROSSFADE_SEC=5
 
-# Ensure config directory exists
+# Ensure config directory and playlist file exist
 mkdir -p "$(dirname "$PLAYLIST_FILE")"
 touch "$PLAYLIST_FILE"
 
-# Colors for better UI
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+# ==============================================================================
+# Terminal Colors
+# ==============================================================================
 
-# Show usage
-show_usage() {
-    echo "Usage: $0 [OPTIONS] [PLAYLIST_NUMBER|URL]"
-    echo ""
-    echo "Options:"
-    echo "  --list              List saved playlists"
-    echo "  --add <name> <url>  Add a new playlist"
-    echo "  --remove <number>   Remove a playlist"
-    echo "  --no-shuffle        Disable playlist shuffling"
-    echo ""
-    echo "Examples:"
-    echo "  $0                           # Interactive playlist selection"
-    echo "  $0 1                         # Play playlist #1"
-    echo "  $0 'https://youtube.com/...' # Play URL directly"
-    echo "  $0 --add 'Chill' 'https://youtube.com/playlist?list=...'"
-    echo "  $0 --remove 2"
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly DIM='\033[2m'
+readonly NC='\033[0m'
+
+# ==============================================================================
+# Utility Functions
+# ==============================================================================
+
+# Print an error message to stderr and exit with status 1.
+#
+# Arguments:
+#   $1 - Error message string
+die() {
+    echo -e "${RED}Error: ${1}${NC}" >&2
+    exit 1
 }
 
-# List playlists
+# Print an informational message to stdout.
+#
+# Arguments:
+#   $1 - Message string
+info() {
+    echo -e "${CYAN}${1}${NC}"
+}
+
+# Print a success message to stdout.
+#
+# Arguments:
+#   $1 - Message string
+success() {
+    echo -e "${GREEN}${1}${NC}"
+}
+
+# Print a warning/notice message to stdout.
+#
+# Arguments:
+#   $1 - Message string
+warn() {
+    echo -e "${YELLOW}${1}${NC}"
+}
+
+# ==============================================================================
+# Dependency Checks
+# ==============================================================================
+
+# Verify that all required external tools are available on PATH.
+check_dependencies() {
+    local missing=()
+
+    command -v yt-dlp  >/dev/null 2>&1 || missing+=("yt-dlp")
+    command -v mpv     >/dev/null 2>&1 || missing+=("mpv")
+    command -v shuf    >/dev/null 2>&1 || missing+=("shuf (coreutils)")
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing dependencies: ${missing[*]}\nInstall them before running ytstr."
+    fi
+}
+
+check_dependencies
+
+# ==============================================================================
+# Usage & Help
+# ==============================================================================
+
+# Display usage information and available options.
+show_usage() {
+    cat <<USAGE
+ytstr v${VERSION} — YouTube Playlist Streamer
+
+Usage: $(basename "$0") [OPTIONS] [PLAYLIST_NUMBER|URL]
+
+Options:
+  --list              List saved playlists
+  --add <name> <url>  Add a new playlist
+  --remove <number>   Remove a playlist by number
+  --no-shuffle        Play in original playlist order
+  --no-mix            Disable crossfade mixing (saves battery)
+  -h, --help          Show this help message
+
+Playback Controls:
+  Space       Pause / Resume
+  >           Next song
+  <           Previous song
+  9 / 0       Volume down / up
+  q           Skip to next song
+  Shift+Q     Quit player
+
+Examples:
+  $(basename "$0")                           # Interactive playlist selection
+  $(basename "$0") 1                         # Play saved playlist #1
+  $(basename "$0") 'https://youtube.com/...' # Play URL directly
+  $(basename "$0") --add 'Chill' 'https://youtube.com/playlist?list=...'
+  $(basename "$0") --remove 2
+USAGE
+}
+
+# ==============================================================================
+# Playlist Management
+# ==============================================================================
+
+# List all saved playlists with their names and URLs.
 list_playlists() {
     if [[ ! -s "$PLAYLIST_FILE" ]]; then
-        echo -e "${YELLOW}No playlists saved yet.${NC}"
-        echo "Add one with: $0 --add <name> <url>"
+        warn "No playlists saved yet."
+        echo "Add one with: $(basename "$0") --add <name> <url>"
         return
     fi
-    
-    echo -e "${CYAN}Saved Playlists:${NC}"
+
+    info "Saved Playlists:"
     local i=1
     while IFS='|' read -r name url; do
-        echo -e "${GREEN}$i.${NC} $name"
-        echo -e "   ${BLUE}$url${NC}"
+        [[ -z "$name" ]] && continue
+        echo -e "${GREEN}${i}.${NC} ${name}"
+        echo -e "   ${BLUE}${url}${NC}"
         ((i++))
     done < "$PLAYLIST_FILE"
 }
 
-# Add playlist
+# Add a new playlist to persistent storage.
+#
+# Arguments:
+#   $1 - Human-readable playlist name
+#   $2 - YouTube playlist URL
 add_playlist() {
-    local name="$1"
-    local url="$2"
-    
+    local name="${1:-}"
+    local url="${2:-}"
+
     if [[ -z "$name" || -z "$url" ]]; then
-        echo -e "${RED}Error: Both name and URL are required${NC}"
-        echo "Usage: $0 --add <name> <url>"
-        exit 1
+        die "Both name and URL are required.\nUsage: $(basename "$0") --add <name> <url>"
     fi
-    
-    echo "$name|$url" >> "$PLAYLIST_FILE"
-    echo -e "${GREEN}✓ Added playlist: $name${NC}"
+
+    echo "${name}|${url}" >> "$PLAYLIST_FILE"
+    success "✓ Added playlist: ${name}"
 }
 
-# Remove playlist
+# Remove a saved playlist by its index number.
+#
+# Arguments:
+#   $1 - 1-based playlist index
 remove_playlist() {
-    local num="$1"
-    
+    local num="${1:-}"
+
     if [[ ! "$num" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Error: Please provide a valid playlist number${NC}"
-        exit 1
+        die "Please provide a valid playlist number."
     fi
-    
-    local total=$(wc -l < "$PLAYLIST_FILE")
-    if [[ $num -lt 1 || $num -gt $total ]]; then
-        echo -e "${RED}Error: Playlist number out of range (1-$total)${NC}"
-        exit 1
+
+    local total
+    total="$(wc -l < "$PLAYLIST_FILE")"
+
+    if [[ "$num" -lt 1 || "$num" -gt "$total" ]]; then
+        die "Playlist number out of range (1-${total})."
     fi
-    
-    local name=$(sed -n "${num}p" "$PLAYLIST_FILE" | cut -d'|' -f1)
+
+    local name
+    name="$(sed -n "${num}p" "$PLAYLIST_FILE" | cut -d'|' -f1)"
     sed -i "${num}d" "$PLAYLIST_FILE"
-    echo -e "${GREEN}✓ Removed playlist: $name${NC}"
+    success "✓ Removed playlist: ${name}"
 }
 
-# Select playlist interactively
+# Prompt the user to interactively select a saved playlist.
+#
+# Outputs:
+#   The URL of the selected playlist (stdout).
 select_playlist() {
     if [[ ! -s "$PLAYLIST_FILE" ]]; then
-        echo -e "${YELLOW}No playlists saved yet.${NC}"
-        echo "Add one with: $0 --add <name> <url>"
+        warn "No playlists saved yet."
+        echo "Add one with: $(basename "$0") --add <name> <url>" >&2
         exit 0
     fi
-    
-    echo -e "${CYAN}Select a playlist:${NC}"
+
+    info "Select a playlist:" >&2
     local i=1
-    while IFS='|' read -r name url; do
-        echo -e "${GREEN}$i.${NC} $name"
+    while IFS='|' read -r name _url; do
+        [[ -z "$name" ]] && continue
+        echo -e "${GREEN}${i}.${NC} ${name}" >&2
         ((i++))
     done < "$PLAYLIST_FILE"
-    
-    echo -ne "\n${YELLOW}Enter playlist number:${NC} "
+
+    echo -ne "\n${YELLOW}Enter playlist number:${NC} " >&2
     read -r choice
-    
+
     if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid choice${NC}"
-        exit 1
+        die "Invalid choice."
     fi
-    
-    local selected=$(sed -n "${choice}p" "$PLAYLIST_FILE")
+
+    local selected
+    selected="$(sed -n "${choice}p" "$PLAYLIST_FILE")"
+
     if [[ -z "$selected" ]]; then
-        echo -e "${RED}Invalid playlist number${NC}"
-        exit 1
+        die "Invalid playlist number."
     fi
-    
+
     echo "$selected" | cut -d'|' -f2
 }
 
-# Get playlist by number
+# Retrieve a playlist URL by its saved index.
+#
+# Arguments:
+#   $1 - 1-based playlist index
+#
+# Outputs:
+#   The URL of the playlist (stdout).
 get_playlist_by_number() {
-    local num="$1"
-    local selected=$(sed -n "${num}p" "$PLAYLIST_FILE")
-    
+    local num="${1:-}"
+    local selected
+    selected="$(sed -n "${num}p" "$PLAYLIST_FILE")"
+
     if [[ -z "$selected" ]]; then
-        echo -e "${RED}Error: Playlist #$num not found${NC}"
-        exit 1
+        die "Playlist #${num} not found."
     fi
-    
+
     echo "$selected" | cut -d'|' -f2
 }
 
-# Parse arguments
+# ==============================================================================
+# Argument Parsing
+# ==============================================================================
+
 PLAYLIST_URL=""
+
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    case "$1" in
         --list)
             list_playlists
             exit 0
             ;;
         --add)
-            add_playlist "$2" "$3"
+            add_playlist "${2:-}" "${3:-}"
             exit 0
             ;;
         --remove)
-            remove_playlist "$2"
+            remove_playlist "${2:-}"
             exit 0
             ;;
         --no-shuffle)
             SHUFFLE=false
             shift
             ;;
+        --no-mix)
+            MIX_SONGS=false
+            shift
+            ;;
         -h|--help)
             show_usage
             exit 0
             ;;
+        -*)
+            die "Unknown option: $1\nRun '$(basename "$0") --help' for usage."
+            ;;
         *)
             if [[ "$1" =~ ^[0-9]+$ ]]; then
-                # It's a playlist number
-                PLAYLIST_URL=$(get_playlist_by_number "$1")
+                PLAYLIST_URL="$(get_playlist_by_number "$1")"
             else
-                # It's a URL
                 PLAYLIST_URL="$1"
             fi
             shift
@@ -173,49 +299,68 @@ done
 
 # If no URL provided, show interactive selection
 if [[ -z "$PLAYLIST_URL" ]]; then
-    PLAYLIST_URL=$(select_playlist)
+    PLAYLIST_URL="$(select_playlist)"
 fi
 
-# Create cache directory
+# ==============================================================================
+# Cache Management
+# ==============================================================================
+
 mkdir -p "$CACHE_DIR"
 
-# Cleanup function
+# Cleanup handler: kill child mpv processes and remove the cache directory.
+# Registered via trap for EXIT, INT, and TERM signals.
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up cache...${NC}"
+    # Kill any background mpv processes spawned by this script
+    pkill -P $$ -x mpv 2>/dev/null || true
     rm -rf "$CACHE_DIR"
     exit 0
 }
 
 trap cleanup EXIT INT TERM
 
-# Get playlist items with titles in ONE call
-echo -e "${CYAN}Fetching playlist...${NC}"
-declare -A VIDEO_TITLES
+# ==============================================================================
+# Playlist Fetching
+# ==============================================================================
 
-# Fetch IDs and titles together
+info "Fetching playlist..."
+
+declare -a PLAYLIST=()
+declare -A VIDEO_TITLES=()
+
+# Fetch video IDs and titles in a single yt-dlp call.
 while IFS='|' read -r video_id title; do
+    [[ -z "$video_id" ]] && continue
     PLAYLIST+=("$video_id")
-    VIDEO_TITLES["$video_id"]="$title"
-done < <(yt-dlp --flat-playlist --print "%(id)s|%(title)s" "$PLAYLIST_URL")
+    VIDEO_TITLES["$video_id"]="${title:-Untitled}"
+done < <(yt-dlp --flat-playlist --print "%(id)s|%(title)s" "$PLAYLIST_URL" 2>/dev/null)
 
 if [[ ${#PLAYLIST[@]} -eq 0 ]]; then
-    echo -e "${RED}Error: Could not fetch playlist or playlist is empty${NC}"
-    exit 1
+    die "Could not fetch playlist or playlist is empty."
 fi
 
-echo -e "${GREEN}Found ${#PLAYLIST[@]} videos${NC}"
+success "Found ${#PLAYLIST[@]} videos"
 
-# Shuffle if enabled
+# Shuffle playlist if enabled
 if [[ "$SHUFFLE" == true ]]; then
-    echo -e "${YELLOW}Shuffling playlist...${NC}"
-    PLAYLIST=($(printf '%s\n' "${PLAYLIST[@]}" | shuf))
+    warn "Shuffling playlist..."
+    readarray -t PLAYLIST < <(printf '%s\n' "${PLAYLIST[@]}" | shuf)
 fi
 
-# Download function
+# ==============================================================================
+# Download & Preload
+# ==============================================================================
+
+# Download a single video's audio to the cache directory (background job).
+# Skips download if the file already exists.
+#
+# Arguments:
+#   $1 - YouTube video ID
 download_video() {
-    local video_id="$1"
-    local output_file="$CACHE_DIR/${video_id}.opus"
-    
+    local video_id="${1:?download_video: video_id is required}"
+    local output_file="${CACHE_DIR}/${video_id}.opus"
+
     if [[ ! -f "$output_file" ]]; then
         yt-dlp -f 'bestaudio' -x --audio-format opus \
             -o "$output_file" \
@@ -224,56 +369,64 @@ download_video() {
     fi
 }
 
-# Preload function - downloads current, next 2, and previous 1
+# Preload audio files around the current index: current, next 2, and previous 1.
+#
+# Arguments:
+#   $1 - Current playlist index (0-based)
 preload_songs() {
-    local current_idx=$1
-    
-    # Download current
+    local current_idx="${1:?preload_songs: current_idx is required}"
+
+    # Current track
     download_video "${PLAYLIST[$current_idx]}"
-    
-    # Download next 2
-    for i in 1 2; do
-        local next_idx=$((current_idx + i))
+
+    # Next 2 tracks
+    local next_idx
+    for offset in 1 2; do
+        next_idx=$((current_idx + offset))
         if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
             download_video "${PLAYLIST[$next_idx]}"
         fi
     done
-    
-    # Download previous 1
+
+    # Previous 1 track
     if [[ $current_idx -gt 0 ]]; then
-        local prev_idx=$((current_idx - 1))
-        download_video "${PLAYLIST[$prev_idx]}"
+        download_video "${PLAYLIST[$((current_idx - 1))]}"
     fi
 }
 
-# Cleanup old cache files
+# Remove cached audio files that are no longer near the playback window.
+# Keeps: current track, next 2, and previous 1.
+#
+# Arguments:
+#   $1 - Current playlist index (0-based)
 cleanup_cache() {
-    local current_idx=$1
-    local keep_files=()
-    
-    # Keep current song
-    keep_files+=("${PLAYLIST[$current_idx]}")
-    
-    # Keep next 2
-    for i in 1 2; do
-        local next_idx=$((current_idx + i))
+    local current_idx="${1:?cleanup_cache: current_idx is required}"
+    local -a keep_ids=()
+
+    # Current
+    keep_ids+=("${PLAYLIST[$current_idx]}")
+
+    # Next 2
+    local next_idx
+    for offset in 1 2; do
+        next_idx=$((current_idx + offset))
         if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
-            keep_files+=("${PLAYLIST[$next_idx]}")
+            keep_ids+=("${PLAYLIST[$next_idx]}")
         fi
     done
-    
-    # Keep previous 1
+
+    # Previous 1
     if [[ $current_idx -gt 0 ]]; then
-        local prev_idx=$((current_idx - 1))
-        keep_files+=("${PLAYLIST[$prev_idx]}")
+        keep_ids+=("${PLAYLIST[$((current_idx - 1))]}")
     fi
-    
-    # Remove files not in keep list
+
+    # Evict uncached files
+    local file basename keep
     for file in "$CACHE_DIR"/*.opus; do
         [[ -f "$file" ]] || continue
-        local basename=$(basename "$file" .opus)
-        local keep=false
-        for id in "${keep_files[@]}"; do
+        basename="$(basename "$file" .opus)"
+        keep=false
+        for id in "${keep_ids[@]}"; do
             if [[ "$basename" == "$id" ]]; then
                 keep=true
                 break
@@ -285,8 +438,12 @@ cleanup_cache() {
     done
 }
 
-# Create MPV input config for next/previous
-MPV_INPUT_CONF="$CACHE_DIR/input.conf"
+# ==============================================================================
+# MPV Configuration
+# ==============================================================================
+
+# Generate MPV input bindings for next/previous navigation.
+readonly MPV_INPUT_CONF="${CACHE_DIR}/input.conf"
 cat > "$MPV_INPUT_CONF" << 'EOF'
 > quit 0
 < quit 2
@@ -294,72 +451,181 @@ NEXT quit 0
 PREV quit 2
 EOF
 
-# Main playback loop
-current_idx=0
+# Generate MPV Lua script for crossfade detection.
+# When the remaining time drops below CROSSFADE_SEC, the script:
+#   1. Writes a trigger file to signal the main loop
+#   2. Applies a fade-out audio filter on the current track
+readonly MPV_LUA_SCRIPT="${CACHE_DIR}/crossfade.lua"
+export CACHE_DIR
+cat > "$MPV_LUA_SCRIPT" << EOF
+local crossfade_time = ${CROSSFADE_SEC}.0
+local triggered = false
 
-echo -e "${CYAN}Starting playback...${NC}"
-echo -e "${YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit${NC}\n"
+mp.add_periodic_timer(0.2, function()
+    local tr = mp.get_property_number("time-remaining")
+    if tr and tr <= crossfade_time and not triggered then
+        triggered = true
+        mp.set_property("term-status-msg", "")
+        os.execute("touch " .. os.getenv("CACHE_DIR") .. "/next_trigger")
+        local tp = mp.get_property_number("time-pos")
+        mp.command("af add afade=t=out:st=" .. tostring(tp) .. ":d=" .. tostring(crossfade_time))
+    end
+end)
+EOF
 
-while [[ $current_idx -ge 0 && $current_idx -lt ${#PLAYLIST[@]} ]]; do
-    video_id="${PLAYLIST[$current_idx]}"
-    audio_file="$CACHE_DIR/${video_id}.opus"
-    
-    # Start preloading first
-    preload_songs "$current_idx"
-    
-    # Wait for current file to be ready
-    while [[ ! -f "$audio_file" ]]; do
-        sleep 0.1
-    done
-    
-    # Wait a bit more to ensure file is complete
-    sleep 0.5
-    
-    # Display song title (already fetched!)
-    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    song_title="${VIDEO_TITLES[$video_id]}"
-    echo -e "${GREEN}[$((current_idx + 1))/${#PLAYLIST[@]}]${NC} ${YELLOW}${song_title}${NC}"
-    
-    # Show next song if cached
-    next_idx=$((current_idx + 1))
-    if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
-        next_video_id="${PLAYLIST[$next_idx]}"
-        next_audio_file="$CACHE_DIR/${next_video_id}.opus"
-        if [[ -f "$next_audio_file" ]]; then
-            next_title="${VIDEO_TITLES[$next_video_id]}"
-            echo -e "\033[2m  ↪ Next: ${next_title}\033[0m"
-        fi
-    fi
-    
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    
-    # Play with mpv
+# ==============================================================================
+# Playback: No-Mix Mode (sequential, foreground mpv)
+# ==============================================================================
+
+# Play a single audio file in foreground mode without any crossfade processing.
+# Returns the mpv exit code.
+#
+# Arguments:
+#   $1 - Path to the audio file
+play_without_mix() {
+    local audio_file="${1:?play_without_mix: audio_file is required}"
+
     mpv --no-video \
         --input-conf="$MPV_INPUT_CONF" \
         --term-status-msg='Time: ${time-pos} / ${duration}' \
         "$audio_file"
-    
-    exit_code=$?
-    
-    # Cleanup old cache
+
+    return $?
+}
+
+# ==============================================================================
+# Playback: Mix Mode (crossfade with background mpv)
+# ==============================================================================
+
+# Tracks the PID of the previously fading-out mpv instance.
+fading_pid=""
+
+# Play a single audio file in crossfade mode.
+# Starts mpv in background with fade-in + silence removal filters.
+# Waits for either:
+#   - The Lua trigger file (time to overlap with the next song)
+#   - Or mpv exiting naturally (user skip / song ends without trigger)
+#
+# Sets the global 'exit_code' variable.
+#
+# Arguments:
+#   $1 - Path to the audio file
+play_with_mix() {
+    local audio_file="${1:?play_with_mix: audio_file is required}"
+    local trigger_file="${CACHE_DIR}/next_trigger"
+
+    rm -f "$trigger_file"
+
+    mpv --no-video \
+        --input-conf="$MPV_INPUT_CONF" \
+        --term-status-msg='Time: ${time-pos} / ${duration}' \
+        --script="$MPV_LUA_SCRIPT" \
+        --af="silenceremove=start_periods=1:start_threshold=-50dB,afade=t=in:st=0:d=${CROSSFADE_SEC}" \
+        "$audio_file" &
+
+    local mpv_pid=$!
+    exit_code=0
+
+    # Poll for the trigger file or mpv exit
+    while kill -0 "$mpv_pid" 2>/dev/null; do
+        if [[ -f "$trigger_file" ]]; then
+            rm -f "$trigger_file"
+            break
+        fi
+        sleep 0.2
+    done
+
+    if kill -0 "$mpv_pid" 2>/dev/null; then
+        # mpv is still running (fading out) — let it finish in background
+        exit_code=0
+
+        # Kill any previous mpv that was still fading out
+        if [[ -n "$fading_pid" ]] && kill -0 "$fading_pid" 2>/dev/null; then
+            kill "$fading_pid" 2>/dev/null || true
+        fi
+        fading_pid="$mpv_pid"
+    else
+        # mpv exited (user skip, song ended, or quit)
+        wait "$mpv_pid" 2>/dev/null || true
+        exit_code=$?
+
+        # Clean up any previous fading process
+        if [[ -n "$fading_pid" ]] && kill -0 "$fading_pid" 2>/dev/null; then
+            kill "$fading_pid" 2>/dev/null || true
+        fi
+        fading_pid=""
+    fi
+}
+
+# ==============================================================================
+# Main Playback Loop
+# ==============================================================================
+
+current_idx=0
+
+info "Starting playback..."
+echo -e "${YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit${NC}\n"
+
+while [[ $current_idx -ge 0 && $current_idx -lt ${#PLAYLIST[@]} ]]; do
+    video_id="${PLAYLIST[$current_idx]}"
+    audio_file="${CACHE_DIR}/${video_id}.opus"
+
+    # Preload nearby tracks
+    preload_songs "$current_idx"
+
+    # Wait for current file to be downloaded
+    while [[ ! -f "$audio_file" ]]; do
+        sleep 0.1
+    done
+
+    # Brief wait to ensure the file write is complete
+    sleep 0.5
+
+    # Display track information
+    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    song_title="${VIDEO_TITLES[$video_id]:-Unknown Title}"
+    echo -e "${GREEN}[$((current_idx + 1))/${#PLAYLIST[@]}]${NC} ${YELLOW}${song_title}${NC}"
+
+    # Show upcoming track preview
+    next_idx=$((current_idx + 1))
+    if [[ $next_idx -lt ${#PLAYLIST[@]} ]]; then
+        next_video_id="${PLAYLIST[$next_idx]}"
+        next_audio_file="${CACHE_DIR}/${next_video_id}.opus"
+        if [[ -f "$next_audio_file" ]]; then
+            next_title="${VIDEO_TITLES[$next_video_id]:-Unknown Title}"
+            echo -e "${DIM}  ↪ Next: ${next_title}${NC}"
+        fi
+    fi
+
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    # Play the current track
+    exit_code=0
+    if [[ "$MIX_SONGS" == false ]]; then
+        play_without_mix "$audio_file"
+        exit_code=$?
+    else
+        play_with_mix "$audio_file"
+        # exit_code is set by play_with_mix
+    fi
+
+    # Evict old cache entries
     cleanup_cache "$current_idx"
-    
-    # Handle mpv exit codes
-    # 0 = normal exit or '>' pressed (next)
-    # 2 = '<' pressed (previous)
-    # 4 = Shift+q pressed (quit)
+
+    # Handle mpv exit codes:
+    #   0 = normal exit / '>' pressed (next)
+    #   2 = '<' pressed (previous)
+    #   4 = Shift+q pressed (quit)
     if [[ $exit_code -eq 4 ]]; then
-        echo -e "${YELLOW}Quitting...${NC}"
+        warn "Quitting..."
         break
     elif [[ $exit_code -eq 2 ]]; then
-        # Previous song
         if [[ $current_idx -gt 0 ]]; then
             current_idx=$((current_idx - 1))
         fi
     else
-        # Next song (exit code 0 or anything else)
         current_idx=$((current_idx + 1))
     fi
 done
 
-echo -e "${GREEN}Playlist finished!${NC}"
+success "Playlist finished!"
