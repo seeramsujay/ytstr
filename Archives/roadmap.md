@@ -14,7 +14,7 @@ A chronological log of decisions, implementations, and milestones for `ytstr`.
 
 ---
 
-## V4: Integration with Mixer's Decision Engine ✅ COMPLETED
+## V2.0.0: Integration with Mixer's Decision Engine ✅ COMPLETED
 - **Goal:** Port the intelligent spectral `DecisionEngine` from the `mixer` project into `ytstr` to turn it into an advanced auto-DJ.
 - ✅ Incorporated psychoacoustic transition algorithms: Rise, Bass Swap, Filter Wash, Cut In, Melt, Tape Stop, Blend, and Fade.
 - ✅ Added `--light-mix` argument to allow falling back to the V1 equal-power crossfade (bypassing spectral analysis).

@@ -59,7 +59,7 @@ except ImportError:
     keyboard = None
 
 # Configuration & Globals
-VERSION = "4.0.0"
+VERSION = "2.0.0"
 PLAYLIST_FILE = os.path.expanduser("~/.config/ytstr/playlists")
 CACHE_DIR = None 
 
