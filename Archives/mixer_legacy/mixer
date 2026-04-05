@@ -1,0 +1,1277 @@
+#!/usr/bin/env python3
+"""
+mixer — V2 Automatic DJ: Gapless Streamer with Intelligent Transitions
+=======================================================================
+This is the main entry-point for the Mixer project (V2).
+
+Architecture
+------------
+The daemon is split into three concurrent layers:
+
+1. **Audio Processor Thread** (`audio_processor_thread`)
+   Runs in a background thread. Lazily loads one track at a time,
+   asks the `DecisionEngine` to pick a transition, bakes the crossfade
+   chunk, and writes it to `/dev/shm/` as a temporary WAV file. It then
+   signals the main thread via a bounded `queue.Queue`.
+
+2. **Decision Engine** (`DecisionEngine`)
+   Analyses the *outgoing* track's last 5 s and the *incoming* track's
+   first 5 s. Extracts four features — total RMS, bass RMS (< 250 Hz),
+   treble RMS (> 2 kHz), and energy variance — and applies a rule-based
+   priority waterfall to select one of seven transition styles.
+
+3. **Main Loop** (`main`)
+   Runs the mpv subprocess with IPC enabled. Polls mpv's playlist via
+   the Unix domain socket to determine how many tracks are queued ahead
+   of the currently playing one, then feeds the next processed chunk
+   from the queue when the buffer runs low. Also handles `/dev/shm`
+   garbage-collection of already-played chunks.
+
+Transition Styles
+-----------------
+fade         Classic equal-power (sinusoidal) crossfade.
+blend        Extended 10 s overlap with equal-power curves — ideal for
+             EDM / Techno where tracks share a similar BPM.
+rise         Progressive 0→+4 dB swell on the incoming track to
+             emphasise an energy surge or "drop".
+cut_in       Hard cut with a 15 ms anti-pop micro-fade guard.
+bass_swap    Progressive high-pass sweep (80 → 800 Hz, exponential) on
+             the outgoing track + 120 Hz HP kill on the incoming track
+             to prevent muddy low-end collisions.
+filter_wash  Progressive high-pass sweep (80 → 2000 Hz) with a
+             resonance bump tracking the cutoff, making the outgoing
+             track sound increasingly thin and distant.
+melt         Multi-echo atmospheric dissolve (three tap delays at
+             200 / 400 / 700 ms) with soft low-pass smoothing at 3 kHz.
+tape_stop    Tape crossfade — progressive tape/turntable slowdown on the
+             outgoing track overlaid with an equal-power fade-in of the
+             incoming track, so the new track emerges as the old one
+             winds down.
+
+Dependencies
+------------
+    pip install pydub
+    apt install mpv ffmpeg    # (or brew install mpv ffmpeg on macOS)
+
+Usage
+-----
+    cd /path/to/music/folder
+    mixer
+
+Supported formats: mp3, m4a, wav, opus, flac, ogg, aac, webm.
+Processed chunks are staged in /dev/shm/ (RAM filesystem) and
+automatically cleaned up after playback.
+"""
+
+import sys
+import os
+import math
+import subprocess
+import random
+import time
+import json
+import socket
+import threading
+import queue
+import re
+import traceback
+
+try:
+    from pynput import keyboard
+except ImportError:
+    keyboard = None
+
+from pydub import AudioSegment
+from pydub.effects import high_pass_filter, low_pass_filter
+
+# ──────────────────────────────────────────────────────────────────────
+#  Audio Utilities
+# ──────────────────────────────────────────────────────────────────────
+
+def get_equal_power_gain(t: float, duration: float, is_fade_in: bool = True) -> float:
+    """
+    Return a dB gain value for a single point on an equal-power fade curve.
+
+    The curve follows a quarter-cosine (sin²) power law, which keeps the
+    *perceived* combined loudness constant during a crossfade — the
+    psychoacoustic equivalent of a DJ's equal-power crossfader.
+
+    Parameters
+    ----------
+    t          : Current time position within the fade, in milliseconds.
+    duration   : Total fade duration, in milliseconds.
+    is_fade_in : True to compute a fade-in (0 dB → 0 dB), False for fade-out.
+
+    Returns
+    -------
+    dB gain as a float. Returns −120.0 (effectively silence) when the
+    computed multiplier is non-positive.
+    """
+    x = t / duration if duration > 0 else 0.0
+    if not is_fade_in:
+        x = 1.0 - x
+    multiplier = math.sin(x * math.pi / 2.0)
+    if multiplier <= 0:
+        return -120.0
+    return 20.0 * math.log10(multiplier)
+
+
+def equal_power_fade(audio: AudioSegment, duration_ms: int, is_fade_in: bool = True) -> AudioSegment:
+    """
+    Apply an equal-power (sinusoidal) fade to an AudioSegment.
+
+    The audio is processed in 10 ms grains so the gain curve has a high
+    enough resolution to sound smooth on standard equipment. Grains outside
+    the fade window are returned unmodified.
+
+    Parameters
+    ----------
+    audio       : The source audio to fade.
+    duration_ms : Length of the fade in milliseconds. Clamped to len(audio).
+    is_fade_in  : True to fade from silence to full volume; False for the reverse.
+
+    Returns
+    -------
+    A new AudioSegment with the fade applied.
+    """
+    if duration_ms <= 0:
+        return audio
+    duration_ms = min(duration_ms, len(audio))
+    chunk_size = 10  # ms per grain — smaller = smoother but slower
+
+    fade_audio = audio[:duration_ms] if is_fade_in else audio[-duration_ms:]
+    remainder  = audio[duration_ms:] if is_fade_in else audio[:-duration_ms]
+
+    faded_chunks = []
+    for i in range(0, len(fade_audio), chunk_size):
+        chunk = fade_audio[i:i + chunk_size]
+        t     = i if is_fade_in else i + chunk_size
+        gain  = get_equal_power_gain(t, duration_ms, is_fade_in)
+        faded_chunks.append(chunk.apply_gain(gain))
+
+    faded_section = sum(faded_chunks) if faded_chunks else AudioSegment.empty()
+
+    return (faded_section + remainder) if is_fade_in else (remainder + faded_section)
+
+
+def trim_to_energy(audio: AudioSegment, chunk_ms: int = 100, threshold_ratio: float = 0.5) -> AudioSegment:
+    """
+    Strip low-energy intro and outro regions using RMS thresholding.
+
+    The function scans the track in *chunk_ms* windows from both ends and
+    drops contiguous low-energy segments until a chunk exceeds
+    ``avg_rms * threshold_ratio``. One extra window is kept on each side
+    as a safety buffer.
+
+    This replicates the "energy trim" technique used by professional DJ
+    software to ensure every track starts and ends at a musically active
+    moment rather than in silence or atmospheric rumble.
+
+    Parameters
+    ----------
+    audio           : Source audio segment.
+    chunk_ms        : Window size for RMS analysis (default 100 ms).
+    threshold_ratio : Fraction of the track's average RMS to treat as the
+                      threshold (default 0.5 = 50 %).
+
+    Returns
+    -------
+    A trimmed AudioSegment. Returns the original if no meaningful trim
+    can be performed (e.g. completely silent audio).
+    """
+    avg_rms = audio.rms
+    if avg_rms == 0:
+        return audio
+
+    threshold = avg_rms * threshold_ratio
+
+    # ── Scan from the front ─────────────────────────────────────────
+    start_trim = 0
+    for i in range(0, len(audio), chunk_ms):
+        if audio[i:i + chunk_ms].rms >= threshold:
+            start_trim = max(0, i - chunk_ms)
+            break
+
+    # ── Scan from the back ──────────────────────────────────────────
+    end_trim = len(audio)
+    for i in range(len(audio), 0, -chunk_ms):
+        if audio[i - chunk_ms:i].rms >= threshold:
+            end_trim = min(len(audio), i + chunk_ms)
+            break
+
+    if start_trim >= end_trim:
+        return audio  # Safety: avoid returning an empty segment
+
+    intro_cut = start_trim
+    outro_cut = len(audio) - end_trim
+    if intro_cut > 0 or outro_cut > 0:
+        print(f"  -> Stripped {intro_cut}ms intro and {outro_cut}ms outro fluff.", file=sys.stderr)
+    return audio[start_trim:end_trim]
+
+
+def tape_stop_effect(audio: AudioSegment, duration_ms: int) -> AudioSegment:
+    """
+    Simulate a progressive tape/turntable stop effect.
+    
+    Slows down the audio over the given duration by progressively dropping
+    its frame rate and fading it out, simulating a turntable losing power.
+    """
+    if len(audio) == 0:
+        return audio
+        
+    duration_ms = min(duration_ms, len(audio))
+    tail = audio[-duration_ms:]
+    head = audio[:-duration_ms]
+    
+    steps = 20
+    chunk_len = len(tail) // steps
+    if chunk_len == 0:
+        return audio
+        
+    parts = []
+    for i in range(steps):
+        chunk = tail[i*chunk_len : (i+1)*chunk_len]
+        ratio = 1.0 - (i / steps) * 0.9  # 100% down to 10% speed
+        new_frame_rate = max(int(chunk.frame_rate * ratio), 1000)
+        
+        try:
+            # Spawn a new segment with a lower frame rate, expanding duration and dropping pitch
+            slowed = chunk._spawn(chunk.raw_data, overrides={
+                "frame_rate": new_frame_rate
+            }).set_frame_rate(chunk.frame_rate)
+        except Exception:
+            slowed = chunk
+            
+        # Progressive volume drop up to -15dB
+        vol_drop = - (i / steps) * 15
+        parts.append(slowed + vol_drop)
+        
+    leftover = tail[steps*chunk_len:]
+    if len(leftover) > 0:
+        parts.append(leftover - 15)
+        
+    res = sum(parts) if parts else tail
+    # Small fade out at the very end to prevent clicking
+    res = res.fade_out(min(200, len(res)))
+    return head + res
+
+
+def tape_start_effect(audio: AudioSegment, duration_ms: int) -> AudioSegment:
+    """
+    Simulate a turntable/tape powering ON — the reverse of tape_stop_effect.
+
+    The audio begins at ~10 % speed (deep, warped pitch) and ramps up to
+    full speed over *duration_ms*, simulating a record player reaching its
+    target RPM.  Volume also ramps from −15 dB to 0 dB so the warp-in
+    grows progressively louder.
+    """
+    if len(audio) == 0:
+        return audio
+
+    duration_ms = min(duration_ms, len(audio))
+    head = audio[:duration_ms]
+    tail = audio[duration_ms:]
+
+    steps = 20
+    chunk_len = len(head) // steps
+    if chunk_len == 0:
+        return audio
+
+    parts = []
+    for i in range(steps):
+        chunk = head[i * chunk_len : (i + 1) * chunk_len]
+        # Ramp from 10 % speed at step 0 → 100 % at the last step
+        ratio = 0.1 + (i / steps) * 0.9
+        new_frame_rate = max(int(chunk.frame_rate * ratio), 1000)
+
+        try:
+            sped = chunk._spawn(chunk.raw_data, overrides={
+                "frame_rate": new_frame_rate
+            }).set_frame_rate(chunk.frame_rate)
+        except Exception:
+            sped = chunk
+
+        # Progressive volume ramp: −15 dB → 0 dB
+        vol_boost = -15 * (1.0 - (i / steps))
+        parts.append(sped + vol_boost)
+
+    leftover = head[steps * chunk_len:]
+    if len(leftover) > 0:
+        parts.append(leftover)  # Already at full speed / volume
+
+    res = sum(parts) if parts else head
+    # Small fade in at the very start to prevent clicking
+    res = res.fade_in(min(200, len(res)))
+    return res + tail
+
+
+def safe_clamp_fade(duration_ms: int, *tracks: AudioSegment) -> int:
+    """
+    Clamp a desired fade duration so it never exceeds half of any track's length.
+
+    This prevents the fade windows of two adjacent tracks from overlapping
+    each other, which would corrupt the mix structure.
+
+    Parameters
+    ----------
+    duration_ms : Desired fade length in milliseconds.
+    *tracks     : Any number of AudioSegments to clamp against.
+
+    Returns
+    -------
+    Clamped duration as an int ≥ 0.
+    """
+    result = duration_ms
+    for t in tracks:
+        if t is not None and len(t) > 0:
+            result = min(result, len(t) // 2)
+    return max(result, 0)
+
+
+def progressive_high_pass(audio: AudioSegment, start_hz: int, end_hz: int, steps: int = 20) -> AudioSegment:
+    """
+    Apply a progressive high-pass filter sweep across the duration of *audio*.
+
+    Slices the audio into *steps* equal chunks and applies an increasing
+    cutoff frequency from *start_hz* to *end_hz*. This simulates the
+    effect of a DJ slowly turning a filter knob — the sound becomes
+    progressively thinner rather than cutting abruptly.
+
+    Used internally by `trans_bass_swap` and `trans_filter_wash`.
+
+    Parameters
+    ----------
+    audio     : Source audio to filter.
+    start_hz  : Starting cutoff frequency in Hz (low end of the sweep).
+    end_hz    : Ending cutoff frequency in Hz (high end of the sweep).
+    steps     : Number of discrete filter steps (default 20).
+
+    Returns
+    -------
+    A new AudioSegment with the progressive filter applied.
+    """
+    if len(audio) == 0 or steps <= 0:
+        return audio
+    step_len = len(audio) // steps
+    if step_len == 0:
+        return audio
+
+    parts = []
+    for i in range(steps):
+        ratio   = i / max(steps - 1, 1)
+        cutoff  = int(start_hz * (end_hz / start_hz) ** ratio)
+        cutoff  = max(cutoff, 20)  # pydub's minimum supported cutoff
+        chunk   = audio[i * step_len:(i + 1) * step_len]
+        try:
+            chunk = high_pass_filter(chunk, cutoff)
+        except Exception:
+            pass  # Preserve chunk unfiltered on unexpected pydub failure
+        parts.append(chunk)
+
+    # Handle any leftover samples from integer division
+    leftover = audio[steps * step_len:]
+    if len(leftover) > 0:
+        try:
+            leftover = high_pass_filter(leftover, end_hz)
+        except Exception:
+            pass
+        parts.append(leftover)
+
+    return sum(parts) if parts else audio
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Transition Implementations
+# ──────────────────────────────────────────────────────────────────────
+
+def trans_fade(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Classic equal-power crossfade.
+
+    The outgoing track fades out while the incoming track fades in
+    simultaneously using sinusoidal gain curves. The combined perceived
+    volume remains constant throughout.
+
+    Best for: Pop, Rock, Vocals — any genre where clean separation
+    between melodic elements matters.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    fout = equal_power_fade(current_song[-eff:], eff, is_fade_in=False)
+    fin  = equal_power_fade(next_song[:eff], eff, is_fade_in=True)
+    return fout.overlay(fin), eff
+
+
+def trans_blend(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Extended overlap blend (up to 10 000 ms) using equal-power curves.
+
+    Both tracks play simultaneously at near-full volume for an extended
+    window, letting their rhythmic patterns "lock" before one fades away.
+    The duration is capped to the shorter track's half-length to avoid
+    structural corruption.
+
+    Best for: House, Techno, EDM — tracks with compatible BPMs where
+    a long groove-lock transition sounds natural.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    blend_ms = min(10000, fade_ms * 4)
+    eff = safe_clamp_fade(blend_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    fout = equal_power_fade(current_song[-eff:], eff, is_fade_in=False)
+    fin  = equal_power_fade(next_song[:eff], eff, is_fade_in=True)
+    return fout.overlay(fin), eff
+
+
+def trans_cut_in(current_song: AudioSegment, next_song: AudioSegment, _fade_ms: int):
+    """
+    Hard cut with a 15 ms anti-pop micro-fade on both sides.
+
+    The raw hard cut (sample-accurate switch) would cause a sharp
+    discontinuity at the splice point, creating an audible click or pop.
+    The 15 ms micro-fade on each side ramps through just enough samples
+    to prevent this without sounding like a true crossfade.
+
+    Best for: Dramatic genre switches (e.g. 128 BPM Dance → 70 BPM Hip-Hop)
+    where a long blend would sound rhythmically chaotic.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    guard_ms = 15
+    if len(current_song) < guard_ms or len(next_song) < guard_ms:
+        return AudioSegment.empty(), 0
+
+    tail = current_song[-guard_ms:].fade_out(guard_ms)
+    head = next_song[:guard_ms].fade_in(guard_ms)
+    return tail.overlay(head), guard_ms
+
+
+def trans_rise(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Progressive volume swell: incoming track ramps from 0 to +4 dB.
+
+    Applies the equal-power fade-in curve and simultaneously ramps a
+    gain boost from 0 dB at the start to +4 dB at the transition's end.
+    This creates a perceived energy surge or "drop" — the incoming track
+    doesn't just fade in, it actively swells above the outgoing one.
+
+    Best for: Transition into a high-energy chorus, beat drop, or
+    climactic section where the new track should feel louder/bigger.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    fout = equal_power_fade(current_song[-eff:], eff, is_fade_in=False)
+
+    # Build the incoming fade with a progressive 0→+4 dB swell baked
+    # into the same grain loop used by equal_power_fade, avoiding a
+    # redundant second pass over the samples.
+    chunk_size = 10
+    in_audio = next_song[:eff]
+    boosted_chunks = []
+    for i in range(0, eff, chunk_size):
+        chunk = in_audio[i:i + chunk_size]
+        fade_gain = get_equal_power_gain(i, eff, is_fade_in=True)
+        swell_db  = 4.0 * (i / max(eff - 1, 1))
+        boosted_chunks.append(chunk.apply_gain(fade_gain + swell_db))
+    fin = sum(boosted_chunks) if boosted_chunks else in_audio
+
+    return fout.overlay(fin), eff
+
+
+def trans_bass_swap(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Progressive high-pass sweep (80 → 800 Hz) on the outgoing track
+    with a 120 Hz "full kill" HP on the incoming track.
+
+    Gradually removes the low-frequency content of the outgoing track
+    over the transition window using an exponential sweep. The incoming
+    track's sub-bass (< 120 Hz) is completely suppressed during the
+    overlap per Research Report §6.3 ("full kill" at −∞ dB), ensuring
+    only one bassline occupies the low end at any given moment.
+
+    Best for: Back-to-back bass-heavy tracks in a continuous mix (EDM,
+    Hip-Hop, Drum & Bass). The "rule" in professional DJing: never let
+    two basses play at full volume simultaneously.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    # Progressively sweep high-pass on outgoing to kill its bass (80 → 800 Hz)
+    out_part = progressive_high_pass(current_song[-eff:], 80, 800, steps=25)
+    out_part = equal_power_fade(out_part, eff, is_fade_in=False)
+
+    # Full-kill HP at 120 Hz on incoming — no sub-bass during overlap
+    try:
+        in_cleaned = high_pass_filter(next_song[:eff], 120)
+    except Exception:
+        in_cleaned = next_song[:eff]
+
+    in_part = equal_power_fade(in_cleaned, eff, is_fade_in=True)
+    return out_part.overlay(in_part), eff
+
+
+def trans_filter_wash(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Progressive high-pass sweep (80 → 2000 Hz) with resonance tracking.
+
+    Sweeps the filter cutoff from 80 Hz to 2 kHz across an extended
+    window (+2 s beyond the base fade). A resonance bump (+4 dB) is
+    progressively faded in at the 1–2 kHz band during the second half
+    of the sweep, simulating the "synthetic wind" effect described in
+    Research Report §6.1. This resonant artifact masks harmonic
+    dissonance between clashing keys.
+
+    Best for: Outgoing tracks with chaotic, busy, or clashing outros
+    that would fight with the incoming track's intro if played on top
+    of each other directly.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    wash_ms = min(fade_ms + 2000, len(current_song) // 2, len(next_song) // 2)
+    if wash_ms <= 0:
+        return AudioSegment.empty(), 0
+
+    raw_out = current_song[-wash_ms:]
+    out_part = progressive_high_pass(raw_out, 80, 2000, steps=30)
+
+    # Progressive resonance bump: fade a 1–2 kHz bandpass in over the
+    # second half of the sweep, so the "whistle" rides the moving cutoff.
+    try:
+        resonance = high_pass_filter(low_pass_filter(raw_out, 2000), 1000) + 4
+        # Only apply in the second half (where cutoff is near resonance band)
+        half = wash_ms // 2
+        silence = AudioSegment.silent(duration=half, frame_rate=raw_out.frame_rate)
+        res_faded = silence + equal_power_fade(resonance[half:], wash_ms - half, is_fade_in=True)
+        out_part = out_part.overlay(res_faded)
+    except Exception:
+        pass
+
+    out_part = equal_power_fade(out_part, wash_ms, is_fade_in=False)
+    in_part  = equal_power_fade(next_song[:wash_ms], wash_ms, is_fade_in=True)
+    return out_part.overlay(in_part), wash_ms
+
+
+def trans_melt(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Multi-echo atmospheric dissolve with low-pass softening.
+
+    Creates a reverb-like wash by layering three attenuated, delayed
+    copies of the outgoing audio on top of itself:
+      - Tap 1: 200 ms delay, −3 dB
+      - Tap 2: 400 ms delay, −6 dB
+      - Tap 3: 700 ms delay, −10 dB
+
+    The combined echo wash is then low-pass filtered at 3 kHz to soften
+    the high frequencies, creating the impression of the track dissolving
+    into reverb before the new track fades in. The extended window (+4 s)
+    gives the echoes room to decay naturally.
+
+    Best for: Psychedelic, Lo-Fi, or Ambient music where an abrupt end
+    would break the mood. The goal is for the listener to barely notice
+    the switch happened.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    melt_ms = min(fade_ms + 4000, len(current_song) // 2, len(next_song) // 2)
+    if melt_ms <= 0:
+        return AudioSegment.empty(), 0
+
+    out_part = current_song[-melt_ms:]
+
+    # Layer echo taps: (delay_ms, attenuation_dB)
+    echo_taps = [(200, -3), (400, -6), (700, -10)]
+    for delay_ms, atten_db in echo_taps:
+        if melt_ms > delay_ms * 2:
+            echo = out_part + atten_db  # Attenuate copy
+            # Time-shift the echo by prepending silence and chopping the tail
+            echo = AudioSegment.silent(duration=delay_ms) + echo[:-delay_ms]
+            out_part = out_part.overlay(echo)
+
+    # Soften the echo wash with a low-pass filter
+    try:
+        out_part = low_pass_filter(out_part, 3000)
+    except Exception:
+        pass
+
+    out_part = equal_power_fade(out_part, melt_ms, is_fade_in=False)
+    in_part  = equal_power_fade(next_song[:melt_ms], melt_ms, is_fade_in=True)
+    return out_part.overlay(in_part), melt_ms
+
+
+def trans_tape_stop(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Tape warp crossfade — the universal fallback DJ transition.
+
+    Outgoing track winds DOWN (tape stop: pitch drops, slows to silence)
+    while the incoming track warps UP (tape start: deep/slow → full speed).
+    The two are overlaid so the listener hears the old track grinding to a
+    halt as the new one spins up — a classic turntable-swap warp effect.
+
+    Capped at 1.5 s to stay punchy and transition-like.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    short_ms = min(1500, fade_ms)
+    eff = safe_clamp_fade(short_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    # Outgoing winds down
+    out_part = tape_stop_effect(current_song[-eff:], eff)
+    # Incoming warps up
+    in_part  = tape_start_effect(next_song[:eff], eff)
+
+    # Pad the shorter segment so both are the same length before overlay
+    if len(out_part) > len(in_part):
+        in_part = in_part + AudioSegment.silent(duration=len(out_part) - len(in_part),
+                                                 frame_rate=in_part.frame_rate)
+    elif len(in_part) > len(out_part):
+        out_part = out_part + AudioSegment.silent(duration=len(in_part) - len(out_part),
+                                                   frame_rate=out_part.frame_rate)
+
+    return out_part.overlay(in_part), eff
+
+
+# Dispatch table mapping transition names to their handler functions.
+# New transitions can be added here without modifying apply_transition().
+TRANSITIONS: dict = {
+    "fade":        trans_fade,
+    "blend":       trans_blend,
+    "cut_in":      trans_cut_in,
+    "rise":        trans_rise,
+    "bass_swap":   trans_bass_swap,
+    "filter_wash": trans_filter_wash,
+    "melt":        trans_melt,
+    "tape_stop":   trans_tape_stop,
+}
+
+
+def apply_transition(trans_type: str, current_song: AudioSegment,
+                     next_song: AudioSegment, fade_ms: int):
+    """
+    Dispatch to the correct transition handler by name.
+
+    Falls back to `trans_fade` for unknown transition types so the
+    pipeline never crashes due to an unsupported name.
+
+    Parameters
+    ----------
+    trans_type  : Transition name (e.g. "bass_swap"). See TRANSITIONS dict.
+    current_song: The outgoing track.
+    next_song   : The incoming track (or None if this is the last track).
+    fade_ms     : Base crossfade duration hint in milliseconds.
+
+    Returns
+    -------
+    (overlap_audio, overlap_duration_ms) — the rendered overlap segment and
+    the number of ms consumed from the ends of each track.
+    """
+    if next_song is None:
+        return AudioSegment.empty(), 0
+    fn = TRANSITIONS.get(trans_type, trans_fade)
+    return fn(current_song, next_song, fade_ms)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Decision Engine
+# ──────────────────────────────────────────────────────────────────────
+
+class DecisionEngine:
+    """
+    Automatic DJ transition selector based on spectral energy analysis.
+
+    For each track pair, the engine analyses a 5-second window at the end
+    of the outgoing track and the start of the incoming track. It extracts
+    four features and applies a priority-ordered waterfall of rules to
+    select the transition style that best suits each specific handoff.
+
+    Features
+    --------
+    rms         : Total signal energy (mono amplitude).
+    bass_rms    : Energy in the sub-250 Hz band (kick drums, bass guitar).
+    treble_rms  : Energy above 2 kHz (hi-hats, vocals, cymbals).
+    variance    : How much the energy fluctuates over 500 ms windows.
+                  Low variance = steady, repetitive groove.
+                  High variance = dynamic, ever-changing energy.
+
+    Decision Rules (evaluated in priority order)
+    --------------------------------------------
+    1. Incoming is ≥ 1.8× louder than outgoing  →  rise
+       (Strong energy surge — progressive swell emphasises the drop.)
+    2. Both tracks are > 40 % bass               →  bass_swap
+       (Prevent muddy low-end collisions via HP sweep + LF kill.)
+    3. Outgoing treble > 1.8× its bass           →  filter_wash
+       (Outgoing is treble-dominated — sweep it away with resonance.)
+    4. Outgoing is < 25 % of incoming energy     →  cut_in
+       (Outgoing is nearly inaudible — hard cut, no point blending.)
+    5. Outgoing energy variance > 0.4 × rms²    →  melt
+       (Chaotic ending — dissolve it with echo wash rather than fade.)
+    6. Both tracks variance < 0.08 × rms²       →  blend
+       (Steady-groove tracks benefit from the long 10 s overlap.)
+    7. Default                                    →  fade
+    """
+
+    ANALYSIS_WINDOW_MS = 5000
+
+    def _analyze(self, chunk: AudioSegment) -> tuple:
+        """
+        Extract (rms, bass_rms, treble_rms, energy_variance) from a chunk.
+
+        Energy variance is computed by splitting the chunk into 500 ms
+        windows, measuring the RMS of each, and returning the population
+        variance. This quantifies how "dynamic" or "chaotic" the energy
+        profile is.
+        """
+        if chunk is None or len(chunk) == 0:
+            return 0.0, 0.0, 0.0, 0.0
+
+        rms = float(chunk.rms)
+
+        try:
+            bass = float(low_pass_filter(chunk, 250).rms)
+        except Exception:
+            bass = rms
+        try:
+            treble = float(high_pass_filter(chunk, 2000).rms)
+        except Exception:
+            treble = rms
+
+        # Population variance of per-window RMS values
+        window_ms = 500
+        energies = [float(chunk[i:i + window_ms].rms)
+                    for i in range(0, len(chunk), window_ms)]
+        if len(energies) > 1:
+            mean     = sum(energies) / len(energies)
+            variance = sum((e - mean) ** 2 for e in energies) / len(energies)
+        else:
+            variance = 0.0
+
+        return rms, bass, treble, variance
+
+    def select_transition(self, current_song: AudioSegment,
+                          next_song: AudioSegment) -> str:
+        """
+        Return the name of the best-fit transition for this track pair.
+
+        Parameters
+        ----------
+        current_song : The outgoing AudioSegment.
+        next_song    : The incoming AudioSegment.
+
+        Returns
+        -------
+        A transition name string (key of the TRANSITIONS dict).
+        Falls back to "fade" when inputs are None or RMS is zero.
+        """
+        if current_song is None or next_song is None:
+            return "fade"
+
+        win_a = min(self.ANALYSIS_WINDOW_MS, len(current_song))
+        win_b = min(self.ANALYSIS_WINDOW_MS, len(next_song))
+        a_rms, a_bass, a_treble, a_var = self._analyze(current_song[-win_a:])
+        b_rms, b_bass, b_treble, b_var = self._analyze(next_song[:win_b])
+
+        if a_rms == 0 or b_rms == 0:
+            return "fade"
+
+        # Rule 1: Incoming drop / energy surge
+        if b_rms > a_rms * 1.8:
+            return "rise"
+
+        # Rule 2: Very different tracks → tape_stop (prevent clashing overlaps)
+        # Triggers when tracks diverge significantly in:
+        #   - overall energy (RMS ratio > 3×)
+        #   - energy dynamics (variance ratio > 4×)
+        #   - frequency balance (bass/treble profile ratio > 2.5×)
+        rms_ratio = max(a_rms, 1) / max(b_rms, 1)
+        a_profile = a_bass / max(a_treble, 1)
+        b_profile = b_bass / max(b_treble, 1)
+        if (rms_ratio > 3.0 or rms_ratio < (1.0 / 3.0) or
+            max(a_var, 1) / max(b_var, 1) > 4.0 or
+            max(b_var, 1) / max(a_var, 1) > 4.0 or
+            max(a_profile, 0.1) / max(b_profile, 0.1) > 2.5 or
+            max(b_profile, 0.1) / max(a_profile, 0.1) > 2.5):
+            return "tape_stop"
+
+        # Rule 3: Both tracks are bass-heavy → prevent low-end mud
+        if (a_bass / a_rms) > 0.40 and (b_bass / b_rms) > 0.40:
+            return "bass_swap"
+
+        # Rule 3: Outgoing is treble-dominated / cluttered → wash away
+        if a_treble > a_bass * 1.8 and a_bass > 0:
+            return "filter_wash"
+
+        # Rule 4: Outgoing is nearly silent → hard cut, no point blending
+        if a_rms < b_rms * 0.25:
+            return "cut_in"
+
+        # Rule 5: Outgoing energy is chaotic → dissolve with echoes
+        if a_var > (a_rms ** 2) * 0.4:
+            return "melt"
+
+        # Rule 6: Both tracks have a steady, repetitive groove → long blend
+        if a_var < (a_rms ** 2) * 0.08 and b_var < (b_rms ** 2) * 0.08:
+            return "blend"
+
+        # Default: tape crossfade — short, safe, works with any edge case
+        return "tape_stop"
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  File Discovery
+# ──────────────────────────────────────────────────────────────────────
+
+# Supported audio file extensions
+VALID_AUDIO_EXTS = ('.mp3', '.m4a', '.wav', '.opus', '.flac', '.ogg', '.aac', '.webm')
+# Filename prefixes to skip (our own temporary files)
+IGNORE_PREFIXES  = ('mixer_part_', 'mixer_tmp')
+# Specific filenames to skip
+IGNORE_FILES     = {'full_dj_mix.wav'}
+
+
+def find_all_audio_files() -> list:
+    """
+    Return a sorted list of playable audio files in the current directory.
+
+    Skips any file whose name starts with a prefix in IGNORE_PREFIXES
+    (our own temporary chunks) or exactly matches a name in IGNORE_FILES
+    (any previously exported full mixes).
+    """
+    files = []
+    for f in os.listdir('.'):
+        if not os.path.isfile(f):
+            continue
+        if not f.lower().endswith(VALID_AUDIO_EXTS):
+            continue
+        if f in IGNORE_FILES or any(f.startswith(p) for p in IGNORE_PREFIXES):
+            continue
+        files.append(f)
+    return sorted(files)
+
+
+def load_and_trim(filepath: str):
+    """
+    Load an audio file from disk and apply RMS-based energy trimming.
+
+    Uses pydub's AudioSegment.from_file() which delegates format detection
+    to ffmpeg/ffprobe, so any ffmpeg-supported format will work.
+
+    Parameters
+    ----------
+    filepath : Path to the audio file.
+
+    Returns
+    -------
+    A trimmed AudioSegment, or None if the file could not be loaded.
+    """
+    print(f"Loading '{filepath}'...", file=sys.stderr)
+    try:
+        audio = AudioSegment.from_file(filepath)
+        return trim_to_energy(audio)
+    except Exception as e:
+        print(f"Warning: Could not load {filepath} ({e}). Skipping.", file=sys.stderr)
+        return None
+
+
+def send_mpv_command(socket_path: str, cmd_list: list):
+    """
+    Send a JSON IPC command to a running mpv process and return its response.
+
+    Parameters
+    ----------
+    socket_path : Filesystem path to mpv's Unix domain socket.
+    cmd_list    : IPC command as a list (e.g. ["get_property", "pause"]).
+
+    Returns
+    -------
+    Parsed JSON response dict, or None on any error.
+    """
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2.0)
+        sock.connect(socket_path)
+        payload = json.dumps({"command": cmd_list}) + '\n'
+        sock.sendall(payload.encode('utf-8'))
+        response = sock.recv(4096)
+        return json.loads(response.decode('utf-8'))
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+#  Disk Buffer with Hysteresis
+# ──────────────────────────────────────────────────────────────────────
+
+BUFFER_HIGH_WATERMARK_MB = 15.0
+BUFFER_LOW_WATERMARK_MB  = 5.0
+
+def get_shm_size() -> float:
+    """Return total size in MB of all active mixer chunks in /dev/shm/."""
+    total = 0
+    try:
+        for f in os.listdir("/dev/shm/"):
+            if f.startswith("mixer_part_") and f.endswith(".m4a"):
+                total += os.path.getsize(os.path.join("/dev/shm", f))
+    except OSError:
+        pass
+    return total / (1024.0 * 1024.0)
+
+def safe_filename(name: str) -> str:
+    """Make filename safe for saving in /dev/shm/."""
+    return "".join(c for c in name if c.isalnum() or c in " _-()").strip()
+
+# ──────────────────────────────────────────────────────────────────────
+#  Audio Processing → Disk Cache Pipeline
+# ──────────────────────────────────────────────────────────────────────
+
+def audio_processor_thread(audio_files: list, fade_ms: int,
+                           mix_queue: queue.Queue,
+                           error_event: threading.Event):
+    """
+    Background worker: load tracks, compute transitions, export M4A to /dev/shm/.
+
+    Hysteresis logic checks the total size of /dev/shm/ cache. It bursts work 
+    up to ~15MB, then sleeps until playback drains it below ~5MB, satisfying 
+    strict footprint requirements while preserving gapless boundaries.
+    """
+    try:
+        total_tracks = len(audio_files)
+        if total_tracks == 0:
+            mix_queue.put(None)
+            return
+
+        idx = 0
+        engine = DecisionEngine()
+        
+        while idx < total_tracks:
+            if error_event.is_set():
+                break
+
+            # ── Hysteresis Throttle ─────────────────────────────────
+            # Wait if buffer is full; wake when it drops below LOW WATERMARK
+            if get_shm_size() >= BUFFER_HIGH_WATERMARK_MB:
+                while get_shm_size() > BUFFER_LOW_WATERMARK_MB and not error_event.is_set():
+                    time.sleep(1.0)
+            
+            if error_event.is_set():
+                break
+
+            original_path = audio_files[idx]
+            current_song = load_and_trim(original_path)
+            if current_song is None:
+                idx += 1
+                continue
+
+            prev_overlap = 0
+
+            # Process tracks natively
+            while current_song is not None:
+                if error_event.is_set():
+                    break
+
+                next_song = None
+                next_check_idx = idx + 1
+                while next_check_idx < total_tracks and next_song is None:
+                    next_song = load_and_trim(audio_files[next_check_idx])
+                    if next_song is None:
+                        next_check_idx += 1
+
+                is_first = (prev_overlap == 0)
+                is_last  = (next_song is None)
+
+                trans_type = (engine.select_transition(current_song, next_song)
+                              if not is_last else "none")
+                print(f"\n[{idx + 1}/{total_tracks}] Transition: {trans_type}",
+                      file=sys.stderr)
+
+                # ── Build this chunk's audio ─────────────────────────────
+                overlap_audio, current_eff_fade = apply_transition(
+                    trans_type, current_song, next_song, fade_ms
+                )
+
+                start_trim = prev_overlap if not is_first else 0
+                end_trim   = current_eff_fade if not is_last else 0
+
+                if start_trim + end_trim >= len(current_song):
+                    mid_audio = current_song
+                elif end_trim > 0:
+                    mid_audio = current_song[start_trim:len(current_song) - end_trim]
+                else:
+                    mid_audio = current_song[start_trim:]
+
+                chunk = (mid_audio + overlap_audio
+                         if overlap_audio is not None and len(overlap_audio) > 0
+                         else mid_audio)
+
+                # ── Export as highly-compressed M4A chunk to /dev/shm/ ──
+                basename = safe_filename(os.path.splitext(os.path.basename(audio_files[idx]))[0])
+                out_path = f"/dev/shm/mixer_part_{idx}_{basename}.m4a"
+                try:
+                    # 'ipod' tells ffmpeg to encode m4a container (using AAC)
+                    chunk.export(out_path, format="ipod", parameters=["-b:a", "128k"])
+                    mix_queue.put((idx, out_path))
+                except Exception as e:
+                    print(f"Error exporting chunk to {out_path}: {e}", file=sys.stderr)
+
+                prev_overlap = current_eff_fade
+                current_song = next_song
+                idx = next_check_idx
+
+                # Check hysteresis again before continuing to loop heavily
+                if get_shm_size() >= BUFFER_HIGH_WATERMARK_MB:
+                    while get_shm_size() > BUFFER_LOW_WATERMARK_MB and not error_event.is_set():
+                        time.sleep(1.0)
+
+            if idx >= total_tracks:
+                break
+
+        mix_queue.put(None)
+        print("\nAll tracks processed!", file=sys.stderr)
+
+    except Exception as e:
+        print(f"Audio processor thread error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        error_event.set()
+        mix_queue.put(None)
+
+# ──────────────────────────────────────────────────────────────────────
+#  Keyboard Listener Service
+# ──────────────────────────────────────────────────────────────────────
+
+def start_keyboard_listener(socket_path, error_event):
+    if keyboard is None:
+        print("Warning: pynput not installed. Keyboard hooks disabled.", file=sys.stderr)
+        return
+
+    def on_press(key):
+        if error_event.is_set():
+            return False
+        try:
+            if hasattr(key, 'char') and key.char:
+                char = key.char.lower()
+                if char == 'q':
+                    send_mpv_command(socket_path, ["quit"])
+                    error_event.set()
+                    return False
+                elif char == ' ':
+                    send_mpv_command(socket_path, ["cycle", "pause"])
+                elif char == 'm':
+                    send_mpv_command(socket_path, ["cycle", "mute"])
+                elif char in ('>', '.'):
+                    send_mpv_command(socket_path, ["playlist-next"])
+                elif char in ('<', ','):
+                    send_mpv_command(socket_path, ["playlist-prev"])
+            else:
+                if key == keyboard.Key.space:
+                    send_mpv_command(socket_path, ["cycle", "pause"])
+                elif key == keyboard.Key.right:
+                    send_mpv_command(socket_path, ["seek", 5])
+                elif key == keyboard.Key.left:
+                    send_mpv_command(socket_path, ["seek", -5])
+                elif key == keyboard.Key.up:
+                    send_mpv_command(socket_path, ["add", "volume", 5])
+                elif key == keyboard.Key.down:
+                    send_mpv_command(socket_path, ["add", "volume", -5])
+                # Media controls
+                elif key == keyboard.Key.media_play_pause or key == keyboard.Key.f8:
+                    send_mpv_command(socket_path, ["cycle", "pause"])
+                elif key == keyboard.Key.media_next or key == keyboard.Key.f9:
+                    send_mpv_command(socket_path, ["playlist-next"])
+                elif key == keyboard.Key.media_previous or key == keyboard.Key.f7:
+                    send_mpv_command(socket_path, ["playlist-prev"])
+        except Exception:
+            pass
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.daemon = True
+    listener.start()
+    return listener
+
+# ──────────────────────────────────────────────────────────────────────
+#  Main Loop
+# ──────────────────────────────────────────────────────────────────────
+
+def main():
+    """
+    Entry point: discovery, caching engine, and mpv control loop.
+
+    Instead of sending one massive unseekable stream, this batches tracks 
+    into memory-light `.m4a` chunks in `/dev/shm`. MPV inherently handles 
+    seeking, playlists, and UI (OSD overlay) without massive memory footprints.
+    Hysteresis polling deletes stale chunks and limits memory buffering automatically 
+    to around 15MB.
+    """
+    fade_ms     = 3000
+    socket_path = "/dev/shm/mixer_mpv_socket"
+
+    if os.path.exists(socket_path):
+        try:
+            os.remove(socket_path)
+        except OSError:
+            pass
+
+    # Clean old chunks
+    try:
+        for f in os.listdir("/dev/shm/"):
+            if f.startswith("mixer_part_") and f.endswith((".wav", ".m4a")):
+                try:
+                    os.remove(os.path.join("/dev/shm", f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    print("Finding audio tracks in directory...", file=sys.stderr)
+    audio_files = find_all_audio_files()
+
+    if not audio_files:
+        print("No audio files found in directory.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f" -> Found {len(audio_files)} tracks.", file=sys.stderr)
+    random.shuffle(audio_files)
+
+    print(f"\nStarting mpv with IPC at {socket_path}...", file=sys.stderr)
+    try:
+        mpv_proc = subprocess.Popen([
+            'mpv',
+            '--gapless-audio=yes',
+            '--idle=yes',
+            '--no-video',
+            '--cache=yes',
+            '--demuxer-max-bytes=20M',
+            '--demuxer-max-back-bytes=10M',
+            f'--input-ipc-server={socket_path}',
+            '--input-terminal=yes'
+        ])
+    except FileNotFoundError:
+        print("Error: 'mpv' binary not found. Please install mpv.", file=sys.stderr)
+        sys.exit(1)
+
+    time.sleep(1.0)
+    if mpv_proc.poll() is not None:
+        print("mpv child process ended unexpectedly on launch.", file=sys.stderr)
+        sys.exit(1)
+
+    mix_queue   = queue.Queue()
+    error_event = threading.Event()
+
+    processor = threading.Thread(
+        target=audio_processor_thread,
+        args=(audio_files, fade_ms, mix_queue, error_event),
+        daemon=True,
+    )
+    processor.start()
+    
+    start_keyboard_listener(socket_path, error_event)
+
+    print("\n  Terminal active — standard mpv keys enabled. Added: SPACE=pause, m=mute, q=quit\n",
+          file=sys.stderr)
+
+    try:
+        processor_done = False
+        
+        while mpv_proc.poll() is None:
+            if error_event.is_set():
+                print("Exiting due to processing error.", file=sys.stderr)
+                break
+
+            resp = send_mpv_command(socket_path, ["get_property", "playlist"])
+            if not resp or resp.get('error') != 'success':
+                if not processor_done and not mix_queue.empty():
+                    item = mix_queue.get_nowait()
+                    if item is None:
+                        processor_done = True
+                    else:
+                        idx, out_path = item
+                        send_mpv_command(socket_path, ["loadfile", out_path, "append-play"])
+                time.sleep(1)
+                continue
+
+            playlist = resp.get('data', [])
+            total_items = len(playlist)
+            current_playing_idx = total_items
+            current_file_idx = -1
+
+            for item in playlist:
+                if item.get('current') is True:
+                    current_playing_idx = item.get('index', 0)
+                    filename = item.get('filename', '')
+                    m = re.search(r'mixer_part_(\d+)_', filename)
+                    if m:
+                        current_file_idx = int(m.group(1))
+                    break
+
+            ahead_count = total_items - 1 - current_playing_idx
+
+            if current_file_idx >= 0:
+                try:
+                    for f in os.listdir("/dev/shm/"):
+                        if f.startswith("mixer_part_") and f.endswith(".m4a"):
+                            m = re.search(r'mixer_part_(\d+)_', f)
+                            if m and int(m.group(1)) < current_file_idx - 1:
+                                try:
+                                    os.remove(os.path.join("/dev/shm", f))
+                                except OSError:
+                                    pass
+                except OSError:
+                    pass
+
+            if ahead_count < 1 and not processor_done:
+                try:
+                    item = mix_queue.get(timeout=1.0)
+                    if item is None:
+                        processor_done = True
+                        print("\nAll tracks processed and queued! Enjoy the mix seamlessly.", file=sys.stderr)
+                    else:
+                        idx, out_path = item
+                        print(f" -> Enqueued track {idx} into mpv...", file=sys.stderr)
+                        send_mpv_command(socket_path, ["loadfile", out_path, "append-play"])
+                except queue.Empty:
+                    pass
+            elif processor_done and ahead_count < 0:
+                break  
+            else:
+                time.sleep(1.0)
+
+    except KeyboardInterrupt:
+        print("\nMixer killed by user.", file=sys.stderr)
+    finally:
+        error_event.set()
+        if mpv_proc.poll() is None:
+            send_mpv_command(socket_path, ["quit"])
+            try:
+                mpv_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                mpv_proc.kill()
+        
+        if os.path.exists(socket_path):
+            try:
+                os.remove(socket_path)
+            except OSError:
+                pass
+
+if __name__ == "__main__":
+    main()

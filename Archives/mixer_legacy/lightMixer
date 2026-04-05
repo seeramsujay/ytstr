@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+lightMixer — V1 Gapless DJ Streamer
+=====================================
+The original Mixer implementation. Retained as a lightweight reference and
+fallback. Unlike the V2 `mixer`, this script applies a single fixed
+equal-power crossfade between every pair of tracks — no spectral analysis,
+no dynamic transition selection.
+
+Architecture
+------------
+Two concurrent layers:
+
+1. **Audio Processor Thread** (`audio_processor_thread`)
+   Runs in a background thread. Lazily pops files from the shuffled list,
+   loads and energy-trims each one, computes a fixed 3-second equal-power
+   crossfade with the next track, and writes the result to `/dev/shm/` as
+   a temporary WAV. Signals the main thread via a bounded queue.
+
+2. **Main Loop** (`main`)
+   Manages the mpv IPC subprocess. Polls the playlist state and feeds new
+   processed chunks whenever fewer than 1 track is queued ahead.
+
+When to use this vs. `mixer`
+-----------------------------
+- **lightMixer**: Minimal dependencies on pydub's filter functions; useful
+  when the filter effects break (e.g. non-standard sample rates), or as a
+  sanity-check baseline.
+- **mixer**: Full automatic DJ with 7 transition types and a decision engine.
+
+Dependencies
+------------
+    pip install pydub
+    apt install mpv ffmpeg
+
+Usage
+-----
+    cd /path/to/music/folder
+    ./lightMixer
+"""
+
+import sys
+import os
+import math
+import subprocess
+import random
+import time
+import json
+import socket
+import queue
+import threading
+import re
+from pydub import AudioSegment
+
+try:
+    from pynput import keyboard
+except ImportError:
+    keyboard = None
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Audio Utilities
+# ──────────────────────────────────────────────────────────────────────
+
+def get_equal_power_gain(t, duration, is_fade_in=True):
+    """
+    Return a dB gain for one grain on an equal-power fade curve.
+
+    Uses a quarter-cosine (sin²) power law so the summed energy of the
+    outgoing and incoming signals stays constant throughout the crossfade.
+
+    Parameters
+    ----------
+    t          : Grain position within the fade window, in milliseconds.
+    duration   : Total fade duration in milliseconds.
+    is_fade_in : True → fade from silence to full; False → full to silence.
+
+    Returns
+    -------
+    float: dB gain. −120.0 when the gain would be −∞ (i.e. complete silence).
+    """
+    x = t / duration if duration > 0 else 0
+    if not is_fade_in:
+        x = 1.0 - x
+    multiplier = math.sin(x * math.pi / 2.0)
+    if multiplier <= 0:
+        return -120.0
+    return 20 * math.log10(multiplier)
+
+
+def equal_power_fade(audio: AudioSegment, duration_ms: int, is_fade_in: bool = True):
+    """
+    Apply an equal-power fade to *audio*.
+
+    Processes the audio in 10 ms grains for sufficient resolution.
+    The non-fade portion is returned unmodified.
+
+    Parameters
+    ----------
+    audio       : Source AudioSegment.
+    duration_ms : Fade length in ms; clamped to len(audio).
+    is_fade_in  : Direction of the fade.
+
+    Returns
+    -------
+    A new AudioSegment with the fade applied.
+    """
+    if len(audio) <= duration_ms:
+        duration_ms = len(audio)
+
+    chunk_size    = 10  # ms per grain
+    faded_chunks  = []
+
+    fade_audio = audio[:duration_ms] if is_fade_in else audio[-duration_ms:]
+    remainder  = audio[duration_ms:] if is_fade_in else audio[:-duration_ms]
+
+    for i in range(0, len(fade_audio), chunk_size):
+        chunk = fade_audio[i:i + chunk_size]
+        t     = i if is_fade_in else i + chunk_size
+        gain  = get_equal_power_gain(t, duration_ms, is_fade_in)
+        faded_chunks.append(chunk.apply_gain(gain))
+
+    faded_section = sum(faded_chunks)
+
+    return (faded_section + remainder) if is_fade_in else (remainder + faded_section)
+
+
+def trim_to_energy(audio: AudioSegment, chunk_ms=100, threshold_ratio=0.6):
+    """
+    Strip low-energy intro/outro using RMS thresholding.
+
+    Scans the audio from both ends in *chunk_ms* windows and drops
+    contiguous segments whose RMS falls below
+    ``avg_rms * threshold_ratio``. One extra window is preserved as a
+    safety buffer on each side.
+
+    Parameters
+    ----------
+    audio           : Source AudioSegment.
+    chunk_ms        : Analysis window size in ms (default 100).
+    threshold_ratio : Fraction of average RMS used as the threshold (default 0.6).
+
+    Returns
+    -------
+    Trimmed AudioSegment, or the original if no meaningful trim is possible.
+    """
+    avg_rms = audio.rms
+    if avg_rms == 0:
+        return audio
+
+    threshold = avg_rms * threshold_ratio
+
+    start_trim = 0
+    for i in range(0, len(audio), chunk_ms):
+        if audio[i:i + chunk_ms].rms >= threshold:
+            start_trim = max(0, i - chunk_ms)
+            break
+
+    end_trim = len(audio)
+    for i in range(len(audio), 0, -chunk_ms):
+        if audio[i - chunk_ms:i].rms >= threshold:
+            end_trim = min(len(audio), i + chunk_ms)
+            break
+
+    if start_trim >= end_trim:
+        return audio
+
+    print(f"  -> Stripped {start_trim}ms intro and {len(audio)-end_trim}ms outro fluff.", file=sys.stderr)
+    return audio[start_trim:end_trim]
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  File Discovery & IPC
+# ──────────────────────────────────────────────────────────────────────
+
+def find_all_audio_files():
+    """
+    Return a sorted list of supported audio files in the current directory.
+
+    Excludes files named ``full_dj_mix.wav`` and any file starting with
+    ``mixer_tmp`` (temporary files from previous runs).
+    """
+    valid_exts = ('.mp3', '.m4a', '.wav', '.opus', '.flac', '.ogg', '.aac', '.webm')
+    files = []
+    for f in os.listdir('.'):
+        if os.path.isfile(f) and f.lower().endswith(valid_exts):
+            if f != "full_dj_mix.wav" and not f.startswith("mixer_tmp"):
+                files.append(f)
+    return sorted(files)
+
+
+def load_and_trim(filepath):
+    """
+    Load *filepath* and apply RMS energy trimming.
+
+    Returns the trimmed AudioSegment, or None if loading fails.
+    """
+    print(f"Loading '{filepath}'...", file=sys.stderr)
+    try:
+        audio = AudioSegment.from_file(filepath)
+        return trim_to_energy(audio)
+    except Exception as e:
+        print(f"Warning: Could not load {filepath} ({e}). Skipping.", file=sys.stderr)
+        return None
+
+
+def send_mpv_command(socket_path, cmd_list):
+    """
+    Send a JSON IPC command to mpv and return the parsed response dict.
+
+    Returns None on any error (connection refused, timeout, parse failure).
+    The socket is always closed after the call.
+
+    Parameters
+    ----------
+    socket_path : Path to mpv's Unix domain socket.
+    cmd_list    : Command as a list (e.g. ["loadfile", "/path.wav", "append-play"]).
+    """
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.STREAM_STREAM)  # wait, SOCK_STREAM!
+        # fix:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(socket_path)
+        payload = {"command": cmd_list}
+        s.sendall((json.dumps(payload) + '\n').encode('utf-8'))
+        response = s.recv(4096)
+        s.close()
+        return json.loads(response.decode('utf-8'))
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Keyboard Listener Service
+# ──────────────────────────────────────────────────────────────────────
+
+def start_keyboard_listener(socket_path, error_event):
+    if keyboard is None:
+        print("Warning: pynput not installed. Keyboard hooks disabled.", file=sys.stderr)
+        return
+
+    def on_press(key):
+        if error_event.is_set():
+            return False
+        try:
+            if hasattr(key, 'char') and key.char:
+                char = key.char.lower()
+                if char == 'q':
+                    send_mpv_command(socket_path, ["quit"])
+                    error_event.set()
+                    return False
+                elif char == ' ':
+                    send_mpv_command(socket_path, ["cycle", "pause"])
+                elif char == 'm':
+                    send_mpv_command(socket_path, ["cycle", "mute"])
+                elif char in ('>', '.'):
+                    send_mpv_command(socket_path, ["playlist-next"])
+                elif char in ('<', ','):
+                    send_mpv_command(socket_path, ["playlist-prev"])
+            else:
+                if key == keyboard.Key.space:
+                    send_mpv_command(socket_path, ["cycle", "pause"])
+                elif key == keyboard.Key.right:
+                    send_mpv_command(socket_path, ["seek", 5])
+                elif key == keyboard.Key.left:
+                    send_mpv_command(socket_path, ["seek", -5])
+                elif key == keyboard.Key.up:
+                    send_mpv_command(socket_path, ["add", "volume", 5])
+                elif key == keyboard.Key.down:
+                    send_mpv_command(socket_path, ["add", "volume", -5])
+                elif key == keyboard.Key.media_play_pause or key == keyboard.Key.f8:
+                    send_mpv_command(socket_path, ["cycle", "pause"])
+                elif key == keyboard.Key.media_next or key == keyboard.Key.f9:
+                    send_mpv_command(socket_path, ["playlist-next"])
+                elif key == keyboard.Key.media_previous or key == keyboard.Key.f7:
+                    send_mpv_command(socket_path, ["playlist-prev"])
+        except Exception:
+            pass
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.daemon = True
+    listener.start()
+    return listener
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Track Processing Pipeline
+# ──────────────────────────────────────────────────────────────────────
+
+def process_track_pair(track_idx, current_song, next_song, fade_ms, is_first, is_last):
+    """
+    Render a gapless chunk for *track_idx* and export it to /dev/shm/.
+
+    Chunk structure:
+        [middle of current_song] + [equal-power crossfade overlap with next_song]
+
+    The "middle" excludes the leading *fade_ms* ms (already played as part of
+    the previous chunk's outgoing overlap) and the trailing *fade_ms* ms
+    (reserved for this chunk's outgoing overlap tail).
+
+    Parameters
+    ----------
+    track_idx    : Integer index used in the output filename.
+    current_song : Outgoing AudioSegment.
+    next_song    : Incoming AudioSegment, or None for the last track.
+    fade_ms      : Crossfade duration in ms.
+    is_first     : True for track 0 (no previous overlap to skip at the head).
+    is_last      : True for the final track (no outgoing overlap needed at the tail).
+
+    Returns
+    -------
+    str: Path to the exported WAV file in /dev/shm/.
+    """
+    # Clamp the fade to the shorter of the two track half-lengths
+    eff_fade = min(fade_ms, len(current_song) // 2) if len(current_song) > 0 else 0
+    if next_song:
+        eff_fade = min(eff_fade, len(next_song) // 2)
+
+    # Skip the head that was already overlapped in the previous chunk
+    if not is_first:
+        current_audio = current_song[eff_fade:-eff_fade] if not is_last else current_song[eff_fade:]
+    else:
+        current_audio = current_song[:-eff_fade] if not is_last else current_song
+
+    if next_song and eff_fade > 0:
+        # Bake the equal-power crossfade overlap
+        fout    = equal_power_fade(current_song[-eff_fade:], eff_fade, is_fade_in=False)
+        fin     = equal_power_fade(next_song[:eff_fade], eff_fade, is_fade_in=True)
+        overlap = fout.overlay(fin)
+        mix     = current_audio + overlap
+    else:
+        mix = current_audio
+
+    out_path = f"/dev/shm/mixer_part_{track_idx}.m4a"
+    try:
+        mix.export(out_path, format="ipod")
+    except Exception as e:
+        print(f"Error exporting chunk to {out_path}: {e}", file=sys.stderr)
+    return out_path
+
+
+def audio_processor_thread(audio_files, fade_ms, mix_queue, error_event):
+    """
+    Background thread: loads tracks lazily and queues rendered chunks.
+
+    Runs concurrently with the main mpv control loop. Pops files from
+    *audio_files*, processes each pair with `process_track_pair`, and
+    puts (index, path) onto *mix_queue*. Puts None as an EOF sentinel
+    when all tracks have been processed, or sets *error_event* on a
+    fatal exception.
+
+    Parameters
+    ----------
+    audio_files : Mutable list of file paths consumed via pop(0).
+    fade_ms     : Crossfade duration hint in milliseconds.
+    mix_queue   : Bounded Queue shared with the main loop (maxsize=1).
+    error_event : threading.Event set on fatal error.
+    """
+    try:
+        current_song = None
+        # Skip any unloadable files at the start of the list
+        while audio_files and current_song is None:
+            current_song = load_and_trim(audio_files.pop(0))
+
+        if current_song is None:
+            mix_queue.put(None)  # Nothing playable
+            return
+
+        total_tracks = len(audio_files) + 1
+        i = 0
+
+        while current_song is not None:
+            next_song = None
+            if audio_files:
+                next_path = audio_files.pop(0)
+                next_song = load_and_trim(next_path)
+                # Skip broken tracks robustly
+                while next_song is None and audio_files:
+                    next_path = audio_files.pop(0)
+                    next_song = load_and_trim(next_path)
+
+            is_first = (i == 0)
+            is_last  = (next_song is None)
+
+            print(f"\nBaking mix chunk {i+1}/{total_tracks}...", file=sys.stderr)
+            out_path = process_track_pair(i, current_song, next_song, fade_ms, is_first, is_last)
+
+            mix_queue.put((i, out_path))  # Blocks when queue is full (backpressure)
+
+            current_song = next_song
+            i += 1
+
+        mix_queue.put(None)  # EOF marker
+    except Exception as e:
+        print(f"Audio processor thread error: {e}", file=sys.stderr)
+        error_event.set()
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Main Loop
+# ──────────────────────────────────────────────────────────────────────
+
+def main():
+    """
+    Entry point: discover tracks, start mpv, manage the playback queue.
+
+    Spawns mpv with gapless-audio and IPC enabled, then starts the
+    background processor thread. The main loop polls mpv's playlist once
+    per second and appends processed chunks to mpv when the ahead-count
+    drops below 1. Old /dev/shm/ chunks are deleted as playback advances.
+    Terminates mpv cleanly on KeyboardInterrupt or when the playlist empties.
+    """
+    fade_ms     = 3000
+    socket_path = "/dev/shm/mixer_mpv_socket"
+
+    # Remove stale socket from a previous crashed session
+    if os.path.exists(socket_path):
+        try:
+            os.remove(socket_path)
+        except OSError:
+            pass
+
+    os.chdir(os.getcwd())
+
+    print("Finding audio tracks in directory...", file=sys.stderr)
+    audio_files = find_all_audio_files()
+
+    if not audio_files:
+        print("No audio files found in directory.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f" -> Found {len(audio_files)} tracks.", file=sys.stderr)
+    random.shuffle(audio_files)
+
+    # Clean up any leftover chunks from previous runs
+    for f in os.listdir("/dev/shm/"):
+        if f.startswith("mixer_part_") and f.endswith((".wav", ".m4a")):
+            try:
+                os.remove(f"/dev/shm/{f}")
+            except OSError:
+                pass
+
+    print(f"\nStarting mpv daemon via IPC at {socket_path}...", file=sys.stderr)
+    try:
+        mpv_proc = subprocess.Popen([
+            'mpv',
+            '--gapless-audio=yes',
+            '--idle=yes',
+            '--no-video',
+            '--cache=yes',
+            '--demuxer-max-bytes=10M',      # Constrain RAM used by the demuxer cache
+            '--demuxer-max-back-bytes=5M',
+            f'--input-ipc-server={socket_path}',
+            '--input-terminal=yes'
+        ])
+    except FileNotFoundError:
+        print("Error: 'mpv' binary not found. Please install mpv.", file=sys.stderr)
+        sys.exit(1)
+
+    # Allow mpv time to bind the socket before first IPC call
+    time.sleep(1.0)
+    if mpv_proc.poll() is not None:
+        print("mpv child process ended unexpectedly on launch.", file=sys.stderr)
+        sys.exit(1)
+
+    mix_queue   = queue.Queue(maxsize=1)    # Single-item buffer keeps RAM usage minimal
+    error_event = threading.Event()
+
+    worker = threading.Thread(
+        target=audio_processor_thread,
+        args=(audio_files, fade_ms, mix_queue, error_event),
+        daemon=True
+    )
+    worker.start()
+
+    # Start independent hotkey listener
+    start_keyboard_listener(socket_path, error_event)
+
+    try:
+        processor_done = False
+        mpv_queue_idx  = -1
+
+        while mpv_proc.poll() is None:
+            if error_event.is_set():
+                print("Exiting due to audio processor error.", file=sys.stderr)
+                break
+
+            resp = send_mpv_command(socket_path, ["get_property", "playlist"])
+            if not resp or resp.get('error') != 'success':
+                # mpv not ready yet — try to push a track if one is ready
+                if not processor_done and not mix_queue.empty():
+                    item = mix_queue.get_nowait()
+                    if item is None:
+                        processor_done = True
+                        print("\nAll tracks processed and queued! Enjoy the mix seamlessly.", file=sys.stderr)
+                    else:
+                        idx, out_path = item
+                        print(f" -> Queuing into mpv list ({idx})...", file=sys.stderr)
+                        send_mpv_command(socket_path, ["loadfile", out_path, "append-play"])
+                        mpv_queue_idx = idx
+                time.sleep(1)
+                continue
+
+            playlist            = resp.get('data', [])
+            total_items         = len(playlist)
+            current_playing_idx = total_items   # Sentinel: past the end
+            current_file_idx    = -1
+
+            for item in playlist:
+                if item.get('current') is True:
+                    current_playing_idx = item.get('index', 0)
+                    filename = item.get('filename', '')
+                    m = re.search(r'mixer_part_(\d+)\.m4a$', filename)
+                    if m:
+                        current_file_idx = int(m.group(1))
+                    break
+
+            ahead_count = total_items - 1 - current_playing_idx
+
+            # Delete chunks that are at least two positions behind the current track
+            if current_file_idx >= 0:
+                for f in os.listdir("/dev/shm/"):
+                    if f.startswith("mixer_part_") and f.endswith(".m4a"):
+                        m = re.search(r'mixer_part_(\d+)\.m4a$', f)
+                        if m and int(m.group(1)) < current_file_idx - 1:
+                            try:
+                                os.remove(f"/dev/shm/{f}")
+                            except OSError:
+                                pass
+
+            if ahead_count < 1 and not processor_done:
+                try:
+                    item = mix_queue.get(timeout=1.0)
+                    if item is None:
+                        processor_done = True
+                        print("\nAll tracks processed and queued! Enjoy the mix seamlessly.", file=sys.stderr)
+                    else:
+                        idx, out_path = item
+                        print(f" -> Queuing into mpv list ({idx})...", file=sys.stderr)
+                        send_mpv_command(socket_path, ["loadfile", out_path, "append-play"])
+                        mpv_queue_idx = idx
+                except queue.Empty:
+                    pass    # Processor not ready yet; try again next tick
+            elif processor_done and ahead_count < 0:
+                break       # Nothing left to play
+            else:
+                time.sleep(1.0)
+
+    except KeyboardInterrupt:
+        print("\nMixer killed by user.", file=sys.stderr)
+    finally:
+        if mpv_proc.poll() is None:
+            send_mpv_command(socket_path, ["quit"])
+            mpv_proc.wait()
+
+
+if __name__ == "__main__":
+    main()

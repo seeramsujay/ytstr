@@ -1,12 +1,30 @@
 #!/usr/bin/env python3
 """
-ytstr - YouTube Streamer with Playlist Management
-A lightweight, terminal-native YouTube playlist streamer in Python.
-Features intelligent RAM caching, lazy physical audio splicing via pydub,
-and seamless gapless playback strictly using the standard `mpv` CLI binary.
+ytstr - YouTube Streamer with Automatic DJ Transitions
+======================================================
+Copyright (C) 2026
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+Modes:
+  default      Full auto-DJ with spectral analysis
+  --light-mix  Simple equal-power crossfade (low CPU)
+  --no-mix     No mixing, sequential playback
 
 Dependencies: pip install yt-dlp pydub
-System Deps: mpv, ffmpeg
+Optional:     pip install pynput  (for hardware media key support)
+System Deps:  mpv, ffmpeg
 """
 
 import sys
@@ -15,6 +33,7 @@ import argparse
 import random
 import threading
 import time
+import math
 import tty
 import termios
 import tempfile
@@ -23,18 +42,24 @@ import logging
 import subprocess
 import socket
 import json
+import signal
 from typing import List, Dict, Optional
 
 try:
     import yt_dlp
     from pydub import AudioSegment
-    from pydub.silence import detect_leading_silence
+    from pydub.effects import high_pass_filter, low_pass_filter
 except ImportError:
     print("\033[0;31mError: Missing dependencies. Please run 'pip install yt-dlp pydub'\033[0m", file=sys.stderr)
     sys.exit(1)
 
+try:
+    from pynput import keyboard
+except ImportError:
+    keyboard = None
+
 # Configuration & Globals
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 PLAYLIST_FILE = os.path.expanduser("~/.config/ytstr/playlists")
 CACHE_DIR = None 
 
@@ -82,28 +107,780 @@ def save_playlists(playlists: List[Dict[str, str]]):
             for p in playlists: f.write(f"{p['name']}|{p['url']}\n")
     except Exception as e: die(f"Failed to save playlists: {e}")
 
-def trim_silence(audio: AudioSegment, silence_threshold=-50.0, chunk_size=10):
-    start_trim = detect_leading_silence(audio, silence_threshold=silence_threshold, chunk_size=chunk_size)
-    trimmed_start = audio[start_trim:]
-    end_trim = detect_leading_silence(trimmed_start.reverse(), silence_threshold=silence_threshold, chunk_size=chunk_size)
-    if end_trim > 0:
-        return trimmed_start[:-end_trim]
-    return trimmed_start
+def get_equal_power_gain(t: float, duration: float, is_fade_in: bool = True) -> float:
+    """
+    Return a dB gain value for a single point on an equal-power fade curve.
+
+    The curve follows a quarter-cosine (sin²) power law, which keeps the
+    *perceived* combined loudness constant during a crossfade — the
+    psychoacoustic equivalent of a DJ's equal-power crossfader.
+
+    Parameters
+    ----------
+    t          : Current time position within the fade, in milliseconds.
+    duration   : Total fade duration, in milliseconds.
+    is_fade_in : True to compute a fade-in (0 dB → 0 dB), False for fade-out.
+
+    Returns
+    -------
+    dB gain as a float. Returns −120.0 (effectively silence) when the
+    computed multiplier is non-positive.
+    """
+    x = t / duration if duration > 0 else 0.0
+    if not is_fade_in:
+        x = 1.0 - x
+    multiplier = math.sin(x * math.pi / 2.0)
+    if multiplier <= 0:
+        return -120.0
+    return 20.0 * math.log10(multiplier)
+
+
+def equal_power_fade(audio: AudioSegment, duration_ms: int, is_fade_in: bool = True) -> AudioSegment:
+    """
+    Apply an equal-power (sinusoidal) fade to an AudioSegment.
+
+    The audio is processed in 10 ms grains so the gain curve has a high
+    enough resolution to sound smooth on standard equipment. Grains outside
+    the fade window are returned unmodified.
+
+    Parameters
+    ----------
+    audio       : The source audio to fade.
+    duration_ms : Length of the fade in milliseconds. Clamped to len(audio).
+    is_fade_in  : True to fade from silence to full volume; False for the reverse.
+
+    Returns
+    -------
+    A new AudioSegment with the fade applied.
+    """
+    if duration_ms <= 0:
+        return audio
+    duration_ms = min(duration_ms, len(audio))
+    chunk_size = 10  # ms per grain — smaller = smoother but slower
+
+    fade_audio = audio[:duration_ms] if is_fade_in else audio[-duration_ms:]
+    remainder  = audio[duration_ms:] if is_fade_in else audio[:-duration_ms]
+
+    faded_chunks = []
+    for i in range(0, len(fade_audio), chunk_size):
+        chunk = fade_audio[i:i + chunk_size]
+        t     = i if is_fade_in else i + chunk_size
+        gain  = get_equal_power_gain(t, duration_ms, is_fade_in)
+        faded_chunks.append(chunk.apply_gain(gain))
+
+    faded_section = sum(faded_chunks) if faded_chunks else AudioSegment.empty()
+
+    return (faded_section + remainder) if is_fade_in else (remainder + faded_section)
+
+
+def trim_to_energy(audio: AudioSegment, chunk_ms: int = 100, threshold_ratio: float = 0.5) -> AudioSegment:
+    """
+    Strip low-energy intro and outro regions using RMS thresholding.
+
+    The function scans the track in *chunk_ms* windows from both ends and
+    drops contiguous low-energy segments until a chunk exceeds
+    ``avg_rms * threshold_ratio``. One extra window is kept on each side
+    as a safety buffer.
+
+    This replicates the "energy trim" technique used by professional DJ
+    software to ensure every track starts and ends at a musically active
+    moment rather than in silence or atmospheric rumble.
+
+    Parameters
+    ----------
+    audio           : Source audio segment.
+    chunk_ms        : Window size for RMS analysis (default 100 ms).
+    threshold_ratio : Fraction of the track's average RMS to treat as the
+                      threshold (default 0.5 = 50 %).
+
+    Returns
+    -------
+    A trimmed AudioSegment. Returns the original if no meaningful trim
+    can be performed (e.g. completely silent audio).
+    """
+    avg_rms = audio.rms
+    if avg_rms == 0:
+        return audio
+
+    threshold = avg_rms * threshold_ratio
+
+    # ── Scan from the front ─────────────────────────────────────────
+    start_trim = 0
+    for i in range(0, len(audio), chunk_ms):
+        if audio[i:i + chunk_ms].rms >= threshold:
+            start_trim = max(0, i - chunk_ms)
+            break
+
+    # ── Scan from the back ──────────────────────────────────────────
+    end_trim = len(audio)
+    for i in range(len(audio), 0, -chunk_ms):
+        if audio[i - chunk_ms:i].rms >= threshold:
+            end_trim = min(len(audio), i + chunk_ms)
+            break
+
+    if start_trim >= end_trim:
+        return audio  # Safety: avoid returning an empty segment
+
+    intro_cut = start_trim
+    outro_cut = len(audio) - end_trim
+    if intro_cut > 0 or outro_cut > 0:
+        print(f"  -> Stripped {intro_cut}ms intro and {outro_cut}ms outro fluff.", file=sys.stderr)
+    return audio[start_trim:end_trim]
+
+
+def tape_stop_effect(audio: AudioSegment, duration_ms: int) -> AudioSegment:
+    """
+    Simulate a progressive tape/turntable stop effect.
+    
+    Slows down the audio over the given duration by progressively dropping
+    its frame rate and fading it out, simulating a turntable losing power.
+    """
+    if len(audio) == 0:
+        return audio
+        
+    duration_ms = min(duration_ms, len(audio))
+    tail = audio[-duration_ms:]
+    head = audio[:-duration_ms]
+    
+    steps = 20
+    chunk_len = len(tail) // steps
+    if chunk_len == 0:
+        return audio
+        
+    parts = []
+    for i in range(steps):
+        chunk = tail[i*chunk_len : (i+1)*chunk_len]
+        ratio = 1.0 - (i / steps) * 0.9  # 100% down to 10% speed
+        new_frame_rate = max(int(chunk.frame_rate * ratio), 1000)
+        
+        try:
+            # Spawn a new segment with a lower frame rate, expanding duration and dropping pitch
+            slowed = chunk._spawn(chunk.raw_data, overrides={
+                "frame_rate": new_frame_rate
+            }).set_frame_rate(chunk.frame_rate)
+        except Exception:
+            slowed = chunk
+            
+        # Progressive volume drop up to -15dB
+        vol_drop = - (i / steps) * 15
+        parts.append(slowed + vol_drop)
+        
+    leftover = tail[steps*chunk_len:]
+    if len(leftover) > 0:
+        parts.append(leftover - 15)
+        
+    res = sum(parts) if parts else tail
+    # Small fade out at the very end to prevent clicking
+    res = res.fade_out(min(200, len(res)))
+    return head + res
+
+
+def tape_start_effect(audio: AudioSegment, duration_ms: int) -> AudioSegment:
+    """
+    Simulate a turntable/tape powering ON — the reverse of tape_stop_effect.
+
+    The audio begins at ~10 % speed (deep, warped pitch) and ramps up to
+    full speed over *duration_ms*, simulating a record player reaching its
+    target RPM.  Volume also ramps from −15 dB to 0 dB so the warp-in
+    grows progressively louder.
+    """
+    if len(audio) == 0:
+        return audio
+
+    duration_ms = min(duration_ms, len(audio))
+    head = audio[:duration_ms]
+    tail = audio[duration_ms:]
+
+    steps = 20
+    chunk_len = len(head) // steps
+    if chunk_len == 0:
+        return audio
+
+    parts = []
+    for i in range(steps):
+        chunk = head[i * chunk_len : (i + 1) * chunk_len]
+        # Ramp from 10 % speed at step 0 → 100 % at the last step
+        ratio = 0.1 + (i / steps) * 0.9
+        new_frame_rate = max(int(chunk.frame_rate * ratio), 1000)
+
+        try:
+            sped = chunk._spawn(chunk.raw_data, overrides={
+                "frame_rate": new_frame_rate
+            }).set_frame_rate(chunk.frame_rate)
+        except Exception:
+            sped = chunk
+
+        # Progressive volume ramp: −15 dB → 0 dB
+        vol_boost = -15 * (1.0 - (i / steps))
+        parts.append(sped + vol_boost)
+
+    leftover = head[steps * chunk_len:]
+    if len(leftover) > 0:
+        parts.append(leftover)  # Already at full speed / volume
+
+    res = sum(parts) if parts else head
+    # Small fade in at the very start to prevent clicking
+    res = res.fade_in(min(200, len(res)))
+    return res + tail
+
+
+def safe_clamp_fade(duration_ms: int, *tracks: AudioSegment) -> int:
+    """
+    Clamp a desired fade duration so it never exceeds half of any track's length.
+
+    This prevents the fade windows of two adjacent tracks from overlapping
+    each other, which would corrupt the mix structure.
+
+    Parameters
+    ----------
+    duration_ms : Desired fade length in milliseconds.
+    *tracks     : Any number of AudioSegments to clamp against.
+
+    Returns
+    -------
+    Clamped duration as an int ≥ 0.
+    """
+    result = duration_ms
+    for t in tracks:
+        if t is not None and len(t) > 0:
+            result = min(result, len(t) // 2)
+    return max(result, 0)
+
+
+def progressive_high_pass(audio: AudioSegment, start_hz: int, end_hz: int, steps: int = 20) -> AudioSegment:
+    """
+    Apply a progressive high-pass filter sweep across the duration of *audio*.
+
+    Slices the audio into *steps* equal chunks and applies an increasing
+    cutoff frequency from *start_hz* to *end_hz*. This simulates the
+    effect of a DJ slowly turning a filter knob — the sound becomes
+    progressively thinner rather than cutting abruptly.
+
+    Used internally by `trans_bass_swap` and `trans_filter_wash`.
+
+    Parameters
+    ----------
+    audio     : Source audio to filter.
+    start_hz  : Starting cutoff frequency in Hz (low end of the sweep).
+    end_hz    : Ending cutoff frequency in Hz (high end of the sweep).
+    steps     : Number of discrete filter steps (default 20).
+
+    Returns
+    -------
+    A new AudioSegment with the progressive filter applied.
+    """
+    if len(audio) == 0 or steps <= 0:
+        return audio
+    step_len = len(audio) // steps
+    if step_len == 0:
+        return audio
+
+    parts = []
+    for i in range(steps):
+        ratio   = i / max(steps - 1, 1)
+        cutoff  = int(start_hz * (end_hz / start_hz) ** ratio)
+        cutoff  = max(cutoff, 20)  # pydub's minimum supported cutoff
+        chunk   = audio[i * step_len:(i + 1) * step_len]
+        try:
+            chunk = high_pass_filter(chunk, cutoff)
+        except Exception:
+            pass  # Preserve chunk unfiltered on unexpected pydub failure
+        parts.append(chunk)
+
+    # Handle any leftover samples from integer division
+    leftover = audio[steps * step_len:]
+    if len(leftover) > 0:
+        try:
+            leftover = high_pass_filter(leftover, end_hz)
+        except Exception:
+            pass
+        parts.append(leftover)
+
+    return sum(parts) if parts else audio
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Transition Implementations
+# ──────────────────────────────────────────────────────────────────────
+
+def trans_fade(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Classic equal-power crossfade.
+
+    The outgoing track fades out while the incoming track fades in
+    simultaneously using sinusoidal gain curves. The combined perceived
+    volume remains constant throughout.
+
+    Best for: Pop, Rock, Vocals — any genre where clean separation
+    between melodic elements matters.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    fout = equal_power_fade(current_song[-eff:], eff, is_fade_in=False)
+    fin  = equal_power_fade(next_song[:eff], eff, is_fade_in=True)
+    return fout.overlay(fin), eff
+
+
+def trans_blend(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Extended overlap blend (up to 10 000 ms) using equal-power curves.
+
+    Both tracks play simultaneously at near-full volume for an extended
+    window, letting their rhythmic patterns "lock" before one fades away.
+    The duration is capped to the shorter track's half-length to avoid
+    structural corruption.
+
+    Best for: House, Techno, EDM — tracks with compatible BPMs where
+    a long groove-lock transition sounds natural.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    blend_ms = min(10000, fade_ms * 4)
+    eff = safe_clamp_fade(blend_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    fout = equal_power_fade(current_song[-eff:], eff, is_fade_in=False)
+    fin  = equal_power_fade(next_song[:eff], eff, is_fade_in=True)
+    return fout.overlay(fin), eff
+
+
+def trans_cut_in(current_song: AudioSegment, next_song: AudioSegment, _fade_ms: int):
+    """
+    Hard cut with a 15 ms anti-pop micro-fade on both sides.
+
+    The raw hard cut (sample-accurate switch) would cause a sharp
+    discontinuity at the splice point, creating an audible click or pop.
+    The 15 ms micro-fade on each side ramps through just enough samples
+    to prevent this without sounding like a true crossfade.
+
+    Best for: Dramatic genre switches (e.g. 128 BPM Dance → 70 BPM Hip-Hop)
+    where a long blend would sound rhythmically chaotic.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    guard_ms = 15
+    if len(current_song) < guard_ms or len(next_song) < guard_ms:
+        return AudioSegment.empty(), 0
+
+    tail = current_song[-guard_ms:].fade_out(guard_ms)
+    head = next_song[:guard_ms].fade_in(guard_ms)
+    return tail.overlay(head), guard_ms
+
+
+def trans_rise(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Progressive volume swell: incoming track ramps from 0 to +4 dB.
+
+    Applies the equal-power fade-in curve and simultaneously ramps a
+    gain boost from 0 dB at the start to +4 dB at the transition's end.
+    This creates a perceived energy surge or "drop" — the incoming track
+    doesn't just fade in, it actively swells above the outgoing one.
+
+    Best for: Transition into a high-energy chorus, beat drop, or
+    climactic section where the new track should feel louder/bigger.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    fout = equal_power_fade(current_song[-eff:], eff, is_fade_in=False)
+
+    # Build the incoming fade with a progressive 0→+4 dB swell baked
+    # into the same grain loop used by equal_power_fade, avoiding a
+    # redundant second pass over the samples.
+    chunk_size = 10
+    in_audio = next_song[:eff]
+    boosted_chunks = []
+    for i in range(0, eff, chunk_size):
+        chunk = in_audio[i:i + chunk_size]
+        fade_gain = get_equal_power_gain(i, eff, is_fade_in=True)
+        swell_db  = 4.0 * (i / max(eff - 1, 1))
+        boosted_chunks.append(chunk.apply_gain(fade_gain + swell_db))
+    fin = sum(boosted_chunks) if boosted_chunks else in_audio
+
+    return fout.overlay(fin), eff
+
+
+def trans_bass_swap(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Progressive high-pass sweep (80 → 800 Hz) on the outgoing track
+    with a 120 Hz "full kill" HP on the incoming track.
+
+    Gradually removes the low-frequency content of the outgoing track
+    over the transition window using an exponential sweep. The incoming
+    track's sub-bass (< 120 Hz) is completely suppressed during the
+    overlap per Research Report §6.3 ("full kill" at −∞ dB), ensuring
+    only one bassline occupies the low end at any given moment.
+
+    Best for: Back-to-back bass-heavy tracks in a continuous mix (EDM,
+    Hip-Hop, Drum & Bass). The "rule" in professional DJing: never let
+    two basses play at full volume simultaneously.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    # Progressively sweep high-pass on outgoing to kill its bass (80 → 800 Hz)
+    out_part = progressive_high_pass(current_song[-eff:], 80, 800, steps=25)
+    out_part = equal_power_fade(out_part, eff, is_fade_in=False)
+
+    # Full-kill HP at 120 Hz on incoming — no sub-bass during overlap
+    try:
+        in_cleaned = high_pass_filter(next_song[:eff], 120)
+    except Exception:
+        in_cleaned = next_song[:eff]
+
+    in_part = equal_power_fade(in_cleaned, eff, is_fade_in=True)
+    return out_part.overlay(in_part), eff
+
+
+def trans_filter_wash(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Progressive high-pass sweep (80 → 2000 Hz) with resonance tracking.
+
+    Sweeps the filter cutoff from 80 Hz to 2 kHz across an extended
+    window (+2 s beyond the base fade). A resonance bump (+4 dB) is
+    progressively faded in at the 1–2 kHz band during the second half
+    of the sweep, simulating the "synthetic wind" effect described in
+    Research Report §6.1. This resonant artifact masks harmonic
+    dissonance between clashing keys.
+
+    Best for: Outgoing tracks with chaotic, busy, or clashing outros
+    that would fight with the incoming track's intro if played on top
+    of each other directly.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    wash_ms = min(fade_ms + 2000, len(current_song) // 2, len(next_song) // 2)
+    if wash_ms <= 0:
+        return AudioSegment.empty(), 0
+
+    raw_out = current_song[-wash_ms:]
+    out_part = progressive_high_pass(raw_out, 80, 2000, steps=30)
+
+    # Progressive resonance bump: fade a 1–2 kHz bandpass in over the
+    # second half of the sweep, so the "whistle" rides the moving cutoff.
+    try:
+        resonance = high_pass_filter(low_pass_filter(raw_out, 2000), 1000) + 4
+        # Only apply in the second half (where cutoff is near resonance band)
+        half = wash_ms // 2
+        silence = AudioSegment.silent(duration=half, frame_rate=raw_out.frame_rate)
+        res_faded = silence + equal_power_fade(resonance[half:], wash_ms - half, is_fade_in=True)
+        out_part = out_part.overlay(res_faded)
+    except Exception:
+        pass
+
+    out_part = equal_power_fade(out_part, wash_ms, is_fade_in=False)
+    in_part  = equal_power_fade(next_song[:wash_ms], wash_ms, is_fade_in=True)
+    return out_part.overlay(in_part), wash_ms
+
+
+def trans_melt(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Multi-echo atmospheric dissolve with low-pass softening.
+
+    Creates a reverb-like wash by layering three attenuated, delayed
+    copies of the outgoing audio on top of itself:
+      - Tap 1: 200 ms delay, −3 dB
+      - Tap 2: 400 ms delay, −6 dB
+      - Tap 3: 700 ms delay, −10 dB
+
+    The combined echo wash is then low-pass filtered at 3 kHz to soften
+    the high frequencies, creating the impression of the track dissolving
+    into reverb before the new track fades in. The extended window (+4 s)
+    gives the echoes room to decay naturally.
+
+    Best for: Psychedelic, Lo-Fi, or Ambient music where an abrupt end
+    would break the mood. The goal is for the listener to barely notice
+    the switch happened.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    melt_ms = min(fade_ms + 4000, len(current_song) // 2, len(next_song) // 2)
+    if melt_ms <= 0:
+        return AudioSegment.empty(), 0
+
+    out_part = current_song[-melt_ms:]
+
+    # Layer echo taps: (delay_ms, attenuation_dB)
+    echo_taps = [(200, -3), (400, -6), (700, -10)]
+    for delay_ms, atten_db in echo_taps:
+        if melt_ms > delay_ms * 2:
+            echo = out_part + atten_db  # Attenuate copy
+            # Time-shift the echo by prepending silence and chopping the tail
+            echo = AudioSegment.silent(duration=delay_ms) + echo[:-delay_ms]
+            out_part = out_part.overlay(echo)
+
+    # Soften the echo wash with a low-pass filter
+    try:
+        out_part = low_pass_filter(out_part, 3000)
+    except Exception:
+        pass
+
+    out_part = equal_power_fade(out_part, melt_ms, is_fade_in=False)
+    in_part  = equal_power_fade(next_song[:melt_ms], melt_ms, is_fade_in=True)
+    return out_part.overlay(in_part), melt_ms
+
+
+def trans_tape_stop(current_song: AudioSegment, next_song: AudioSegment, fade_ms: int):
+    """
+    Tape warp crossfade — the universal fallback DJ transition.
+
+    Outgoing track winds DOWN (tape stop: pitch drops, slows to silence)
+    while the incoming track warps UP (tape start: deep/slow → full speed).
+    The two are overlaid so the listener hears the old track grinding to a
+    halt as the new one spins up — a classic turntable-swap warp effect.
+
+    Capped at 1.5 s to stay punchy and transition-like.
+
+    Returns: (overlap_audio, overlap_duration_ms)
+    """
+    short_ms = min(1500, fade_ms)
+    eff = safe_clamp_fade(short_ms, current_song, next_song)
+    if eff == 0:
+        return AudioSegment.empty(), 0
+
+    # Outgoing winds down
+    out_part = tape_stop_effect(current_song[-eff:], eff)
+    # Incoming warps up
+    in_part  = tape_start_effect(next_song[:eff], eff)
+
+    # Pad the shorter segment so both are the same length before overlay
+    if len(out_part) > len(in_part):
+        in_part = in_part + AudioSegment.silent(duration=len(out_part) - len(in_part),
+                                                 frame_rate=in_part.frame_rate)
+    elif len(in_part) > len(out_part):
+        out_part = out_part + AudioSegment.silent(duration=len(in_part) - len(out_part),
+                                                   frame_rate=out_part.frame_rate)
+
+    return out_part.overlay(in_part), eff
+
+
+# Dispatch table mapping transition names to their handler functions.
+# New transitions can be added here without modifying apply_transition().
+TRANSITIONS: dict = {
+    "fade":        trans_fade,
+    "blend":       trans_blend,
+    "cut_in":      trans_cut_in,
+    "rise":        trans_rise,
+    "bass_swap":   trans_bass_swap,
+    "filter_wash": trans_filter_wash,
+    "melt":        trans_melt,
+    "tape_stop":   trans_tape_stop,
+}
+
+
+def apply_transition(trans_type: str, current_song: AudioSegment,
+                     next_song: AudioSegment, fade_ms: int):
+    """
+    Dispatch to the correct transition handler by name.
+
+    Falls back to `trans_fade` for unknown transition types so the
+    pipeline never crashes due to an unsupported name.
+
+    Parameters
+    ----------
+    trans_type  : Transition name (e.g. "bass_swap"). See TRANSITIONS dict.
+    current_song: The outgoing track.
+    next_song   : The incoming track (or None if this is the last track).
+    fade_ms     : Base crossfade duration hint in milliseconds.
+
+    Returns
+    -------
+    (overlap_audio, overlap_duration_ms) — the rendered overlap segment and
+    the number of ms consumed from the ends of each track.
+    """
+    if next_song is None:
+        return AudioSegment.empty(), 0
+    fn = TRANSITIONS.get(trans_type, trans_fade)
+    return fn(current_song, next_song, fade_ms)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Decision Engine
+# ──────────────────────────────────────────────────────────────────────
+
+class DecisionEngine:
+    """
+    Automatic DJ transition selector based on spectral energy analysis.
+
+    For each track pair, the engine analyses a 5-second window at the end
+    of the outgoing track and the start of the incoming track. It extracts
+    four features and applies a priority-ordered waterfall of rules to
+    select the transition style that best suits each specific handoff.
+
+    Features
+    --------
+    rms         : Total signal energy (mono amplitude).
+    bass_rms    : Energy in the sub-250 Hz band (kick drums, bass guitar).
+    treble_rms  : Energy above 2 kHz (hi-hats, vocals, cymbals).
+    variance    : How much the energy fluctuates over 500 ms windows.
+                  Low variance = steady, repetitive groove.
+                  High variance = dynamic, ever-changing energy.
+
+    Decision Rules (evaluated in priority order)
+    --------------------------------------------
+    1. Incoming is ≥ 1.8× louder than outgoing  →  rise
+       (Strong energy surge — progressive swell emphasises the drop.)
+    2. Both tracks are > 40 % bass               →  bass_swap
+       (Prevent muddy low-end collisions via HP sweep + LF kill.)
+    3. Outgoing treble > 1.8× its bass           →  filter_wash
+       (Outgoing is treble-dominated — sweep it away with resonance.)
+    4. Outgoing is < 25 % of incoming energy     →  cut_in
+       (Outgoing is nearly inaudible — hard cut, no point blending.)
+    5. Outgoing energy variance > 0.4 × rms²    →  melt
+       (Chaotic ending — dissolve it with echo wash rather than fade.)
+    6. Both tracks variance < 0.08 × rms²       →  blend
+       (Steady-groove tracks benefit from the long 10 s overlap.)
+    7. Default                                    →  fade
+    """
+
+    ANALYSIS_WINDOW_MS = 5000
+
+    def _analyze(self, chunk: AudioSegment) -> tuple:
+        """
+        Extract (rms, bass_rms, treble_rms, energy_variance) from a chunk.
+
+        Energy variance is computed by splitting the chunk into 500 ms
+        windows, measuring the RMS of each, and returning the population
+        variance. This quantifies how "dynamic" or "chaotic" the energy
+        profile is.
+        """
+        if chunk is None or len(chunk) == 0:
+            return 0.0, 0.0, 0.0, 0.0
+
+        rms = float(chunk.rms)
+
+        try:
+            bass = float(low_pass_filter(chunk, 250).rms)
+        except Exception:
+            bass = rms
+        try:
+            treble = float(high_pass_filter(chunk, 2000).rms)
+        except Exception:
+            treble = rms
+
+        # Population variance of per-window RMS values
+        window_ms = 500
+        energies = [float(chunk[i:i + window_ms].rms)
+                    for i in range(0, len(chunk), window_ms)]
+        if len(energies) > 1:
+            mean     = sum(energies) / len(energies)
+            variance = sum((e - mean) ** 2 for e in energies) / len(energies)
+        else:
+            variance = 0.0
+
+        return rms, bass, treble, variance
+
+    def select_transition(self, current_song: AudioSegment,
+                          next_song: AudioSegment) -> str:
+        """
+        Return the name of the best-fit transition for this track pair.
+
+        Parameters
+        ----------
+        current_song : The outgoing AudioSegment.
+        next_song    : The incoming AudioSegment.
+
+        Returns
+        -------
+        A transition name string (key of the TRANSITIONS dict).
+        Falls back to "fade" when inputs are None or RMS is zero.
+        """
+        if current_song is None or next_song is None:
+            return "fade"
+
+        win_a = min(self.ANALYSIS_WINDOW_MS, len(current_song))
+        win_b = min(self.ANALYSIS_WINDOW_MS, len(next_song))
+        a_rms, a_bass, a_treble, a_var = self._analyze(current_song[-win_a:])
+        b_rms, b_bass, b_treble, b_var = self._analyze(next_song[:win_b])
+
+        if a_rms == 0 or b_rms == 0:
+            return "fade"
+
+        # Rule 1: Incoming drop / energy surge
+        if b_rms > a_rms * 1.8:
+            return "rise"
+
+        # Rule 2: Very different tracks → tape_stop (prevent clashing overlaps)
+        # Triggers when tracks diverge significantly in:
+        #   - overall energy (RMS ratio > 3×)
+        #   - energy dynamics (variance ratio > 4×)
+        #   - frequency balance (bass/treble profile ratio > 2.5×)
+        rms_ratio = max(a_rms, 1) / max(b_rms, 1)
+        a_profile = a_bass / max(a_treble, 1)
+        b_profile = b_bass / max(b_treble, 1)
+        if (rms_ratio > 3.0 or rms_ratio < (1.0 / 3.0) or
+            max(a_var, 1) / max(b_var, 1) > 4.0 or
+            max(b_var, 1) / max(a_var, 1) > 4.0 or
+            max(a_profile, 0.1) / max(b_profile, 0.1) > 2.5 or
+            max(b_profile, 0.1) / max(a_profile, 0.1) > 2.5):
+            return "tape_stop"
+
+        # Rule 3: Both tracks are bass-heavy → prevent low-end mud
+        if (a_bass / a_rms) > 0.40 and (b_bass / b_rms) > 0.40:
+            return "bass_swap"
+
+        # Rule 3: Outgoing is treble-dominated / cluttered → wash away
+        if a_treble > a_bass * 1.8 and a_bass > 0:
+            return "filter_wash"
+
+        # Rule 4: Outgoing is nearly silent → hard cut, no point blending
+        if a_rms < b_rms * 0.25:
+            return "cut_in"
+
+        # Rule 5: Outgoing energy is chaotic → dissolve with echoes
+        if a_var > (a_rms ** 2) * 0.4:
+            return "melt"
+
+        # Rule 6: Both tracks have a steady, repetitive groove → long blend
+        if a_var < (a_rms ** 2) * 0.08 and b_var < (b_rms ** 2) * 0.08:
+            return "blend"
+
+        # Default: tape crossfade — short, safe, works with any edge case
+        return "tape_stop"
+
+
 
 # ==============================================================================
 # Player Controller
 # ==============================================================================
 
 class YtstrPlayer:
-    def __init__(self, playlist_url: str, shuffle: bool, mix: bool, crossfade_sec: float = 5.0):
+    def __init__(self, playlist_url: str, shuffle: bool, mix: bool, light_mix: bool, crossfade_sec: float = 3.0):
         self.playlist_url = playlist_url
         self.shuffle = shuffle
         self.mix = mix
+        self.light_mix = light_mix
+        self.engine = DecisionEngine()
         self.crossfade_ms = int(crossfade_sec * 1000)
         
         self.playlist: List[Dict] = []
         global CACHE_DIR
-        CACHE_DIR = tempfile.mkdtemp(prefix="ytstr_", dir="/dev/shm")
+        
+        # E05 Fix: Startup Sweep for Stale SHM Dirs
+        shm_base = "/dev/shm"
+        if os.path.exists(shm_base):
+            for d in os.listdir(shm_base):
+                if d.startswith("ytstr_"):
+                    try:
+                        pid_str = d.split("_")[1]
+                        os.kill(int(pid_str), 0)
+                    except ProcessLookupError:
+                        shutil.rmtree(os.path.join(shm_base, d), ignore_errors=True)
+                    except Exception: pass
+
+        CACHE_DIR = os.path.join(shm_base, f"ytstr_{os.getpid()}")
+        os.makedirs(CACHE_DIR, exist_ok=True)
         self.cache_dir = CACHE_DIR
         self.raw_dir = os.path.join(self.cache_dir, "raw")
         self.mix_dir = os.path.join(self.cache_dir, "mixed")
@@ -118,9 +895,12 @@ class YtstrPlayer:
         self.downloaded_idx = -1
         self.mixed_idx = -1
         self.mpv_appended_idx = -1
+        self.playing_idx = 0
+        self.last_transition_type: str = ""  # For UI display
         
         # In-memory Pydub segments for overlaps
         self.cached_raw_audio: Dict[int, AudioSegment] = {}
+        self.pending_overlap: Optional[AudioSegment] = None
 
     def fetch_playlist(self):
         info("Fetching playlist...")
@@ -174,6 +954,23 @@ class YtstrPlayer:
         while not self._quit_flag and self.mixed_idx < len(self.playlist) - 1:
             target_idx = self.mixed_idx + 1
             
+            # E03 Fix: Backpressure - don't bake too far ahead
+            if target_idx > self.playing_idx + 2:
+                time.sleep(1)
+                continue
+
+            # E03 Fix: Garbage Collection - clean old baked tracks
+            gc_idx = self.playing_idx - 1
+            if gc_idx >= 0:
+                old_wav = os.path.join(self.mix_dir, f"{gc_idx}_out.wav")
+                old_raw = os.path.join(self.raw_dir, f"{gc_idx}.opus")
+                if os.path.exists(old_wav):
+                    try: os.remove(old_wav)
+                    except Exception: pass
+                if os.path.exists(old_raw):
+                    try: os.remove(old_raw)
+                    except Exception: pass
+            
             # We need the current track downloaded
             if self.downloaded_idx < target_idx:
                 time.sleep(0.5)
@@ -192,32 +989,50 @@ class YtstrPlayer:
                 else:
                     path_curr = os.path.join(self.raw_dir, f"{target_idx}.opus")
                     s_current = AudioSegment.from_file(path_curr)
-                    if self.mix: s_current = trim_silence(s_current)
+                    if self.mix: s_current = trim_to_energy(s_current)
+                
+                # Prepend the second-half of the overlap from the previous transition!
+                if getattr(self, 'pending_overlap', None) is not None:
+                    s_current = self.pending_overlap + s_current
+                    self.pending_overlap = None
                 
                 if not self.mix or is_last:
                     # No crossfade logic needed for the very last track or NO-MIX
-                    out_path = os.path.join(self.mix_dir, f"{target_idx}_out.mp3")
-                    s_current.export(out_path, format="mp3")
+                    out_path = os.path.join(self.mix_dir, f"{target_idx}_out.wav")
+                    s_current.export(out_path, format="wav")
                     self.mixed_idx = target_idx
                     continue
                 
                 # We are mixing. Load next track.
                 path_next = os.path.join(self.raw_dir, f"{target_idx+1}.opus")
                 s_next = AudioSegment.from_file(path_next)
-                s_next = trim_silence(s_next)
+                s_next = trim_to_energy(s_next)
                 
-                # Create the overlap
-                fout_curr = s_current[-self.crossfade_ms:].fade_out(self.crossfade_ms)
-                fin_next = s_next[:self.crossfade_ms].fade_in(self.crossfade_ms)
-                overlap = fout_curr.overlay(fin_next)
+                # Create the overlap using the Decision Engine
+                fade_ms = self.crossfade_ms
+                if self.light_mix:
+                    trans_type = "fade"
+                else:
+                    trans_type = self.engine.select_transition(s_current, s_next)
                 
-                # Out chunk ends with overlap
-                out_chunk = s_current[:-self.crossfade_ms] + overlap
-                out_path = os.path.join(self.mix_dir, f"{target_idx}_out.mp3")
-                out_chunk.export(out_path, format="mp3")
+                self.last_transition_type = trans_type
+                print(f"{DIM}  -> Transition [{target_idx}->{target_idx+1}]: {trans_type}{NC}", file=sys.stderr)
+                overlap, eff_fade = apply_transition(trans_type, s_current, s_next, fade_ms)
                 
-                # The remainder of the next track becomes the starting chunk for the next loop!
-                self.cached_raw_audio[target_idx+1] = s_next[self.crossfade_ms:]
+                half_fade = eff_fade // 2
+                
+                if eff_fade > 0:
+                    out_chunk = s_current[:-eff_fade] + overlap[:half_fade]
+                    self.pending_overlap = overlap[half_fade:]
+                    self.cached_raw_audio[target_idx+1] = s_next[eff_fade:]
+                else:
+                    out_chunk = s_current
+                    self.pending_overlap = None
+                    self.cached_raw_audio[target_idx+1] = s_next
+                    
+                out_path = os.path.join(self.mix_dir, f"{target_idx}_out.wav")
+                out_chunk.export(out_path, format="wav")
+                
                 self.mixed_idx = target_idx
                 
             except Exception as e:
@@ -242,7 +1057,7 @@ class YtstrPlayer:
             
         if self._quit_flag: return
         
-        first_file = os.path.join(self.mix_dir, f"0_out.mp3")
+        first_file = os.path.join(self.mix_dir, f"0_out.wav")
         mpv_cmd = [
             "mpv",
             "--no-video",
@@ -259,7 +1074,7 @@ class YtstrPlayer:
         while not self._quit_flag and self.mpv_process.poll() is None:
             if self.mixed_idx > self.mpv_appended_idx:
                 next_target = self.mpv_appended_idx + 1
-                next_file = os.path.join(self.mix_dir, f"{next_target}_out.mp3")
+                next_file = os.path.join(self.mix_dir, f"{next_target}_out.wav")
                 if os.path.exists(next_file):
                     self.mpv_ipc_command(["loadfile", next_file, "append"])
                     self.mpv_appended_idx = next_target
@@ -279,21 +1094,52 @@ class YtstrPlayer:
                         data = json.loads(res)
                         curr_pos = data.get("data")
                         
-                        if curr_pos is not None and int(curr_pos) != printed_idx:
-                            printed_idx = int(curr_pos)
-                            if 0 <= printed_idx < len(self.playlist):
-                                print(f"\n{CYAN}━━━━━━━━━━━━━━━━━━━ PLAYING ━━━━━━━━━━━━━━━━━━━━{NC}")
-                                t = self.playlist[printed_idx]['title']
-                                print(f"{GREEN}[{printed_idx + 1}/{len(self.playlist)}]{NC} {YELLOW}{t}{NC}")
-                                if printed_idx + 1 < len(self.playlist):
-                                    nt = self.playlist[printed_idx+1]['title']
-                                    print(f"{DIM}  ↪ Next: {nt}{NC}")
-                                print(f"{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}")
+                        if curr_pos is not None:
+                            curr_idx = int(curr_pos)
+                            self.playing_idx = curr_idx
+                            if curr_idx != printed_idx:
+                                printed_idx = curr_idx
+                                if 0 <= printed_idx < len(self.playlist):
+                                    print(f"\n{CYAN}━━━━━━━━━━━━━━━━━━━ PLAYING ━━━━━━━━━━━━━━━━━━━━{NC}")
+                                    t = self.playlist[printed_idx]['title']
+                                    print(f"{GREEN}[{printed_idx + 1}/{len(self.playlist)}]{NC} {YELLOW}{t}{NC}")
+                                    if self.last_transition_type and self.mix:
+                                        print(f"{DIM}  ⚡ Transition: {self.last_transition_type}{NC}")
+                                    if printed_idx + 1 < len(self.playlist):
+                                        nt = self.playlist[printed_idx+1]['title']
+                                        print(f"{DIM}  ↪ Next: {nt}{NC}")
+                                    print(f"{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}")
                 except Exception: pass
             time.sleep(1)
 
     def keyboard_listener(self):
         fd = sys.stdin.fileno()
+        is_tty = sys.stdin.isatty()
+        
+        def on_press(key):
+            if self._quit_flag:
+                return False
+            try:
+                if key == keyboard.Key.media_play_pause or key == keyboard.Key.f8:
+                    self.mpv_ipc_command(["cycle", "pause"])
+                elif key == keyboard.Key.media_next or key == keyboard.Key.f9:
+                    self.mpv_ipc_command(["playlist-next"])
+                elif key == keyboard.Key.media_previous or key == keyboard.Key.f7:
+                    self.mpv_ipc_command(["playlist-prev"])
+            except Exception:
+                pass
+
+        if keyboard is not None:
+            listener = keyboard.Listener(on_press=on_press)
+            listener.daemon = True
+            listener.start()
+            
+        # E01 Fix: Don't crash if not running in a terminal
+        if not is_tty:
+            while not self._quit_flag:
+                time.sleep(1)
+            return
+
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setcbreak(sys.stdin.fileno())
@@ -319,7 +1165,16 @@ class YtstrPlayer:
 
     def start(self):
         self.fetch_playlist()
-        print(f"\n{YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit{NC}")
+        
+        # Display mix mode
+        if not self.mix:
+            mode_str = f"{RED}OFF (--no-mix){NC}"
+        elif self.light_mix:
+            mode_str = f"{YELLOW}Light Mix (equal-power crossfade){NC}"
+        else:
+            mode_str = f"{GREEN}Auto-DJ (DecisionEngine + 8 transitions){NC}"
+        print(f"\n{CYAN}Mix Mode:{NC} {mode_str}")
+        print(f"{YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit{NC}")
         
         t_dw = threading.Thread(target=self.download_worker, daemon=True)
         t_mx = threading.Thread(target=self.mix_worker, daemon=True)
@@ -329,7 +1184,8 @@ class YtstrPlayer:
         t_dw.start()
         t_mx.start()
         
-        print(f"{DIM}Pre-computing initial crossfade (takes 5-10 seconds)...{NC}")
+        if self.mix:
+            print(f"{DIM}Pre-computing initial transition (takes 5-10 seconds)...{NC}")
         t_mp.start()
         t_ui.start()
         
@@ -338,27 +1194,44 @@ class YtstrPlayer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=f"ytstr v{VERSION} — YouTube Playlist Streamer", add_help=False)
-    parser.add_argument('--list', action='store_true')
-    parser.add_argument('--add', nargs=2, metavar=('NAME', 'URL'))
-    parser.add_argument('--remove', type=int, metavar='NUM')
-    parser.add_argument('--no-shuffle', action='store_true')
-    parser.add_argument('--no-mix', action='store_true')
-    parser.add_argument('-h', '--help', action='store_true')
-    parser.add_argument('target', nargs='?')
+    parser = argparse.ArgumentParser(description=f"ytstr v{VERSION} — YouTube Playlist Streamer with Auto-DJ", add_help=False)
+    parser.add_argument('--list', action='store_true', help='List all saved playlists')
+    parser.add_argument('--add', nargs=2, metavar=('NAME', 'URL'), help='Save a playlist with a friendly name')
+    parser.add_argument('--remove', type=int, metavar='NUM', help='Remove a saved playlist by index')
+    parser.add_argument('--no-shuffle', action='store_true', help='Play tracks in original order')
+    parser.add_argument('--no-mix', action='store_true', help='Disable all audio mixing (battery saver)')
+    parser.add_argument('--light-mix', action='store_true', help='Simple equal-power crossfade (skip DecisionEngine)')
+    parser.add_argument('-h', '--help', action='store_true', help='Show this help message')
+    parser.add_argument('target', nargs='?', help='Playlist URL or saved playlist number')
     
     args = parser.parse_args()
     
     if args.help:
+        parser.print_help()
         sys.exit(0)
         
     playlists = parse_playlists()
     
     if args.list:
+        for i, p in enumerate(playlists):
+            print(f"{GREEN}{i+1}.{NC} {p['name']} ({p['url']})")
         sys.exit(0)
     if args.add:
+        playlists.append({'name': args.add[0], 'url': args.add[1]})
+        save_playlists(playlists)
+        success(f"Added playlist: {args.add[0]}")
         sys.exit(0)
     if args.remove:
+        try:
+            idx = args.remove - 1
+            if 0 <= idx < len(playlists):
+                removed = playlists.pop(idx)
+                save_playlists(playlists)
+                success(f"Removed playlist: {removed['name']}")
+            else:
+                die("Invalid playlist number.")
+        except Exception as e:
+            die(str(e))
         sys.exit(0)
 
     playlist_url = args.target
@@ -378,20 +1251,27 @@ def main():
     player = YtstrPlayer(
         playlist_url=playlist_url,
         shuffle=not args.no_shuffle,
-        mix=not args.no_mix
+        mix=not args.no_mix,
+        light_mix=args.light_mix
     )
     
-    import atexit
-    def cleanup():
+    def cleanup(signum=None, frame=None):
+        player._quit_flag = True
+        if player.mpv_process:
+            try: player.mpv_process.terminate()
+            except Exception: pass
         if getattr(player, 'cache_dir', None) and os.path.exists(player.cache_dir):
             shutil.rmtree(player.cache_dir, ignore_errors=True)
-    atexit.register(cleanup)
+        if signum is not None:
+            sys.exit(0)
+            
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
     
     try:
         player.start()
-    except KeyboardInterrupt:
-        player._quit_flag = True
-        if player.mpv_process: player.mpv_process.terminate()
+    except Exception:
+        cleanup()
 
 if __name__ == "__main__":
     main()

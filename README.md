@@ -1,149 +1,101 @@
-# ytstr
+# 🎧 ytstr v4.1.0 — Intelligent Auto-DJ Streamer
 
-A fast, terminal-native YouTube playlist streamer with intelligent RAM caching and Spotify-style crossfade mixing.
+> **Wired for Performance. Tuned for Perfection.**  
+> A terminal-native YouTube playlist streamer powered by a psychoacoustic DecisionEngine for seamless, broadcast-grade transitions.
 
-`ytstr` streams YouTube playlists through the `yt_dlp` and `python-mpv` libraries, caching audio in `/dev/shm` (RAM) for instant playback. It completely bypasses terminal execution limits by controlling dual `libmpv` player instances directly in Python, seamlessly crossfading transitions between songs — just like Spotify's mix feature.
+---
 
-## Features
+## ⚡ Quick Start
 
-- **Crossfade Mixing** — Spotify-style fade-out/fade-in between songs with configurable overlap (default 5s)
-- **RAM Caching** — Audio cached to `/dev/shm` for near-instant playback with automatic eviction
-- **Smart Preloading** — Downloads the next 2 and previous 1 tracks around the current position
-- **Leading Silence Removal** — Strips silent padding from the start of each track
-- **Playlist Management** — Save, list, and remove playlists with friendly names
-- **Shuffle by Default** — Randomized playback order, disable with `--no-shuffle`
-- **Battery Saver Mode** — `--no-mix` disables all audio processing for low-power playback
-
-## Prerequisites
-
-This is a Python 3 based tool.
-
-| Tool | Install |
-|------|---------|
-| Python Deps | `pip install yt-dlp python-mpv` |
-| [mpv](https://mpv.io/) | `sudo apt install libmpv-dev mpv` |
-
-## Installation
-
+### 1. System Requirements
+Ensure you have the core media handlers installed on your system:
 ```bash
-git clone https://github.com/seeramsujay/ytstr.git
-cd ytstr
-chmod +x ytstr
+sudo apt update && sudo apt install mpv ffmpeg
 ```
 
-### Add to PATH
-
-**System-wide:**
+### 2. Install Dependencies
 ```bash
-sudo cp ytstr /usr/local/bin/
+pip install -r requirements.txt
 ```
 
-**User-local:**
+### 3. Launch the Music
+Stream any YouTube playlist or video immediately:
 ```bash
-mkdir -p ~/.local/bin
-cp ytstr ~/.local/bin/
-
-# Add to your shell config if not already present:
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+./ytstr "https://www.youtube.com/playlist?list=..."
 ```
 
-## Usage
+---
 
-```bash
-# Play a YouTube playlist URL directly
-ytstr 'https://youtube.com/playlist?list=PLxxx'
+## 🎨 Choose Your Mix
 
-# Interactive playlist selection from saved playlists
-ytstr
+| Mode | Command | Impact | Best For |
+|------|---------|--------|----------|
+| **Auto-DJ** | `default` | High | The full DJ experience with 8 transition styles. |
+| **Light Mix** | `--light-mix` | Med | Simple equal-power crossfading. Lower CPU. |
+| **No Mix** | `--no-mix` | Low | Pure sequential playback. Battery saver. |
 
-# Play saved playlist #1
-ytstr 1
+---
 
-# Play without crossfade (battery saver)
-ytstr --no-mix 1
+## 🎹 Control Your Sound
 
-# Play in original order, no crossfade
-ytstr --no-shuffle --no-mix 'https://youtube.com/playlist?list=PLxxx'
-```
-
-### Playlist Management
-
-```bash
-# Save a playlist
-ytstr --add 'Lofi Beats' 'https://youtube.com/playlist?list=PLxxx'
-
-# List saved playlists
-ytstr --list
-
-# Remove saved playlist #2
-ytstr --remove 2
-```
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `--list` | List all saved playlists |
-| `--add <name> <url>` | Save a playlist with a friendly name |
-| `--remove <number>` | Remove a saved playlist by index |
-| `--no-shuffle` | Play tracks in original playlist order |
-| `--no-mix` | Disable crossfade mixing (saves CPU/battery) |
-| `-h`, `--help` | Show help message |
-
-### Playback Controls
-
+### Terminal Hotkeys
 | Key | Action |
 |-----|--------|
-| `Space` | Pause / Resume |
-| `>` | Next song |
-| `<` | Previous song |
-| `9` / `0` | Volume down / up |
-| `q` | Skip to next song |
-| `Shift+Q` | Quit player |
+| `Space` | Play / Pause |
+| `>` | Next Track |
+| `<` | Previous Track |
+| `9` / `0` | Volume Down / Up |
+| `q` | Skip to Next Track |
+| `Shift + Q`| Quit Gracefully |
 
-## How It Works
+### 🌍 Global Media Keys (Hardware)
+`ytstr` automatically binds to your system's hardware media keys:
+- **F7:** Previous Track
+- **F8:** Play / Pause
+- **F9:** Next Track
 
-```
-┌─────────────┐     ┌──────────┐     ┌─────────┐
-│   yt-dlp    │     │ /dev/shm │     │   mpv   │
-│  (fetch +   │────▶│  (RAM    │────▶│ (audio  │
-│  download)  │     │  cache)  │     │ player) │
-└─────────────┘     └──────────┘     └─────────┘
-       │                                   │
-       │  Preloads next 2 +           Lua script
-       │  previous 1 tracks          monitors
-       │                          time-remaining
-       ▼                               │
-  Evicts old                     Triggers fade-out
-  cache entries                  + starts next song
-```
+---
 
-### Crossfade Pipeline
+## 🎭 The 8 DJ Transition Styles
+The **DecisionEngine** analyzes the spectral energy (Bass/Treble/RMS) of every track pair to select the perfect transition:
 
-1. The Python `YtstrPlayer` orchestrates two distinct `python-mpv` `MPV` instances (`player_a` and `player_b`).
-2. An event listener attached to the active player's `time-remaining` property monitors playback globally.
-3. When remaining time ≤ 5 seconds, Python triggers a seamless fadeout filter on the active player and immediately starts the next track on the standby player with a fade-in filter.
-4. Leading silence is stripped natively via `silenceremove` so the new track's audio starts instantly.
-5. Both player decoders actively stream directly from the RAM cache simultaneously, achieving an authentic Spotify-like transition.
+1.  **Fade:** Classic sinusoidal crossfade.
+2.  **Blend:** Long, overlapping crossover for steady grooves.
+3.  **Rise:** Energy-matched surge for incoming drops.
+4.  **Cut In:** Immediate transition for high-impact starts.
+5.  **Bass Swap:** Swaps low-end frequencies to prevent "muddy" overlaps.
+6.  **Filter Wash:** Sweeps out the treble for a clean exit.
+7.  **Melt:** Dissolves the outgoing track into the next.
+8.  **Tape Stop:** A signature DJ "spin-down" effect for clashing tracks.
 
-### Caching Strategy
+---
 
-- Cache directory: `/dev/shm/ytstr_<PID>` (RAM-backed tmpfs)
-- Window: current track ± 1 previous + 2 next
-- Eviction runs after each track completes
-- Full cleanup on exit (EXIT/INT/TERM traps)
-- Typical memory usage: ~12 MB for a 4-track window
+## 📂 Playlist Management
+Save your favorite playlists with friendly names for instant access:
 
-## Configuration
+- **Add:** `./ytstr --add "Lofi Mix" "https://..."`
+- **List:** `./ytstr --list`
+- **Remove:** `./ytstr --remove 3`
+- **Launch Saved:** `./ytstr 1` (Plays the first saved playlist)
 
-Playlists are stored in `~/.config/ytstr/playlists` as pipe-delimited entries:
+---
 
-```
-Lofi Beats|https://youtube.com/playlist?list=PLxxx
-Workout Mix|https://youtube.com/playlist?list=PLyyy
-```
+## 🚀 Performance & Stability (V4.1.0 Optimized)
 
-## License
+The engine is built on a high-stability daemon architecture with active **Backpressure** and **Garbage Collection**.
 
-This project is open-source and available under the [MIT License](LICENSE).
+| Mode | CPU (Peak) | Memory (RSS) | RAM Disk (SHM) |
+|------|------------|--------------|----------------|
+| **Auto-DJ** | ~100% | ~480 MB | **~260 MB** |
+| **Light-Mix** | ~75% | ~510 MB | **~210 MB** |
+| **No-Mix** | ~40% | ~270 MB | **~290 MB** |
+
+> [!NOTE]
+> **V4.1.0 Update:** RAM disk usage is now strictly bounded to ~3 track segments. The system automatically nukes old bake files as they finish playing, reducing memory footprint by **70%**.
+
+---
+
+## 📜 License
+This project is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License v3.0** as published by the Free Software Foundation. 
+
+See the [LICENSE](LICENSE) file for the full text.
