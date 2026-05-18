@@ -43,6 +43,7 @@ import subprocess
 import socket
 import json
 import signal
+import io
 from typing import List, Dict, Optional
 
 try:
@@ -106,6 +107,28 @@ def save_playlists(playlists: List[Dict[str, str]]):
         with open(PLAYLIST_FILE, 'w') as f:
             for p in playlists: f.write(f"{p['name']}|{p['url']}\n")
     except Exception as e: die(f"Failed to save playlists: {e}")
+
+def get_audio_duration(file_path: str) -> float:
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+    try:
+        res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('utf-8').strip()
+        return float(res)
+    except Exception:
+        return 0.0
+
+def get_audio_chunk(file_path: str, start_s: float, duration_s: float) -> AudioSegment:
+    cmd = [
+        "ffmpeg", "-y", "-v", "error", 
+        "-ss", str(start_s), "-t", str(duration_s),
+        "-i", file_path, 
+        "-f", "wav", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", 
+        "pipe:1"
+    ]
+    try:
+        res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        return AudioSegment.from_file(io.BytesIO(res), format="wav")
+    except Exception:
+        return AudioSegment.empty()
 
 def get_equal_power_gain(t: float, duration: float, is_fade_in: bool = True) -> float:
     """
@@ -867,7 +890,6 @@ class YtstrPlayer:
         self.playlist: List[Dict] = []
         global CACHE_DIR
         
-        # E05 Fix: Startup Sweep for Stale SHM Dirs
         shm_base = "/dev/shm"
         if os.path.exists(shm_base):
             for d in os.listdir(shm_base):
@@ -883,24 +905,19 @@ class YtstrPlayer:
         os.makedirs(CACHE_DIR, exist_ok=True)
         self.cache_dir = CACHE_DIR
         self.raw_dir = os.path.join(self.cache_dir, "raw")
-        self.mix_dir = os.path.join(self.cache_dir, "mixed")
         os.makedirs(self.raw_dir, exist_ok=True)
-        os.makedirs(self.mix_dir, exist_ok=True)
         
         self.ipc_socket = os.path.join(self.cache_dir, "mpv_ipc")
         self.mpv_process = None
         self._quit_flag = False
         
-        # State tracking
         self.downloaded_idx = -1
-        self.mixed_idx = -1
-        self.mpv_appended_idx = -1
         self.playing_idx = 0
-        self.last_transition_type: str = ""  # For UI display
+        self.last_transition_type: str = ""
         
-        # In-memory Pydub segments for overlaps
-        self.cached_raw_audio: Dict[int, AudioSegment] = {}
-        self.pending_overlap: Optional[AudioSegment] = None
+        self.skip_to_next = False
+        self.skip_to_prev = False
+        self.toggle_pause = False
 
     def fetch_playlist(self):
         info("Fetching playlist...")
@@ -925,9 +942,8 @@ class YtstrPlayer:
             random.shuffle(self.playlist)
 
     def download_worker(self):
-        """Continuously downloads tracks up to 2 ahead of the mixed index."""
         while not self._quit_flag and self.downloaded_idx < len(self.playlist) - 1:
-            if self.downloaded_idx <= self.mixed_idx + 2:
+            if self.downloaded_idx <= self.playing_idx + 2:
                 target_idx = self.downloaded_idx + 1
                 video_id = self.playlist[target_idx]['id']
                 path = os.path.join(self.raw_dir, f"{target_idx}.opus")
@@ -949,98 +965,24 @@ class YtstrPlayer:
             else:
                 time.sleep(0.5)
 
-    def mix_worker(self):
-        """Lazily trims silences, mixes overlaps using Pydub, and exports sequentially."""
-        while not self._quit_flag and self.mixed_idx < len(self.playlist) - 1:
-            target_idx = self.mixed_idx + 1
-            
-            # E03 Fix: Backpressure - don't bake too far ahead
-            if target_idx > self.playing_idx + 2:
-                time.sleep(1)
-                continue
-
-            # E03 Fix: Garbage Collection - clean old baked tracks
-            gc_idx = self.playing_idx - 1
-            if gc_idx >= 0:
-                old_wav = os.path.join(self.mix_dir, f"{gc_idx}_out.wav")
-                old_raw = os.path.join(self.raw_dir, f"{gc_idx}.opus")
-                if os.path.exists(old_wav):
-                    try: os.remove(old_wav)
-                    except Exception: pass
-                if os.path.exists(old_raw):
-                    try: os.remove(old_raw)
-                    except Exception: pass
-            
-            # We need the current track downloaded
-            if self.downloaded_idx < target_idx:
-                time.sleep(0.5)
-                continue
-                
-            # If mixing, we ALSO need the NEXT track downloaded unless it's the last track
-            is_last = target_idx == (len(self.playlist) - 1)
-            if self.mix and not is_last and self.downloaded_idx < target_idx + 1:
-                time.sleep(0.5)
-                continue
-
-            try:
-                # Load current track (either from raw or cache from previous iteration)
-                if target_idx in self.cached_raw_audio:
-                    s_current = self.cached_raw_audio.pop(target_idx)
-                else:
-                    path_curr = os.path.join(self.raw_dir, f"{target_idx}.opus")
-                    s_current = AudioSegment.from_file(path_curr)
-                    if self.mix: s_current = trim_to_energy(s_current)
-                
-                # Prepend the second-half of the overlap from the previous transition!
-                if getattr(self, 'pending_overlap', None) is not None:
-                    s_current = self.pending_overlap + s_current
-                    self.pending_overlap = None
-                
-                if not self.mix or is_last:
-                    # No crossfade logic needed for the very last track or NO-MIX
-                    out_path = os.path.join(self.mix_dir, f"{target_idx}_out.wav")
-                    s_current.export(out_path, format="wav")
-                    self.mixed_idx = target_idx
-                    continue
-                
-                # We are mixing. Load next track.
-                path_next = os.path.join(self.raw_dir, f"{target_idx+1}.opus")
-                s_next = AudioSegment.from_file(path_next)
-                s_next = trim_to_energy(s_next)
-                
-                # Create the overlap using the Decision Engine
-                fade_ms = self.crossfade_ms
-                if self.light_mix:
-                    trans_type = "fade"
-                else:
-                    trans_type = self.engine.select_transition(s_current, s_next)
-                
-                self.last_transition_type = trans_type
-                print(f"{DIM}  -> Transition [{target_idx}->{target_idx+1}]: {trans_type}{NC}", file=sys.stderr)
-                overlap, eff_fade = apply_transition(trans_type, s_current, s_next, fade_ms)
-                
-                half_fade = eff_fade // 2
-                
-                if eff_fade > 0:
-                    out_chunk = s_current[:-eff_fade] + overlap[:half_fade]
-                    self.pending_overlap = overlap[half_fade:]
-                    self.cached_raw_audio[target_idx+1] = s_next[eff_fade:]
-                else:
-                    out_chunk = s_current
-                    self.pending_overlap = None
-                    self.cached_raw_audio[target_idx+1] = s_next
-                    
-                out_path = os.path.join(self.mix_dir, f"{target_idx}_out.wav")
-                out_chunk.export(out_path, format="wav")
-                
-                self.mixed_idx = target_idx
-                
-            except Exception as e:
-                # If processing fails, mark as mixed to skip stalling
-                self.mixed_idx = target_idx
+    def launch_mpv(self):
+        if self.mpv_process:
+            try: self.mpv_process.kill()
+            except Exception: pass
+        mpv_cmd = [
+            "mpv",
+            "--no-video",
+            "--demuxer=rawaudio",
+            "--demuxer-rawaudio-channels=2",
+            "--demuxer-rawaudio-format=s16le",
+            "--demuxer-rawaudio-rate=44100",
+            "--msg-level=all=no",
+            f"--input-ipc-server={self.ipc_socket}",
+            "-"
+        ]
+        self.mpv_process = subprocess.Popen(mpv_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def mpv_ipc_command(self, cmd: List[str]):
-        """Dispatches JSON command to running MPV socket."""
         if not os.path.exists(self.ipc_socket): return
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -1049,67 +991,175 @@ class YtstrPlayer:
                 client.sendall(msg.encode('utf-8'))
         except Exception: pass
 
-    def mpv_worker(self):
-        """Orchestrates MPV playback sequentially."""
-        # Wait until the very first track is mixed
-        while self.mixed_idx < 0 and not self._quit_flag:
+    def stream_worker(self):
+        while self.downloaded_idx < 0 and not self._quit_flag:
             time.sleep(0.5)
-            
         if self._quit_flag: return
-        
-        first_file = os.path.join(self.mix_dir, f"0_out.wav")
-        mpv_cmd = [
-            "mpv",
-            "--no-video",
-            "--gapless-audio=yes",
-            "--msg-level=all=no", # Keep terminal brutally clean
-            f"--input-ipc-server={self.ipc_socket}",
-            first_file
-        ]
-        
-        self.mpv_process = subprocess.Popen(mpv_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.mpv_appended_idx = 0
-        
-        # Continously append new tracks as they render
-        while not self._quit_flag and self.mpv_process.poll() is None:
-            if self.mixed_idx > self.mpv_appended_idx:
-                next_target = self.mpv_appended_idx + 1
-                next_file = os.path.join(self.mix_dir, f"{next_target}_out.wav")
-                if os.path.exists(next_file):
-                    self.mpv_ipc_command(["loadfile", next_file, "append"])
-                    self.mpv_appended_idx = next_target
-            time.sleep(1)
 
-    def ui_worker(self):
-        """Displays UI status cleanly."""
-        printed_idx = -1
-        while not self._quit_flag:
-            # We must retrieve current playlist index from MPV
+        self.launch_mpv()
+        
+        curr_idx = 0
+        curr_time_s = 0.0
+        total_written_s = 0.0
+        pending_overlap = None
+        
+        while not self._quit_flag and curr_idx < len(self.playlist):
+            if self.skip_to_next:
+                self.skip_to_next = False
+                curr_idx += 1
+                curr_time_s = 0.0
+                total_written_s = 0.0
+                pending_overlap = None
+                self.launch_mpv()
+                if curr_idx >= len(self.playlist): break
+                continue
+                
+            if self.skip_to_prev:
+                self.skip_to_prev = False
+                curr_idx = max(0, curr_idx - 1)
+                curr_time_s = 0.0
+                total_written_s = 0.0
+                pending_overlap = None
+                self.launch_mpv()
+                continue
+                
+            if self.toggle_pause:
+                self.toggle_pause = False
+                self.mpv_ipc_command(["cycle", "pause"])
+
+            # 1. Check MPV playback time for hysteresis
+            mpv_time_s = 0.0
             if os.path.exists(self.ipc_socket):
                 try:
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                         client.connect(self.ipc_socket)
-                        client.sendall(b'{"command": ["get_property", "playlist-pos"]}\n')
+                        client.sendall(b'{"command": ["get_property", "playback-time"]}\n')
                         res = client.recv(1024).decode('utf-8')
                         data = json.loads(res)
-                        curr_pos = data.get("data")
-                        
-                        if curr_pos is not None:
-                            curr_idx = int(curr_pos)
-                            self.playing_idx = curr_idx
-                            if curr_idx != printed_idx:
-                                printed_idx = curr_idx
-                                if 0 <= printed_idx < len(self.playlist):
-                                    print(f"\n{CYAN}━━━━━━━━━━━━━━━━━━━ PLAYING ━━━━━━━━━━━━━━━━━━━━{NC}")
-                                    t = self.playlist[printed_idx]['title']
-                                    print(f"{GREEN}[{printed_idx + 1}/{len(self.playlist)}]{NC} {YELLOW}{t}{NC}")
-                                    if self.last_transition_type and self.mix:
-                                        print(f"{DIM}  ⚡ Transition: {self.last_transition_type}{NC}")
-                                    if printed_idx + 1 < len(self.playlist):
-                                        nt = self.playlist[printed_idx+1]['title']
-                                        print(f"{DIM}  ↪ Next: {nt}{NC}")
-                                    print(f"{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}")
+                        if data.get("data") is not None:
+                            mpv_time_s = float(data["data"])
                 except Exception: pass
+
+            # Hysteresis: wait if we have > 30s buffered
+            buffered_s = total_written_s - mpv_time_s
+            if buffered_s > 30.0:
+                time.sleep(1)
+                continue
+
+            # 2. Fetch chunk and write to mpv
+            chunk_dur_s = 40.0 # Fetch 40 seconds at a time
+            
+            if self.downloaded_idx < curr_idx:
+                time.sleep(0.5)
+                continue
+                
+            path_curr = os.path.join(self.raw_dir, f"{curr_idx}.opus")
+            if not os.path.exists(path_curr):
+                time.sleep(0.5)
+                continue
+                
+            track_dur_s = get_audio_duration(path_curr)
+            if track_dur_s == 0.0:
+                time.sleep(0.5)
+                continue
+                
+            fade_s = self.crossfade_ms / 1000.0
+            end_limit_s = track_dur_s if (not self.mix or curr_idx == len(self.playlist)-1) else (track_dur_s - fade_s)
+            
+            remaining_in_track_s = end_limit_s - curr_time_s
+            
+            self.playing_idx = curr_idx # Update UI state
+            
+            if remaining_in_track_s > chunk_dur_s:
+                chunk = get_audio_chunk(path_curr, curr_time_s, chunk_dur_s)
+                if pending_overlap is not None:
+                    chunk = pending_overlap + chunk
+                    pending_overlap = None
+                
+                try:
+                    self.mpv_process.stdin.write(chunk.raw_data)
+                    self.mpv_process.stdin.flush()
+                except Exception:
+                    pass # Broken pipe (user quit or skipped)
+                    
+                curr_time_s += chunk_dur_s
+                total_written_s += len(chunk) / 1000.0
+            else:
+                if remaining_in_track_s > 0:
+                    chunk = get_audio_chunk(path_curr, curr_time_s, remaining_in_track_s)
+                    if pending_overlap is not None:
+                        chunk = pending_overlap + chunk
+                        pending_overlap = None
+                    try:
+                        self.mpv_process.stdin.write(chunk.raw_data)
+                        self.mpv_process.stdin.flush()
+                    except Exception: pass
+                    total_written_s += len(chunk) / 1000.0
+                elif pending_overlap is not None:
+                    try:
+                        self.mpv_process.stdin.write(pending_overlap.raw_data)
+                        self.mpv_process.stdin.flush()
+                    except Exception: pass
+                    total_written_s += len(pending_overlap) / 1000.0
+                    pending_overlap = None
+                
+                if self.mix and curr_idx < len(self.playlist) - 1:
+                    while self.downloaded_idx < curr_idx + 1 and not self._quit_flag and not self.skip_to_next and not self.skip_to_prev:
+                        time.sleep(0.5)
+                    if self._quit_flag or self.skip_to_next or self.skip_to_prev: continue
+                    
+                    path_next = os.path.join(self.raw_dir, f"{curr_idx+1}.opus")
+                    
+                    s_out = get_audio_chunk(path_curr, track_dur_s - 5.0, 5.0)
+                    s_in = get_audio_chunk(path_next, 0.0, 5.0)
+                    
+                    if self.light_mix:
+                        trans_type = "fade"
+                    else:
+                        trans_type = self.engine.select_transition(s_out, s_in)
+                        
+                    self.last_transition_type = trans_type
+                    
+                    fade_chunk_out = get_audio_chunk(path_curr, track_dur_s - fade_s, fade_s)
+                    fade_chunk_in = get_audio_chunk(path_next, 0.0, fade_s)
+                    
+                    overlap, eff_fade = apply_transition(trans_type, fade_chunk_out, fade_chunk_in, self.crossfade_ms)
+                    half_fade = eff_fade // 2
+                    
+                    if eff_fade > 0:
+                        out_chunk = overlap[:half_fade]
+                        pending_overlap = overlap[half_fade:]
+                        curr_time_s = eff_fade / 1000.0
+                    else:
+                        out_chunk = AudioSegment.empty()
+                        curr_time_s = 0.0
+                        
+                    if len(out_chunk) > 0:
+                        try:
+                            self.mpv_process.stdin.write(out_chunk.raw_data)
+                            self.mpv_process.stdin.flush()
+                        except Exception: pass
+                        total_written_s += len(out_chunk) / 1000.0
+                else:
+                    curr_time_s = 0.0
+                    
+                curr_idx += 1
+
+    def ui_worker(self):
+        printed_idx = -1
+        while not self._quit_flag:
+            curr_idx = self.playing_idx
+            if curr_idx != printed_idx and 0 <= curr_idx < len(self.playlist):
+                printed_idx = curr_idx
+                print(f"\n{CYAN}━━━━━━━━━━━━━━━━━━━ PLAYING ━━━━━━━━━━━━━━━━━━━━{NC}")
+                t = self.playlist[printed_idx]['title']
+                print(f"{GREEN}[{printed_idx + 1}/{len(self.playlist)}]{NC} {YELLOW}{t}{NC}")
+                if self.last_transition_type and self.mix:
+                    print(f"{DIM}  ⚡ Transition: {self.last_transition_type}{NC}")
+                if printed_idx + 1 < len(self.playlist):
+                    nt = self.playlist[printed_idx+1]['title']
+                    print(f"{DIM}  ↪ Next: {nt}{NC}")
+                print(f"{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}")
             time.sleep(1)
 
     def keyboard_listener(self):
@@ -1117,27 +1167,23 @@ class YtstrPlayer:
         is_tty = sys.stdin.isatty()
         
         def on_press(key):
-            if self._quit_flag:
-                return False
+            if self._quit_flag: return False
             try:
                 if key == keyboard.Key.media_play_pause or key == keyboard.Key.f8:
-                    self.mpv_ipc_command(["cycle", "pause"])
+                    self.toggle_pause = True
                 elif key == keyboard.Key.media_next or key == keyboard.Key.f9:
-                    self.mpv_ipc_command(["playlist-next"])
+                    self.skip_to_next = True
                 elif key == keyboard.Key.media_previous or key == keyboard.Key.f7:
-                    self.mpv_ipc_command(["playlist-prev"])
-            except Exception:
-                pass
+                    self.skip_to_prev = True
+            except Exception: pass
 
         if keyboard is not None:
             listener = keyboard.Listener(on_press=on_press)
             listener.daemon = True
             listener.start()
             
-        # E01 Fix: Don't crash if not running in a terminal
         if not is_tty:
-            while not self._quit_flag:
-                time.sleep(1)
+            while not self._quit_flag: time.sleep(1)
             return
 
         old_settings = termios.tcgetattr(fd)
@@ -1147,26 +1193,20 @@ class YtstrPlayer:
                 import select
                 if select.select([sys.stdin], [], [], 0.5)[0]:
                     ch = sys.stdin.read(1)
-                    if ch == ' ':
-                        self.mpv_ipc_command(["cycle", "pause"])
-                    elif ch == '>' or ch == 'q':
-                        self.mpv_ipc_command(["playlist-next"])
-                    elif ch == '<':
-                        self.mpv_ipc_command(["playlist-prev"])
+                    if ch == ' ': self.toggle_pause = True
+                    elif ch == '>' or ch == 'q': self.skip_to_next = True
+                    elif ch == '<': self.skip_to_prev = True
                     elif ch == 'Q':
                         self._quit_flag = True
-                        if self.mpv_process: self.mpv_process.terminate()
-                    elif ch == '9':
-                        self.mpv_ipc_command(["add", "volume", "-5"])
-                    elif ch == '0':
-                        self.mpv_ipc_command(["add", "volume", "5"])
+                        if self.mpv_process: self.mpv_process.kill()
+                    elif ch == '9': self.mpv_ipc_command(["add", "volume", "-5"])
+                    elif ch == '0': self.mpv_ipc_command(["add", "volume", "5"])
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def start(self):
         self.fetch_playlist()
         
-        # Display mix mode
         if not self.mix:
             mode_str = f"{RED}OFF (--no-mix){NC}"
         elif self.light_mix:
@@ -1177,16 +1217,11 @@ class YtstrPlayer:
         print(f"{YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Shift+q=quit{NC}")
         
         t_dw = threading.Thread(target=self.download_worker, daemon=True)
-        t_mx = threading.Thread(target=self.mix_worker, daemon=True)
-        t_mp = threading.Thread(target=self.mpv_worker, daemon=True)
+        t_st = threading.Thread(target=self.stream_worker, daemon=True)
         t_ui = threading.Thread(target=self.ui_worker, daemon=True)
         
         t_dw.start()
-        t_mx.start()
-        
-        if self.mix:
-            print(f"{DIM}Pre-computing initial transition (takes 5-10 seconds)...{NC}")
-        t_mp.start()
+        t_st.start()
         t_ui.start()
         
         self.keyboard_listener()
@@ -1258,7 +1293,7 @@ def main():
     def cleanup(signum=None, frame=None):
         player._quit_flag = True
         if player.mpv_process:
-            try: player.mpv_process.terminate()
+            try: player.mpv_process.kill()
             except Exception: pass
         if getattr(player, 'cache_dir', None) and os.path.exists(player.cache_dir):
             shutil.rmtree(player.cache_dir, ignore_errors=True)
