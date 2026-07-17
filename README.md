@@ -78,3 +78,18 @@ Start streaming a direct URL or keyword query:
 
 ## 📄 License
 This project is licensed under the GPL-3.0 License. See the `LICENSE` file for details.
+
+
+---
+
+## 🛡️ Licensing & Privacy Protection
+
+Because this repository contains personal code, portfolios, or intellectual property, **strict privacy protections are in place**.
+
+### ⚠️ Prohibitions on AI Training & Scraping
+This repository is published for direct human viewing only. Automated data scraping, harvesting, and crawling are strictly prohibited under the author's personal copyright terms.
+
+**By accessing this repository or its contents, you agree to the following terms:**
+*   **NO AI/LLM Ingestion:** Any ingestion of code, text, layouts, designs, or assets for training, validation, testing, or tuning of machine learning models, neural networks, or artificial intelligence systems (such as Large Language Models) is strictly prohibited.
+*   **NO Automated Data Scraping:** Any automated extraction, parsing, harvesting, or scraping of content by bots, crawlers, scripts, or spiders is prohibited.
+*   **Personal Use Only:** Human viewing for personal or educational review is permitted. No duplication, modification, adaptation, or commercial distribution of this work is allowed without express written permission.
