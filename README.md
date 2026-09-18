@@ -85,17 +85,21 @@ ytstr --tui
 
 | Key | Action |
 | :---: | :--- |
-| `1` - `5` / `Tab` | Switch tabs: **Home**, **Charts**, **Search**, **Saved**, **Login** |
+| `1` - `6` / `Tab` | Switch tabs: **Recommended**, **My Playlists**, **Liked Songs**, **Radio Queue**, **Search**, **Account** |
 | `↑` / `↓` or `k` / `j` | Navigate items in list |
-| `PageUp` / `PageDown` | Scroll 10 items |
-| `Enter` | Play selected track or playlist |
+| `Enter` | Play selected track & start continuous radio / Drill down into playlist |
+| `Backspace` / `Esc` | Return from playlist drill-down to playlist list |
+| `Shift` + `P` | Queue and play entire playlist directly |
 | `Space` | Toggle Pause / Resume |
-| `n` / `p` | Skip to Next / Previous track |
-| `+` / `-` | Volume up / down (5% steps) |
-| `/` | Open Search bar |
-| `r` | Start infinite Radio from selected track |
-| `s` | Save selected track or playlist to `~/.config/ytstr/playlists` |
-| `m` | Cycle Playback Mode (Direct Low-RAM → Light Mix → Stream → Auto-DJ) |
+| `>` or `.` / `n` | Skip to next track in radio queue |
+| `<` or `,` / `p` | Skip to previous track |
+| `d` or `Delete` | Remove/skip upcoming song from radio queue |
+| `u` | Jump to Radio Queue view |
+| `9` / `0` or `-` / `+` | Volume down / up (5% steps) |
+| `/` | Open YouTube Music search bar |
+| `r` | Force seed new radio station from selected track |
+| `s` | Save selected track or playlist locally |
+| `m` | Cycle Playback Mode (Direct Low-RAM -> Light Mix -> Stream -> Auto-DJ) |
 | `x` | Stop playback |
 | `q` | Quit TUI |
 
