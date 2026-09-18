@@ -96,7 +96,7 @@ class AuthManager:
                 )
 
                 if not has_auth:
-                    last_err = f"No active YouTube session found in {b.capitalize()}. Please log in first."
+                    last_err = f"No active YouTube session found in {b.capitalize()}."
                     continue
 
                 # Build valid ytmusicapi browser headers dictionary
@@ -118,7 +118,13 @@ class AuthManager:
                 last_err = f"{b.capitalize()}: {e}"
                 continue
 
-        return False, last_err or "Could not extract cookies from any browser. Make sure you are logged into music.youtube.com."
+        if browser_name.lower() == "auto":
+            return (
+                False,
+                "No active YouTube session found across installed browsers (Chrome, Firefox, Brave, Edge, etc.). "
+                "Please sign in to https://music.youtube.com in your browser, then re-run: ytstr --login",
+            )
+        return False, last_err or f"Could not extract cookies from {browser_name.capitalize()}."
 
     def save_headers(self, raw_headers: str) -> bool:
         """
