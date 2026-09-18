@@ -24,6 +24,7 @@ dependencies = [
     "yt-dlp>=2024.3.10",
     "pydub>=0.25.1",
     "ytmusicapi>=1.8.0",
+    "pynput>=1.7.6",
 ]
 
 [project.optional-dependencies]

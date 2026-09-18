@@ -25,6 +25,8 @@ class KeyboardListener:
         on_volume_up: Callable[[], None],
         on_volume_down: Callable[[], None],
         on_quit: Callable[[], None],
+        on_seek_forward: Optional[Callable[[int], None]] = None,
+        on_seek_backward: Optional[Callable[[int], None]] = None,
     ):
         self.on_toggle_pause = on_toggle_pause
         self.on_next = on_next
@@ -32,6 +34,8 @@ class KeyboardListener:
         self.on_volume_up = on_volume_up
         self.on_volume_down = on_volume_down
         self.on_quit = on_quit
+        self.on_seek_forward = on_seek_forward
+        self.on_seek_backward = on_seek_backward
 
         self._running = True
 
@@ -53,6 +57,10 @@ class KeyboardListener:
                     self.on_next()
                 elif key in (keyboard.Key.media_previous, keyboard.Key.f7):
                     self.on_prev()
+                elif key == getattr(keyboard.Key, 'media_volume_up', None):
+                    self.on_volume_up()
+                elif key == getattr(keyboard.Key, 'media_volume_down', None):
+                    self.on_volume_down()
             except Exception:
                 pass
 
@@ -77,12 +85,26 @@ class KeyboardListener:
                 r, _, _ = select.select([sys.stdin], [], [], 0.3)
                 if r:
                     ch = sys.stdin.read(1)
-                    if ch == " ":
+                    if ch == "":  # Escape sequence for arrow keys
+                        seq = sys.stdin.read(2)
+                        if seq == "[C":  # Right Arrow
+                            if self.on_seek_forward:
+                                self.on_seek_forward(5)
+                        elif seq == "[D":  # Left Arrow
+                            if self.on_seek_backward:
+                                self.on_seek_backward(5)
+                    elif ch == " ":
                         self.on_toggle_pause()
                     elif ch in (">", ".", "n"):
                         self.on_next()
                     elif ch in ("<", ",", "p"):
                         self.on_prev()
+                    elif ch in ("]", "l"):
+                        if self.on_seek_forward:
+                            self.on_seek_forward(10)
+                    elif ch in ("[", "h"):
+                        if self.on_seek_backward:
+                            self.on_seek_backward(10)
                     elif ch in ("9", "-"):
                         self.on_volume_down()
                     elif ch in ("0", "+", "="):

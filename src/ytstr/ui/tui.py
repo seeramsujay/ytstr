@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from ytstr.config import PLAYLIST_FILE, VERSION
 from ytstr.core.types import Track
 from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process
+
+try:
+    from pynput import keyboard as pynput_keyboard
+except ImportError:
+    pynput_keyboard = None
 from ytstr.ytm.auth import AuthManager
 from ytstr.ytm.client import YouTubeMusicClient
 
@@ -77,6 +82,8 @@ class TUIApp:
         self.loading_text = ""
         self.search_query = ""
 
+        self.global_listener = None
+        self._start_global_media_listener()
         self._setup_curses()
         self._ensure_mpv()
         self.fetch_recommended_async()
@@ -140,8 +147,52 @@ class TUIApp:
         finally:
             self.cleanup()
 
+    def _start_global_media_listener(self):
+        """Intercept hardware keyboard media keys (Play/Pause, Next, Prev, etc.)."""
+        if not pynput_keyboard:
+            return
+
+        def on_press(key):
+            try:
+                # Play / Pause
+                if key in (pynput_keyboard.Key.media_play_pause, pynput_keyboard.Key.f8):
+                    self.toggle_pause()
+                # Next Track
+                elif key in (pynput_keyboard.Key.media_next, pynput_keyboard.Key.f9):
+                    if self.ipc:
+                        self.ipc.send_command(["playlist-next"])
+                        self.status_msg = "Skipped to next track (Media Key)."
+                # Previous Track
+                elif key in (pynput_keyboard.Key.media_previous, pynput_keyboard.Key.f7):
+                    if self.ipc:
+                        self.ipc.send_command(["playlist-prev"])
+                        self.status_msg = "Skipped to previous track (Media Key)."
+                # Volume
+                elif key == getattr(pynput_keyboard.Key, 'media_volume_up', None):
+                    if self.ipc:
+                        self.ipc.adjust_volume(5)
+                        self.status_msg = "Volume +5%"
+                elif key == getattr(pynput_keyboard.Key, 'media_volume_down', None):
+                    if self.ipc:
+                        self.ipc.adjust_volume(-5)
+                        self.status_msg = "Volume -5%"
+            except Exception:
+                pass
+
+        try:
+            self.global_listener = pynput_keyboard.Listener(on_press=on_press)
+            self.global_listener.daemon = True
+            self.global_listener.start()
+        except Exception:
+            pass
+
     def cleanup(self):
         """Clean up MPV and temporary sockets on exit."""
+        if self.global_listener:
+            try:
+                self.global_listener.stop()
+            except Exception:
+                pass
         self.stop_playback()
         if os.path.exists(SOCKET_PATH):
             try:
@@ -181,6 +232,28 @@ class TUIApp:
             self._move_selection(-10)
         elif ch == curses.KEY_NPAGE:
             self._move_selection(10)
+
+        # Fast Forward / Rewind: Left/Right Arrow (5s), Shift+Left/Shift+Right or [/] (30s)
+        elif ch in (curses.KEY_RIGHT, ord('l'), ord('L')):
+            if self.ipc:
+                self.ipc.send_command(["seek", 5, "relative"])
+                self.time_pos = min(self.duration, self.time_pos + 5)
+                self.status_msg = "Fast Forward +5s (→)"
+        elif ch in (curses.KEY_LEFT, ord('h'), ord('H')):
+            if self.ipc:
+                self.ipc.send_command(["seek", -5, "relative"])
+                self.time_pos = max(0.0, self.time_pos - 5)
+                self.status_msg = "Rewind -5s (←)"
+        elif ch in (ord(']'), curses.KEY_SRIGHT):
+            if self.ipc:
+                self.ipc.send_command(["seek", 30, "relative"])
+                self.time_pos = min(self.duration, self.time_pos + 30)
+                self.status_msg = "Fast Forward +30s (])"
+        elif ch in (ord('['), curses.KEY_SLEFT):
+            if self.ipc:
+                self.ipc.send_command(["seek", -30, "relative"])
+                self.time_pos = max(0.0, self.time_pos - 30)
+                self.status_msg = "Rewind -30s ([)"
 
         # Enter / Return -> Activate
         elif ch in (10, 13, curses.KEY_ENTER):
@@ -891,7 +964,7 @@ class TUIApp:
         if self.in_playlist_name:
             footer = " [Enter] Play Song & Radio  [Backspace] Back to Playlists  [Space] Pause  [>/<] Next/Prev  [9/0] Vol  [m] Mode  [q] Quit"
         else:
-            footer = " [Enter] Play & Radio  [u] Queue  [d] Remove Upcoming  [Space] Pause  [>/<] Next/Prev  [9/0] Vol  [/] Search  [q] Quit"
+            footer = " [Enter] Play & Radio  [←/→] Seek  [Space] Pause  [>/<] Next/Prev  [d] Drop  [9/0] Vol  [/] Search  [q] Quit"
         self.stdscr.addstr(footer_y, 0, footer[:max_x - 1], curses.A_REVERSE | curses.color_pair(6))
 
         self.stdscr.refresh()

@@ -137,6 +137,20 @@ class YtstrCoordinator:
             if ipc:
                 ipc.adjust_volume(-5)
 
+        def on_seek_fwd(sec: int = 5):
+            ipc = (
+                self.direct_player.ipc if self.direct_player else (self.dj_player.ipc if self.dj_player else None)
+            )
+            if ipc:
+                ipc.send_command(["seek", sec, "relative"])
+
+        def on_seek_back(sec: int = 5):
+            ipc = (
+                self.direct_player.ipc if self.direct_player else (self.dj_player.ipc if self.dj_player else None)
+            )
+            if ipc:
+                ipc.send_command(["seek", -sec, "relative"])
+
         def on_quit():
             self.stop()
 
@@ -147,6 +161,8 @@ class YtstrCoordinator:
             on_volume_up=on_vol_up,
             on_volume_down=on_vol_down,
             on_quit=on_quit,
+            on_seek_forward=on_seek_fwd,
+            on_seek_backward=on_seek_back,
         )
 
         try:

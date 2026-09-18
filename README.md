@@ -91,6 +91,9 @@ ytstr --tui
 | `Backspace` / `Esc` | Return from playlist drill-down to playlist list |
 | `Shift` + `P` | Queue and play entire playlist directly |
 | `Space` | Toggle Pause / Resume |
+| `←` / `→` or `h` / `l` | **Rewind / Fast-Forward 5s** (like mpv) |
+| `[` / `]` | **Rewind / Fast-Forward 30s** |
+| **Hardware Media Keys** | Play/Pause, Next Track, Prev Track, Volume (top keyboard keys) |
 | `>` or `.` / `n` | Skip to next track in radio queue |
 | `<` or `,` / `p` | Skip to previous track |
 | `d` or `Delete` | Remove/skip upcoming song from radio queue |
