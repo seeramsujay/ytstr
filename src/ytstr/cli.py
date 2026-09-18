@@ -131,9 +131,9 @@ def main(argv: Optional[list] = None) -> int:
 
     # Playback mode determination
     if args.stream:
-        mode = PlaybackMode.DIRECT_STREAM
+        mode = PlaybackMode.STREAM
     elif args.no_mix:
-        mode = PlaybackMode.DIRECT_NO_MIX
+        mode = PlaybackMode.NO_MIX
     elif args.light_mix:
         mode = PlaybackMode.LIGHT_MIX
     else:

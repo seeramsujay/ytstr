@@ -9,6 +9,7 @@ from ytstr.ui.tui import (
     TAB_LIKED,
     TAB_LOGIN,
     TAB_PLAYLISTS,
+    TAB_QUEUE,
     TAB_RECOMMENDED,
     TAB_SEARCH,
     TUIApp,
@@ -29,6 +30,7 @@ def test_tui_initialization():
          patch("curses.has_colors", return_value=True), \
          patch("curses.init_pair"), \
          patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
          patch.object(TUIApp, "fetch_recommended_async"):
         app = TUIApp(stdscr)
 
@@ -45,6 +47,7 @@ def test_tui_navigation_and_modes():
          patch("curses.has_colors", return_value=True), \
          patch("curses.init_pair"), \
          patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
          patch.object(TUIApp, "fetch_recommended_async"), \
          patch.object(TUIApp, "fetch_playlists_async"), \
          patch.object(TUIApp, "fetch_liked_async"):
@@ -57,7 +60,10 @@ def test_tui_navigation_and_modes():
         app._handle_input(ord('3'))
         assert app.current_tab == TAB_LIKED
 
-        app._handle_input(ord('5'))
+        app._handle_input(ord('4'))
+        assert app.current_tab == TAB_QUEUE
+
+        app._handle_input(ord('6'))
         assert app.current_tab == TAB_LOGIN
         assert len(app.items) >= 3
 
@@ -85,6 +91,7 @@ def test_tui_draw_no_crash():
          patch("curses.has_colors", return_value=True), \
          patch("curses.init_pair"), \
          patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
          patch.object(TUIApp, "fetch_recommended_async"):
         app = TUIApp(stdscr)
         app.items = [
