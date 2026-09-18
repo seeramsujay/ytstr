@@ -6,10 +6,10 @@ from unittest.mock import MagicMock, patch
 
 from ytstr.core.types import Track
 from ytstr.ui.tui import (
-    TAB_CHARTS,
-    TAB_HOME,
+    TAB_LIKED,
     TAB_LOGIN,
-    TAB_SAVED,
+    TAB_PLAYLISTS,
+    TAB_RECOMMENDED,
     TAB_SEARCH,
     TUIApp,
 )
@@ -29,10 +29,10 @@ def test_tui_initialization():
          patch("curses.has_colors", return_value=True), \
          patch("curses.init_pair"), \
          patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "fetch_home_async"):
+         patch.object(TUIApp, "fetch_recommended_async"):
         app = TUIApp(stdscr)
 
-        assert app.current_tab == TAB_HOME
+        assert app.current_tab == TAB_RECOMMENDED
         assert app.mode_idx == 0
         assert app.selected_idx == 0
         assert app.now_playing is None
@@ -45,15 +45,17 @@ def test_tui_navigation_and_modes():
          patch("curses.has_colors", return_value=True), \
          patch("curses.init_pair"), \
          patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "fetch_home_async"):
+         patch.object(TUIApp, "fetch_recommended_async"), \
+         patch.object(TUIApp, "fetch_playlists_async"), \
+         patch.object(TUIApp, "fetch_liked_async"):
         app = TUIApp(stdscr)
 
         # Tab switching
         app._handle_input(ord('2'))
-        assert app.current_tab == TAB_CHARTS
+        assert app.current_tab == TAB_PLAYLISTS
 
-        app._handle_input(ord('4'))
-        assert app.current_tab == TAB_SAVED
+        app._handle_input(ord('3'))
+        assert app.current_tab == TAB_LIKED
 
         app._handle_input(ord('5'))
         assert app.current_tab == TAB_LOGIN
@@ -83,11 +85,11 @@ def test_tui_draw_no_crash():
          patch("curses.has_colors", return_value=True), \
          patch("curses.init_pair"), \
          patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "fetch_home_async"):
+         patch.object(TUIApp, "fetch_recommended_async"):
         app = TUIApp(stdscr)
         app.items = [
             Track(id="test1", title="Bohemian Rhapsody", artist="Queen", duration_sec=354, url="http://test"),
-            {"type": "playlist", "id": "pl1", "title": "Rock Classics"},
+            {"type": "playlist", "id": "pl1", "title": "Rock Classics", "count": 25},
         ]
         app._draw()
         assert stdscr.erase.called

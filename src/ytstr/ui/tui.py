@@ -18,38 +18,44 @@ from ytstr.ytm.client import YouTubeMusicClient
 
 SOCKET_PATH = "/tmp/ytstr_tui_mpv.sock"
 
-TAB_HOME = 0
-TAB_CHARTS = 1
-TAB_SEARCH = 2
-TAB_SAVED = 3
+TAB_RECOMMENDED = 0
+TAB_PLAYLISTS = 1
+TAB_LIKED = 2
+TAB_SEARCH = 3
 TAB_LOGIN = 4
-TAB_NAMES = ["🏠 Home", "📈 Charts", "🔍 Search", "📁 Saved", "🔑 Login"]
+TAB_NAMES = ["🎵 Recommended", "📁 My Playlists", "❤️ Liked Songs", "🔍 Search", "🔑 Account"]
 
 MODES = ["--no-mix", "--light-mix", "--stream", ""]
 MODE_LABELS = ["Direct Low-RAM", "Light Mix", "Direct Stream", "Auto-DJ (Spectral)"]
 
 
 class TUIApp:
-    """Terminal User Interface for browsing and streaming YouTube Music."""
+    """Terminal User Interface for personalized YouTube Music streaming."""
 
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.auth_mgr = AuthManager()
         self.client = YouTubeMusicClient(self.auth_mgr)
 
-        self.current_tab = TAB_HOME
+        self.current_tab = TAB_RECOMMENDED
         self.mode_idx = 0  # Default to Direct Low-RAM
 
         # Navigation & list items
-        self.items: List[Any] = []  # Can contain Track, dict (playlist), or section header str
+        self.items: List[Any] = []
         self.selected_idx = 0
         self.scroll_offset = 0
 
+        # Playlist drill-down state
+        self.in_playlist_name: Optional[str] = None
+        self.playlist_back_items: List[Any] = []
+        self.playlist_back_selected = 0
+
         # Cached tab items
-        self.home_sections: List[Dict[str, Any]] = []
-        self.charts_sections: List[Dict[str, Any]] = []
+        self.recommended_sections: List[Dict[str, Any]] = []
+        self.my_playlists: List[Dict[str, Any]] = []
+        self.liked_tracks: List[Track] = []
         self.search_results: List[Track] = []
-        self.saved_playlists: List[Tuple[str, str]] = []
+        self.saved_local_playlists: List[Tuple[str, str]] = []
 
         # Playback status
         self.player_proc: Optional[subprocess.Popen] = None
@@ -58,7 +64,7 @@ class TUIApp:
         self.is_paused = False
         self.time_pos = 0.0
         self.duration = 0.0
-        self.status_msg = "Ready. Press Enter to play, / to search, ? for help."
+        self.status_msg = "Ready. Select a track or playlist to play. Press ? for help."
 
         # Loading & thread state
         self.is_loading = False
@@ -66,22 +72,26 @@ class TUIApp:
         self.search_query = ""
 
         self._setup_curses()
-        self.load_saved_playlists()
-        self.fetch_home_async()
+        self.fetch_recommended_async()
 
     def _setup_curses(self):
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except Exception:
+            pass
         curses.use_default_colors()
-        self.stdscr.timeout(200)  # 200ms non-blocking tick for progress bar updates
+        self.stdscr.timeout(200)
 
-        # Initialize color pairs
         if curses.has_colors():
-            curses.init_pair(1, curses.COLOR_RED, -1)     # Red accent / logo
-            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Selected row
-            curses.init_pair(3, curses.COLOR_GREEN, -1)   # Green / playing / active
-            curses.init_pair(4, curses.COLOR_CYAN, -1)    # Playlist / category
-            curses.init_pair(5, curses.COLOR_YELLOW, -1)  # Warnings / prompts
-            curses.init_pair(6, curses.COLOR_WHITE, -1)   # Normal text
+            try:
+                curses.init_pair(1, curses.COLOR_RED, -1)     # Accent / logo / headers
+                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Selected row
+                curses.init_pair(3, curses.COLOR_GREEN, -1)   # Green / playing
+                curses.init_pair(4, curses.COLOR_CYAN, -1)    # Playlists
+                curses.init_pair(5, curses.COLOR_YELLOW, -1)  # Warnings / prompts
+                curses.init_pair(6, curses.COLOR_WHITE, -1)   # Normal text
+            except Exception:
+                pass
 
     def run(self):
         """Main event loop."""
@@ -98,12 +108,20 @@ class TUIApp:
                 continue
 
             if ch in (ord('q'), ord('Q')):
+                if self.in_playlist_name:
+                    self._exit_playlist_view()
+                    continue
                 self.stop_playback()
                 break
 
             self._handle_input(ch)
 
     def _handle_input(self, ch: int):
+        # Back navigation from playlist drill-down: Backspace (127/8), Esc (27), or 'h'
+        if self.in_playlist_name and ch in (127, 8, 27, ord('h'), ord('H'), curses.KEY_BACKSPACE):
+            self._exit_playlist_view()
+            return
+
         # Tab navigation: 1-5 or Tab
         if ch in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5')):
             idx = ch - ord('1')
@@ -116,48 +134,62 @@ class TUIApp:
             self._switch_tab((self.current_tab - 1) % len(TAB_NAMES))
             return
 
-        # Up / Down / PageUp / PageDown
+        # Up / Down / PageUp / PageDown / j / k
         if ch in (curses.KEY_UP, ord('k'), ord('K')):
             self._move_selection(-1)
         elif ch in (curses.KEY_DOWN, ord('j'), ord('J')):
             self._move_selection(1)
-        elif ch == curses.KEY_PPAGE:  # Page Up
+        elif ch == curses.KEY_PPAGE:
             self._move_selection(-10)
-        elif ch == curses.KEY_NPAGE:  # Page Down
+        elif ch == curses.KEY_NPAGE:
             self._move_selection(10)
 
-        # Actions
-        elif ch in (10, 13, curses.KEY_ENTER):  # Enter key
+        # Enter / Return -> Activate
+        elif ch in (10, 13, curses.KEY_ENTER):
             self._activate_selected()
-        elif ch == ord(' '):  # Space -> Pause / Resume
+
+        # Play whole playlist directly without drilldown (Shift+P)
+        elif ch == ord('P'):
+            self._play_playlist_direct()
+
+        # Space -> Pause / Resume
+        elif ch == ord(' '):
             self.toggle_pause()
-        elif ch in (ord('/'), ord('s')):
-            if ch == ord('/'):
-                self._prompt_search()
-            else:
-                self._save_selected()
+
+        # Search / Save
+        elif ch == ord('/'):
+            self._prompt_search()
+        elif ch in (ord('s'), ord('S')):
+            self._save_selected()
+
+        # Radio
         elif ch in (ord('r'), ord('R')):
             self._start_radio_selected()
+
+        # Cycle playback mode
         elif ch in (ord('m'), ord('M')):
-            # Cycle playback mode
             self.mode_idx = (self.mode_idx + 1) % len(MODES)
             self.status_msg = f"Switched mode to: {MODE_LABELS[self.mode_idx]}"
+
+        # Skip Next / Previous
         elif ch in (ord('n'), ord('N')):
-            # Next track in mpv
             if self.player_proc:
                 self.ipc.send_command(["playlist-next"])
         elif ch in (ord('p'), ord('P')):
-            # Prev track in mpv
             if self.player_proc:
                 self.ipc.send_command(["playlist-prev"])
-        elif ch == ord('+') or ch == ord('='):
+
+        # Volume
+        elif ch in (ord('+'), ord('=')):
             if self.player_proc:
                 self.ipc.adjust_volume(5)
                 self.status_msg = "Volume +5%"
-        elif ch == ord('-') or ch == ord('_'):
+        elif ch in (ord('-'), ord('_')):
             if self.player_proc:
                 self.ipc.adjust_volume(-5)
                 self.status_msg = "Volume -5%"
+
+        # Stop
         elif ch in (ord('x'), ord('X')):
             self.stop_playback()
             self.status_msg = "Playback stopped."
@@ -166,22 +198,29 @@ class TUIApp:
         self.current_tab = new_tab
         self.selected_idx = 0
         self.scroll_offset = 0
+        self.in_playlist_name = None
 
-        if new_tab == TAB_HOME:
-            if not self.home_sections:
-                self.fetch_home_async()
+        if new_tab == TAB_RECOMMENDED:
+            if not self.recommended_sections:
+                self.fetch_recommended_async()
             else:
-                self._rebuild_items_from_sections(self.home_sections)
-        elif new_tab == TAB_CHARTS:
-            if not self.charts_sections:
-                self.fetch_charts_async()
+                self._rebuild_items_from_sections(self.recommended_sections)
+
+        elif new_tab == TAB_PLAYLISTS:
+            if not self.my_playlists:
+                self.fetch_playlists_async()
             else:
-                self._rebuild_items_from_sections(self.charts_sections)
+                self.items = list(self.my_playlists)
+
+        elif new_tab == TAB_LIKED:
+            if not self.liked_tracks:
+                self.fetch_liked_async()
+            else:
+                self.items = list(self.liked_tracks)
+
         elif new_tab == TAB_SEARCH:
             self.items = list(self.search_results)
-        elif new_tab == TAB_SAVED:
-            self.load_saved_playlists()
-            self.items = [("saved", name, url) for name, url in self.saved_playlists]
+
         elif new_tab == TAB_LOGIN:
             self._build_login_items()
 
@@ -189,7 +228,6 @@ class TUIApp:
         if not self.items:
             return
         new_idx = max(0, min(len(self.items) - 1, self.selected_idx + delta))
-        # Skip section headers if landing on one
         if isinstance(self.items[new_idx], str) and self.items[new_idx].startswith("---"):
             new_idx = max(0, min(len(self.items) - 1, new_idx + (1 if delta >= 0 else -1)))
         self.selected_idx = new_idx
@@ -201,7 +239,6 @@ class TUIApp:
         item = self.items[self.selected_idx]
 
         if self.current_tab == TAB_LOGIN:
-            # Login action items
             action_code = item.get("action") if isinstance(item, dict) else None
             if action_code == "auto_login":
                 self.status_msg = "Extracting session cookies from installed browsers (Zen, Firefox, Chrome...)..."
@@ -221,26 +258,69 @@ class TUIApp:
 
         if isinstance(item, Track):
             self.play_target(item.web_url, item.display_title())
+
         elif isinstance(item, dict) and item.get("type") == "playlist":
-            url = f"https://www.youtube.com/playlist?list={item.get('id')}"
-            self.play_target(url, f"Playlist: {item.get('title')}")
+            pl_id = item.get("id")
+            title = item.get("title", "Playlist")
+            self._open_playlist_drilldown(pl_id, title)
+
         elif isinstance(item, tuple) and item[0] == "saved":
             _, name, url = item
             self.play_target(url, f"Saved: {name}")
+
+    def _open_playlist_drilldown(self, playlist_id: str, title: str):
+        """Fetch tracks inside a playlist and view them interactively."""
+        self.is_loading = True
+        self.loading_text = f"Opening '{title}'..."
+        self.playlist_back_items = list(self.items)
+        self.playlist_back_selected = self.selected_idx
+        self.in_playlist_name = title
+
+        def worker():
+            tracks = self.client.get_playlist_tracks(playlist_id)
+            self.is_loading = False
+            if tracks:
+                self.items = tracks
+                self.selected_idx = 0
+                self.scroll_offset = 0
+                self.status_msg = f"Opened '{title}' ({len(tracks)} tracks). Press Enter to play track, Backspace to exit."
+            else:
+                self.status_msg = f"Could not load tracks for '{title}'."
+                self.in_playlist_name = None
+                self.items = self.playlist_back_items
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _exit_playlist_view(self):
+        if self.playlist_back_items:
+            self.items = self.playlist_back_items
+            self.selected_idx = self.playlist_back_selected
+            self.scroll_offset = max(0, self.selected_idx - 5)
+        self.in_playlist_name = None
+        self.status_msg = "Back to playlists."
+
+    def _play_playlist_direct(self):
+        """Play entire playlist without entering drilldown."""
+        if not self.items or self.selected_idx >= len(self.items):
+            return
+        item = self.items[self.selected_idx]
+        if isinstance(item, dict) and item.get("type") == "playlist":
+            url = f"https://www.youtube.com/playlist?list={item.get('id')}"
+            self.play_target(url, f"Playlist: {item.get('title')}")
 
     def _start_radio_selected(self):
         if not self.items or self.selected_idx >= len(self.items):
             return
         item = self.items[self.selected_idx]
         if not isinstance(item, Track):
-            self.status_msg = "Radio is only available for individual tracks."
+            self.status_msg = "Radio is available for individual tracks."
             return
 
-        self.status_msg = f"Fetching radio recommendations for '{item.title}'..."
+        self.status_msg = f"Fetching radio for '{item.title}'..."
         track_id = item.id
 
         def worker():
-            tracks = self.client.get_watch_playlist_tracks(track_id, limit=25)
+            tracks = self.client.get_watch_playlist_tracks(track_id, limit=30)
             if tracks:
                 self.search_results = tracks
                 self.items = tracks
@@ -274,7 +354,6 @@ class TUIApp:
                 self.status_msg = f"Failed to save: {e}"
 
     def _prompt_search(self):
-        """Prompt user for a search query directly in the terminal."""
         curses.curs_set(1)
         self.stdscr.nodelay(False)
         max_y, max_x = self.stdscr.getmaxyx()
@@ -295,6 +374,7 @@ class TUIApp:
 
         self.search_query = query
         self.current_tab = TAB_SEARCH
+        self.in_playlist_name = None
         self.is_loading = True
         self.loading_text = f"Searching for '{query}'..."
         self.items = []
@@ -313,39 +393,70 @@ class TUIApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def fetch_home_async(self):
+    def fetch_recommended_async(self):
         self.is_loading = True
-        self.loading_text = "Loading Home & Recommendations..."
+        self.loading_text = "Loading personalized recommendations (Listen Again, Quick Picks)..."
         self.items = []
 
         def worker():
             try:
-                sections = self.client.get_home_sections(limit=8)
-                self.home_sections = sections
-                if self.current_tab == TAB_HOME:
+                sections = self.client.get_home_sections(limit=10, personalized_only=True)
+                self.recommended_sections = sections
+                if self.current_tab == TAB_RECOMMENDED:
                     self._rebuild_items_from_sections(sections)
-                self.status_msg = f"Loaded {len(sections)} sections from YouTube Music."
+                self.status_msg = f"Loaded {len(sections)} personalized music sections."
             except Exception as e:
-                self.status_msg = f"Failed to load home: {e}"
+                self.status_msg = f"Failed to load recommendations: {e}"
             finally:
                 self.is_loading = False
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def fetch_charts_async(self):
+    def fetch_playlists_async(self):
         self.is_loading = True
-        self.loading_text = "Loading Charts and Trending..."
+        self.loading_text = "Loading your YouTube Music playlists..."
         self.items = []
 
         def worker():
             try:
-                charts = self.client.get_charts()
-                self.charts_sections = charts
-                if self.current_tab == TAB_CHARTS:
-                    self._rebuild_items_from_sections(charts)
-                self.status_msg = f"Loaded charts and trending tracks."
+                lib_pls = self.client.get_library_playlists(limit=50)
+                self.load_local_playlists()
+                combined: List[Any] = []
+
+                if lib_pls:
+                    for p in lib_pls:
+                        combined.append(p)
+
+                if self.saved_local_playlists:
+                    combined.append("--- 💾 LOCAL SAVED PLAYLISTS ---")
+                    for name, url in self.saved_local_playlists:
+                        combined.append(("saved", name, url))
+
+                self.my_playlists = combined
+                if self.current_tab == TAB_PLAYLISTS and not self.in_playlist_name:
+                    self.items = combined
+                self.status_msg = f"Loaded {len(lib_pls)} library playlists."
             except Exception as e:
-                self.status_msg = f"Failed to load charts: {e}"
+                self.status_msg = f"Failed to load playlists: {e}"
+            finally:
+                self.is_loading = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def fetch_liked_async(self):
+        self.is_loading = True
+        self.loading_text = "Loading your Liked Music..."
+        self.items = []
+
+        def worker():
+            try:
+                tracks = self.client.get_liked_songs(limit=100)
+                self.liked_tracks = tracks
+                if self.current_tab == TAB_LIKED:
+                    self.items = tracks
+                self.status_msg = f"Loaded {len(tracks)} liked songs."
+            except Exception as e:
+                self.status_msg = f"Failed to load liked songs: {e}"
             finally:
                 self.is_loading = False
 
@@ -360,7 +471,8 @@ class TUIApp:
                 if ok:
                     self.status_msg = f"✓ {msg}"
                     self.client._init_ytm()
-                    self.fetch_home_async()
+                    self.fetch_playlists_async()
+                    self.fetch_recommended_async()
                 else:
                     self.status_msg = f"Login Note: {msg}"
             except Exception as e:
@@ -374,12 +486,12 @@ class TUIApp:
     def _build_login_items(self):
         is_auth = self.auth_mgr.is_authenticated()
         self.items = [
-            {"label": "🌐 1. Open music.youtube.com in Browser", "action": "open_browser"},
-            {"label": "⚡ 2. Auto-Detect & Extract Session (Zen, Firefox, Chrome, Brave...)", "action": "auto_login"},
-            {"label": "🦊 3. Extract Session specifically from Zen Browser", "action": "zen_login"},
+            {"label": "⚡ 1. Auto-Detect & Extract Session (Zen, Firefox, Chrome, Brave...)", "action": "auto_login"},
+            {"label": "🦊 2. Extract Session specifically from Zen Browser", "action": "zen_login"},
+            {"label": "🌐 3. Open music.youtube.com in Browser", "action": "open_browser"},
         ]
         if is_auth:
-            self.items.append({"label": "🚪 4. Log Out (Remove Saved Credentials)", "action": "logout"})
+            self.items.append({"label": "🚪 4. Log Out (Clear Credentials)", "action": "logout"})
 
     def _rebuild_items_from_sections(self, sections: List[Dict[str, Any]]):
         flattened: List[Any] = []
@@ -389,12 +501,12 @@ class TUIApp:
             if not items:
                 continue
             flattened.append(f"--- 🎵 {sec_title.upper()} ---")
-            for item in items[:10]:
+            for item in items[:12]:
                 flattened.append(item)
         self.items = flattened
 
-    def load_saved_playlists(self):
-        self.saved_playlists = []
+    def load_local_playlists(self):
+        self.saved_local_playlists = []
         if os.path.exists(PLAYLIST_FILE):
             try:
                 with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
@@ -402,7 +514,7 @@ class TUIApp:
                         line = line.strip()
                         if line and not line.startswith("#") and "|" in line:
                             parts = line.split("|", 1)
-                            self.saved_playlists.append((parts[0].strip(), parts[1].strip()))
+                            self.saved_local_playlists.append((parts[0].strip(), parts[1].strip()))
             except Exception:
                 pass
 
@@ -479,20 +591,24 @@ class TUIApp:
 
         self.stdscr.attron(curses.A_BOLD)
         self.stdscr.addstr(0, 0, header_left, curses.color_pair(1))
-        self.stdscr.addstr(0, len(header_left), "— YouTube Music TUI", curses.color_pair(6))
+        self.stdscr.addstr(0, len(header_left), "— YouTube Music Streamer", curses.color_pair(6))
 
         if len(header_right) < max_x - 30:
             self.stdscr.addstr(0, max_x - len(header_right), header_right, auth_pair)
         self.stdscr.attroff(curses.A_BOLD)
 
-        # 2. Tabs Row
-        tab_str = " "
-        for i, name in enumerate(TAB_NAMES):
-            if i == self.current_tab:
-                tab_str += f"[{name}]  "
-            else:
-                tab_str += f" {name}   "
-        self.stdscr.addstr(1, 0, tab_str[:max_x - 1], curses.A_REVERSE | curses.color_pair(4))
+        # 2. Tabs Row or Drill-down Breadcrumb
+        if self.in_playlist_name:
+            tab_str = f" 📁 My Playlists > 🎵 {self.in_playlist_name} (Press Backspace or Esc to return) "
+            self.stdscr.addstr(1, 0, tab_str[:max_x - 1], curses.A_REVERSE | curses.color_pair(4))
+        else:
+            tab_str = " "
+            for i, name in enumerate(TAB_NAMES):
+                if i == self.current_tab:
+                    tab_str += f"[{name}]  "
+                else:
+                    tab_str += f" {name}   "
+            self.stdscr.addstr(1, 0, tab_str[:max_x - 1], curses.A_REVERSE | curses.color_pair(4))
 
         # 3. Separator
         self.stdscr.addstr(2, 0, "─" * (max_x - 1), curses.color_pair(6))
@@ -506,10 +622,9 @@ class TUIApp:
             loading_msg = f"⏳ {self.loading_text}"
             self.stdscr.addstr(content_top + 2, max(2, (max_x - len(loading_msg)) // 2), loading_msg, curses.A_BOLD | curses.color_pair(5))
         elif not self.items:
-            empty_msg = "No items to display. Press [Tab] to switch views or [/] to search."
+            empty_msg = "No items to display. Check connection or switch tabs."
             self.stdscr.addstr(content_top + 2, max(2, (max_x - len(empty_msg)) // 2), empty_msg, curses.color_pair(5))
         else:
-            # Adjust scroll window
             if self.selected_idx < self.scroll_offset:
                 self.scroll_offset = self.selected_idx
             elif self.selected_idx >= self.scroll_offset + content_height:
@@ -525,11 +640,10 @@ class TUIApp:
                 is_selected = (item_idx == self.selected_idx)
 
                 if isinstance(item, str) and item.startswith("---"):
-                    # Section Header
                     header_text = f" {item} "
                     self.stdscr.addstr(y, 1, header_text[:max_x - 2], curses.A_BOLD | curses.color_pair(1))
+
                 elif isinstance(item, Track):
-                    # Track Item
                     prefix = " ▶ " if is_selected else "   "
                     duration_str = ""
                     if item.duration_sec > 0:
@@ -550,24 +664,23 @@ class TUIApp:
                     self.stdscr.addstr(y, 0, line_content[:max_x - 1], attr)
 
                 elif isinstance(item, dict) and item.get("type") == "playlist":
-                    # Playlist Item
                     prefix = " ▶ 📁 " if is_selected else "   📁 "
                     title = item.get("title", "Playlist")
-                    line_content = f"{prefix}{title} [Playlist]"
+                    count = item.get("count")
+                    count_str = f"({count} tracks)" if count else ""
+                    line_content = f"{prefix}{title}  {count_str}".strip()
                     attr = curses.color_pair(2) | curses.A_BOLD if is_selected else curses.color_pair(4)
                     self.stdscr.addstr(y, 0, line_content[:max_x - 1], attr)
 
                 elif isinstance(item, dict) and "label" in item:
-                    # Login action item
                     prefix = " ▶ " if is_selected else "   "
                     line_content = f"{prefix}{item['label']}"
                     attr = curses.color_pair(2) | curses.A_BOLD if is_selected else curses.color_pair(6)
                     self.stdscr.addstr(y, 0, line_content[:max_x - 1], attr)
 
                 elif isinstance(item, tuple) and item[0] == "saved":
-                    # Saved Playlist item
                     prefix = " ▶ 📁 " if is_selected else "   📁 "
-                    line_content = f"{prefix}{item[1]}"
+                    line_content = f"{prefix}{item[1]} [Saved]"
                     attr = curses.color_pair(2) | curses.A_BOLD if is_selected else curses.color_pair(4)
                     self.stdscr.addstr(y, 0, line_content[:max_x - 1], attr)
 
@@ -592,7 +705,10 @@ class TUIApp:
 
         # 6. Footer / Keybindings
         footer_y = max_y - 1
-        footer = " [Tab] View  [Enter] Play  [Space] Pause  [n/p] Skip  [/] Search  [r] Radio  [m] Mode  [q] Quit"
+        if self.in_playlist_name:
+            footer = " [Enter] Play Track  [Backspace] Back to Playlists  [Space] Pause  [m] Mode  [q] Quit"
+        else:
+            footer = " [Tab] Tab  [Enter] Open/Play  [Shift+P] Play Playlist  [Space] Pause  [/] Search  [r] Radio  [m] Mode  [q] Quit"
         self.stdscr.addstr(footer_y, 0, footer[:max_x - 1], curses.A_REVERSE | curses.color_pair(6))
 
         self.stdscr.refresh()

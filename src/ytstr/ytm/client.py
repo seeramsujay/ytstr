@@ -8,6 +8,22 @@ from ytmusicapi import YTMusic
 from ytstr.core.types import Track
 from ytstr.ytm.auth import AuthManager
 
+# Keywords identifying personalized recommendation sections vs generic global charts
+PERSONALIZED_KEYWORDS = {
+    "listen again",
+    "quick picks",
+    "mixed for you",
+    "from your library",
+    "forgotten favorites",
+    "your daily discover",
+    "albums for you",
+    "fresh finds",
+    "listen together",
+    "similar to",
+    "recommended",
+    "fans of",
+}
+
 
 class YouTubeMusicClient:
     """Interacts with YouTube Music API for recommendations, browsing, and search."""
@@ -35,9 +51,10 @@ class YouTubeMusicClient:
     def is_authenticated(self) -> bool:
         return self.auth_manager.is_authenticated()
 
-    def get_home_sections(self, limit: int = 6) -> List[Dict[str, Any]]:
+    def get_home_sections(self, limit: int = 8, personalized_only: bool = True) -> List[Dict[str, Any]]:
         """
-        Fetch YouTube Music home feed sections (Listen Again, Quick Picks, etc.).
+        Fetch YouTube Music home feed sections.
+        If personalized_only is True, filters to user-specific sections (Listen Again, Quick Picks, etc.).
 
         Returns list of sections: [{"title": str, "items": [Track | dict]}]
         """
@@ -57,6 +74,14 @@ class YouTubeMusicClient:
             if not isinstance(section, dict):
                 continue
             title = section.get("title", "Featured")
+            title_lower = title.lower()
+
+            if personalized_only and self.is_authenticated:
+                # Keep sections that match personalized keywords or artist/recommendation feeds
+                is_personal = any(k in title_lower for k in PERSONALIZED_KEYWORDS) or "for you" in title_lower
+                if not is_personal and "hits" in title_lower:
+                    continue
+
             contents = section.get("contents", [])
             if not isinstance(contents, list):
                 continue
@@ -76,6 +101,7 @@ class YouTubeMusicClient:
                                 "type": "playlist",
                                 "id": pl_id,
                                 "title": item.get("title", "Untitled Playlist"),
+                                "count": item.get("itemCount") or item.get("count"),
                                 "thumbnails": item.get("thumbnails", []),
                             })
                 except Exception:
@@ -85,6 +111,55 @@ class YouTubeMusicClient:
                 sections.append({"title": title, "items": items})
 
         return sections
+
+    def get_library_playlists(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fetch all playlists saved in the user's personal YouTube Music library."""
+        if not self._ytm or not self.is_authenticated:
+            return []
+
+        playlists = []
+        try:
+            raw_pls = self._ytm.get_library_playlists(limit=limit)
+            if isinstance(raw_pls, list):
+                for p in raw_pls:
+                    if not p or not isinstance(p, dict):
+                        continue
+                    pl_id = p.get("playlistId")
+                    if not pl_id:
+                        continue
+                    title = p.get("title", "Untitled Playlist")
+                    count = p.get("count")
+                    playlists.append({
+                        "type": "playlist",
+                        "id": pl_id,
+                        "title": title,
+                        "count": count,
+                        "description": f"{count} tracks" if count else "Playlist",
+                    })
+        except Exception:
+            pass
+        return playlists
+
+    def get_liked_songs(self, limit: int = 100) -> List[Track]:
+        """Fetch user's Liked Music tracks."""
+        if not self._ytm or not self.is_authenticated:
+            return []
+
+        tracks: List[Track] = []
+        try:
+            liked = self._ytm.get_liked_songs(limit=limit)
+            if isinstance(liked, dict):
+                raw_tracks = liked.get("tracks", [])
+                if isinstance(raw_tracks, list):
+                    for item in raw_tracks:
+                        if not item or not isinstance(item, dict):
+                            continue
+                        t = self._parse_item_to_track(item)
+                        if t:
+                            tracks.append(t)
+        except Exception:
+            pass
+        return tracks
 
     def get_charts(self, country: str = "US") -> List[Dict[str, Any]]:
         """Fetch popular trending charts."""
@@ -181,8 +256,8 @@ class YouTubeMusicClient:
             pass
         return tracks
 
-    def _parse_item_to_track(self, item: Any) -> Optional[Track]:
-        """Convert a ytmusicapi item dictionary to a Track dataclass."""
+    def _parse_item_to_track(self, item: Dict[str, Any]) -> Optional[Track]:
+        """Convert a raw ytmusicapi dictionary into a strongly typed Track object."""
         if not item or not isinstance(item, dict):
             return None
 
@@ -191,25 +266,47 @@ class YouTubeMusicClient:
             return None
 
         title = item.get("title", "Unknown Title")
-        artist = None
-        artists = item.get("artists")
-        if isinstance(artists, list) and artists:
-            artist = ", ".join([a.get("name", "") for a in artists if isinstance(a, dict) and a.get("name")])
-        elif isinstance(artists, str):
-            artist = artists
+        if isinstance(title, dict):
+            title = title.get("text", "Unknown Title")
 
-        duration_sec = float(item.get("duration_seconds") or 0.0)
-        thumbnails = item.get("thumbnails", [])
+        # Artists
+        artist_names = []
+        artists_data = item.get("artists")
+        if isinstance(artists_data, list):
+            for a in artists_data:
+                if isinstance(a, dict) and "name" in a:
+                    artist_names.append(a["name"])
+                elif isinstance(a, str):
+                    artist_names.append(a)
+        artist_str = ", ".join(artist_names) if artist_names else ""
+
+        # Duration
+        duration_sec = 0.0
+        if "duration_seconds" in item and item["duration_seconds"]:
+            try:
+                duration_sec = float(item["duration_seconds"])
+            except (ValueError, TypeError):
+                pass
+        elif "duration" in item and item["duration"]:
+            try:
+                parts = str(item["duration"]).split(":")
+                if len(parts) == 2:
+                    duration_sec = int(parts[0]) * 60 + int(parts[1])
+                elif len(parts) == 3:
+                    duration_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            except (ValueError, TypeError):
+                pass
+
+        # Thumbnail
         thumb_url = None
-        if isinstance(thumbnails, list) and thumbnails:
-            last_thumb = thumbnails[-1]
-            if isinstance(last_thumb, dict):
-                thumb_url = last_thumb.get("url")
+        thumbs = item.get("thumbnails")
+        if isinstance(thumbs, list) and thumbs:
+            thumb_url = thumbs[-1].get("url")
 
         return Track(
-            id=video_id,
-            title=title,
-            artist=artist,
+            id=str(video_id),
+            title=str(title),
+            artist=artist_str,
             duration_sec=duration_sec,
             url=f"https://www.youtube.com/watch?v={video_id}",
             thumbnail_url=thumb_url,
