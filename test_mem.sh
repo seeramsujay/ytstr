@@ -15,8 +15,8 @@ measure_mem() {
     
     local max_mem=0
     
-    # Monitor for 60 seconds
-    for i in {1..60}; do
+    # Monitor for 20 seconds per mode
+    for i in {1..20}; do
         if ! kill -0 $pid 2>/dev/null; then
             break
         fi
@@ -39,22 +39,23 @@ measure_mem() {
     local max_mem_mb=$(echo "scale=2; $max_mem / 1024" | bc)
     
     echo "* **$mode Mode**: Peak RAM usage was ${max_mem_mb} MB" >> test.md
-    echo "Completed $mode mode test."
+    echo "Completed $mode mode test: ${max_mem_mb} MB."
 }
 
-# 2 songs playlist for testing
 PLAYLIST="https://www.youtube.com/playlist?list=PL4fGSI1pDJn5kI81J1fYWK5eZRl1zJ5kM"
 
-# Make sure ytstr is executable
 chmod +x ./ytstr
 
-# Test 1: Default Mix
-measure_mem "python3 ./ytstr $PLAYLIST --no-shuffle" "Default Mix"
+# Test 1: Direct No-Mix
+measure_mem "uv run ./ytstr $PLAYLIST --no-mix --no-shuffle" "Direct No-Mix"
 
-# Test 2: Light Mix
-measure_mem "python3 ./ytstr $PLAYLIST --light-mix --no-shuffle" "Light Mix"
+# Test 2: Direct Stream
+measure_mem "uv run ./ytstr $PLAYLIST --stream --no-shuffle" "Direct Stream"
 
-# Test 3: No Mix
-measure_mem "python3 ./ytstr $PLAYLIST --no-mix --no-shuffle" "No Mix"
+# Test 3: Light Mix
+measure_mem "uv run ./ytstr $PLAYLIST --light-mix --no-shuffle" "Light Mix"
+
+# Test 4: Auto-DJ Mix
+measure_mem "uv run ./ytstr $PLAYLIST --no-shuffle" "Auto-DJ Mix"
 
 echo "Done."
