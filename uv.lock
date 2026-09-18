@@ -1099,6 +1099,13 @@ media-keys = [
     { name = "pynput" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "pytest", version = "9.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "pytest-cov" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "pydub", specifier = ">=0.25.1" },
@@ -1109,3 +1116,9 @@ requires-dist = [
     { name = "ytmusicapi", specifier = ">=1.8.0" },
 ]
 provides-extras = ["media-keys", "dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-cov", specifier = ">=4.1.0" },
+]
