@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ytstr"
+version = "2.1.0"
+description = "High-Speed YouTube & YouTube Music Audio Streamer with Auto-DJ, Low-RAM Direct Streaming, and Lightweight GUI"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.9"
+authors = [
+    { name = "Sujay Seeram" }
+]
+keywords = ["youtube", "youtube-music", "audio", "streamer", "dj", "mpv", "low-ram"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
+
+dependencies = [
+    "yt-dlp>=2024.3.10",
+    "pydub>=0.25.1",
+    "ytmusicapi>=1.8.0",
+]
+
+[project.optional-dependencies]
+media-keys = [
+    "pynput>=1.7.6",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+ytstr = "ytstr.cli:main"
+ytstr-gui = "ytstr.ytm.gui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ytstr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --strict-markers"

@@ -1,0 +1,3 @@
+"""
+ytstr core package.
+"""

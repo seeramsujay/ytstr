@@ -22,14 +22,19 @@ wheels/
 *.egg
 
 # Virtual Environment
+.venv/
 venv/
 ENV/
 
-# Repository Cleanliness
-Archives/
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Logs
+# Logs & Temp
 *.log
+errors.md
+test.md
 
 # Project Specific
 yt_cache/
