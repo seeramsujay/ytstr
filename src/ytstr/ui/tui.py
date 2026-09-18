@@ -200,6 +200,10 @@ class TUIApp:
         elif ch in (ord('s'), ord('S')):
             self._save_selected()
 
+        # Remove / Skip song from upcoming radio queue: 'd', 'D', or Delete
+        elif ch in (ord('d'), ord('D'), curses.KEY_DC):
+            self._remove_selected_from_queue()
+
         # Radio force trigger
         elif ch in (ord('r'), ord('R')):
             self._start_radio_selected()
@@ -443,6 +447,51 @@ class TUIApp:
         self.ipc.load_file(target, mode="replace")
         self.now_playing = title
         self.status_msg = f"▶ Playing: {title}"
+
+    def _remove_selected_from_queue(self):
+        """Remove/skip selected song from upcoming radio queue."""
+        if not self.queue_tracks:
+            self.status_msg = "Queue is empty."
+            return
+
+        # Determine target index in queue: if on Queue tab, use selected_idx, else target next upcoming track
+        target_idx = -1
+        if self.current_tab == TAB_QUEUE:
+            if 0 <= self.selected_idx < len(self.queue_tracks):
+                target_idx = self.selected_idx
+        else:
+            # Skip the immediate next song in queue
+            target_idx = self.current_queue_idx + 1
+
+        if target_idx < 0 or target_idx >= len(self.queue_tracks):
+            self.status_msg = "No upcoming song to remove from queue."
+            return
+
+        removed_track = self.queue_tracks[target_idx]
+        title = removed_track.display_title()
+
+        # If removing the currently playing track, tell mpv to skip to next
+        if target_idx == self.current_queue_idx:
+            if self.ipc:
+                self.ipc.send_command(["playlist-next"])
+            del self.queue_tracks[target_idx]
+            self.status_msg = f"Removed currently playing '{title[:25]}' and advanced."
+        else:
+            # Tell mpv to remove this track from its playlist
+            if self.ipc:
+                self.ipc.send_command(["playlist-remove", target_idx])
+            del self.queue_tracks[target_idx]
+            if target_idx < self.current_queue_idx:
+                self.current_queue_idx -= 1
+            self.status_msg = f"Removed '{title[:25]}' from radio queue (d)."
+
+        # Adjust selected_idx if on Queue tab
+        if self.current_tab == TAB_QUEUE:
+            self.items = list(self.queue_tracks)
+            if self.selected_idx >= len(self.items):
+                self.selected_idx = max(0, len(self.items) - 1)
+
+        self._update_next_track()
 
     def _start_radio_selected(self):
         if not self.items or self.selected_idx >= len(self.items):
@@ -842,7 +891,7 @@ class TUIApp:
         if self.in_playlist_name:
             footer = " [Enter] Play Song & Radio  [Backspace] Back to Playlists  [Space] Pause  [>/<] Next/Prev  [9/0] Vol  [m] Mode  [q] Quit"
         else:
-            footer = " [Enter] Play & Radio  [u] Queue  [Tab] Switch Tab  [Space] Pause  [>/<] Next/Prev  [9/0] Vol  [/] Search  [q] Quit"
+            footer = " [Enter] Play & Radio  [u] Queue  [d] Remove Upcoming  [Space] Pause  [>/<] Next/Prev  [9/0] Vol  [/] Search  [q] Quit"
         self.stdscr.addstr(footer_y, 0, footer[:max_x - 1], curses.A_REVERSE | curses.color_pair(6))
 
         self.stdscr.refresh()

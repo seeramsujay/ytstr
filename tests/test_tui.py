@@ -101,3 +101,22 @@ def test_tui_draw_no_crash():
         app._draw()
         assert stdscr.erase.called
         assert stdscr.refresh.called
+
+
+def test_tui_remove_from_queue():
+    stdscr = make_mock_stdscr()
+    with patch("curses.curs_set"),          patch("curses.use_default_colors"),          patch("curses.has_colors", return_value=True),          patch("curses.init_pair"),          patch("curses.color_pair", return_value=0),          patch.object(TUIApp, "_ensure_mpv"),          patch.object(TUIApp, "fetch_recommended_async"):
+        app = TUIApp(stdscr)
+        t1 = Track(id="1", title="Track 1")
+        t2 = Track(id="2", title="Track 2")
+        t3 = Track(id="3", title="Track 3")
+        app.queue_tracks = [t1, t2, t3]
+        app.current_queue_idx = 0
+        app.current_tab = TAB_QUEUE
+        app.items = list(app.queue_tracks)
+        app.selected_idx = 1  # Selected Track 2 (upcoming)
+
+        # Press 'd' to remove Track 2
+        app._handle_input(ord('d'))
+        assert len(app.queue_tracks) == 2
+        assert app.queue_tracks[1].id == "3"
