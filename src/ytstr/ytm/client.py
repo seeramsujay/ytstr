@@ -47,27 +47,42 @@ class YouTubeMusicClient:
         sections: List[Dict[str, Any]] = []
         try:
             home_data = self._ytm.get_home(limit=limit)
-            for section in home_data:
-                title = section.get("title", "Featured")
-                contents = section.get("contents", [])
-                items = []
-                for item in contents:
+        except Exception:
+            return []
+
+        if not isinstance(home_data, list):
+            return []
+
+        for section in home_data:
+            if not isinstance(section, dict):
+                continue
+            title = section.get("title", "Featured")
+            contents = section.get("contents", [])
+            if not isinstance(contents, list):
+                continue
+
+            items = []
+            for item in contents:
+                if not item or not isinstance(item, dict):
+                    continue
+                try:
                     track = self._parse_item_to_track(item)
                     if track:
                         items.append(track)
                     else:
-                        # Playlist or album object
-                        if item.get("playlistId") or item.get("browseId"):
+                        pl_id = item.get("playlistId") or item.get("browseId")
+                        if pl_id:
                             items.append({
                                 "type": "playlist",
-                                "id": item.get("playlistId") or item.get("browseId"),
+                                "id": pl_id,
                                 "title": item.get("title", "Untitled Playlist"),
                                 "thumbnails": item.get("thumbnails", []),
                             })
-                if items:
-                    sections.append({"title": title, "items": items})
-        except Exception:
-            pass
+                except Exception:
+                    continue
+
+            if items:
+                sections.append({"title": title, "items": items})
 
         return sections
 
@@ -84,6 +99,8 @@ class YouTubeMusicClient:
                 items = []
                 if isinstance(entries, list):
                     for item in entries:
+                        if not item or not isinstance(item, dict):
+                            continue
                         if item.get("playlistId"):
                             items.append({
                                 "type": "playlist",
@@ -148,8 +165,11 @@ class YouTubeMusicClient:
             pass
         return tracks
 
-    def _parse_item_to_track(self, item: Dict[str, Any]) -> Optional[Track]:
+    def _parse_item_to_track(self, item: Any) -> Optional[Track]:
         """Convert a ytmusicapi item dictionary to a Track dataclass."""
+        if not item or not isinstance(item, dict):
+            return None
+
         video_id = item.get("videoId")
         if not video_id:
             return None
@@ -158,13 +178,17 @@ class YouTubeMusicClient:
         artist = None
         artists = item.get("artists")
         if isinstance(artists, list) and artists:
-            artist = ", ".join([a.get("name", "") for a in artists if a.get("name")])
+            artist = ", ".join([a.get("name", "") for a in artists if isinstance(a, dict) and a.get("name")])
         elif isinstance(artists, str):
             artist = artists
 
         duration_sec = float(item.get("duration_seconds") or 0.0)
         thumbnails = item.get("thumbnails", [])
-        thumb_url = thumbnails[-1].get("url") if thumbnails else None
+        thumb_url = None
+        if isinstance(thumbnails, list) and thumbnails:
+            last_thumb = thumbnails[-1]
+            if isinstance(last_thumb, dict):
+                thumb_url = last_thumb.get("url")
 
         return Track(
             id=video_id,

@@ -470,7 +470,7 @@ class YTMDesktopApp:
         browser_var = tk.StringVar(value="auto")
         browser_combo = ttk.Combobox(
             import_row, textvariable=browser_var, width=18, state="readonly",
-            values=["auto", "chrome", "firefox", "brave", "edge", "chromium", "opera", "vivaldi"]
+            values=["auto", "zen", "firefox", "chrome", "brave", "edge", "chromium", "opera", "vivaldi"]
         )
         browser_combo.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -478,7 +478,7 @@ class YTMDesktopApp:
 
         def do_auto_import():
             chosen_browser = browser_var.get()
-            import_status_lbl.config(text=f"Importing session from {chosen_browser}...", fg=YELLOW)
+            import_status_lbl.config(text=f"Importing session from {chosen_browser}...", fg=ACCENT_BLUE)
             auto_card.update()
 
             def worker():

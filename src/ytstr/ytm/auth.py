@@ -7,20 +7,65 @@ import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from yt_dlp.cookies import extract_cookies_from_browser
+from yt_dlp.cookies import YDLLogger, _extract_firefox_cookies, extract_cookies_from_browser
 import ytmusicapi
 from ytmusicapi.auth.browser import initialize_headers
 
 from ytstr.config import YTM_AUTH_FILE, ensure_config_dir
 
+# Essential session & auth cookies for YouTube Music (prevents HTTP 413 Entity Too Large)
+AUTH_COOKIE_KEYS = {
+    "__Secure-3PAPISID",
+    "__Secure-1PAPISID",
+    "SAPISID",
+    "__Secure-3PSID",
+    "__Secure-1PSID",
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "LOGIN_INFO",
+    "VISITOR_INFO1_LIVE",
+    "PREF",
+    "__Secure-3PSIDTS",
+    "__Secure-1PSIDTS",
+    "SIDCC",
+    "__Secure-3PSIDCC",
+    "__Secure-1PSIDCC",
+}
+
+# Custom profile roots for Firefox forks like Zen Browser, Floorp, LibreWolf, Waterfox
+FIREFOX_FORKS: Dict[str, List[str]] = {
+    "zen": [
+        os.path.expanduser("~/.zen"),
+        os.path.expanduser("~/.var/app/app.zen_browser.zen/.zen"),
+        os.path.expanduser("~/.config/zen"),
+    ],
+    "librewolf": [
+        os.path.expanduser("~/.librewolf"),
+        os.path.expanduser("~/.var/app/io.gitlab.librewolf-community/.librewolf"),
+    ],
+    "floorp": [
+        os.path.expanduser("~/.floorp"),
+        os.path.expanduser("~/.var/app/one.ablaze.floorp/.floorp"),
+    ],
+    "waterfox": [
+        os.path.expanduser("~/.waterfox"),
+    ],
+}
+
 CANDIDATE_BROWSERS = [
-    "chrome",
+    "zen",
     "firefox",
+    "chrome",
     "brave",
     "edge",
     "chromium",
     "opera",
     "vivaldi",
+    "librewolf",
+    "floorp",
+    "waterfox",
 ]
 
 
@@ -62,24 +107,37 @@ class AuthManager:
     def import_cookies_from_browser(self, browser_name: str = "auto") -> Tuple[bool, str]:
         """
         Automatically extract YouTube session cookies directly from installed browser
-        without requiring manual developer tools or copy-pasting.
+        (including Zen Browser, Firefox, Chrome, Brave, etc.) without requiring manual
+        developer tools or copy-pasting.
 
         Args:
-            browser_name: 'auto', 'chrome', 'firefox', 'brave', 'edge', 'chromium', 'opera', 'vivaldi'
+            browser_name: 'auto', 'zen', 'firefox', 'chrome', 'brave', 'edge', 'chromium', etc.
 
         Returns:
             Tuple[bool, str]: (Success, Message)
         """
-        targets = (
-            CANDIDATE_BROWSERS
-            if browser_name.lower() == "auto"
-            else [browser_name.lower()]
-        )
+        b_name = browser_name.lower().strip()
+        targets = CANDIDATE_BROWSERS if b_name == "auto" else [b_name]
 
         last_err = ""
         for b in targets:
             try:
-                cookie_jar = extract_cookies_from_browser(b)
+                cookie_jar = None
+
+                # Check Firefox forks first (e.g. Zen Browser, LibreWolf, Floorp)
+                if b in FIREFOX_FORKS:
+                    for search_dir in FIREFOX_FORKS[b]:
+                        if os.path.exists(search_dir):
+                            try:
+                                cookie_jar = _extract_firefox_cookies(search_dir, None, YDLLogger())
+                                if cookie_jar and len(cookie_jar) > 0:
+                                    break
+                            except Exception:
+                                pass
+                else:
+                    # Standard yt-dlp supported browser extraction
+                    cookie_jar = extract_cookies_from_browser(b)
+
                 if not cookie_jar:
                     continue
 
@@ -87,19 +145,21 @@ class AuthManager:
                 for cookie in cookie_jar:
                     domain = getattr(cookie, "domain", "")
                     if "youtube.com" in domain or "google.com" in domain:
-                        yt_cookies[cookie.name] = cookie.value
+                        # Only retain essential authentication & session tokens
+                        if cookie.name in AUTH_COOKIE_KEYS:
+                            yt_cookies[cookie.name] = cookie.value
 
                 # Verify critical authentication cookies exist
                 has_auth = any(
                     k in yt_cookies
-                    for k in ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID", "SID"]
+                    for k in ["__Secure-3PAPISID", "SAPISID", "__Secure-1PAPISID", "SID"]
                 )
 
                 if not has_auth:
                     last_err = f"No active YouTube session found in {b.capitalize()}."
                     continue
 
-                # Build valid ytmusicapi browser headers dictionary
+                # Build clean ytmusicapi browser headers dictionary
                 cookie_str = "; ".join([f"{k}={v}" for k, v in yt_cookies.items()])
                 base_headers = dict(initialize_headers())
                 auth_data = {
@@ -118,10 +178,10 @@ class AuthManager:
                 last_err = f"{b.capitalize()}: {e}"
                 continue
 
-        if browser_name.lower() == "auto":
+        if b_name == "auto":
             return (
                 False,
-                "No active YouTube session found across installed browsers (Chrome, Firefox, Brave, Edge, etc.). "
+                "No active YouTube session found across installed browsers (Zen, Firefox, Chrome, Brave, Edge, etc.). "
                 "Please sign in to https://music.youtube.com in your browser, then re-run: ytstr --login",
             )
         return False, last_err or f"Could not extract cookies from {browser_name.capitalize()}."
