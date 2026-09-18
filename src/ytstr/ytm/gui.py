@@ -3,12 +3,13 @@ Lightweight YouTube Music GUI inspired by InnerTune and Metrolist.
 Built with native Tkinter for ultra-low memory footprint (< 35 MB RAM).
 """
 import os
+import queue
 import subprocess
 import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ytstr.config import PLAYLIST_FILE, VERSION
 from ytstr.core.types import Track
@@ -42,6 +43,10 @@ class YTMDesktopApp:
         self.current_tracks: List[Track] = []
         self.active_player_proc: Optional[subprocess.Popen] = None
 
+        # Thread-safe UI dispatch queue (fixes Tkinter thread-safety on Linux)
+        self._ui_queue: queue.Queue = queue.Queue()
+        self._poll_ui_queue()
+
         self._setup_styles()
         self._build_header()
         self._build_content_area()
@@ -49,6 +54,24 @@ class YTMDesktopApp:
 
         # Load initial home sections asynchronously
         self.load_home()
+
+    def _poll_ui_queue(self):
+        """Periodically drain the UI queue from the main thread."""
+        try:
+            while not self._ui_queue.empty():
+                callback, args, kwargs = self._ui_queue.get_nowait()
+                try:
+                    callback(*args, **kwargs)
+                except Exception as e:
+                    print(f"Error executing UI callback: {e}")
+        except Exception:
+            pass
+        finally:
+            self.root.after(50, self._poll_ui_queue)
+
+    def _dispatch_to_ui(self, callback: Callable, *args, **kwargs):
+        """Thread-safe submission of UI updates from background threads."""
+        self._ui_queue.put((callback, args, kwargs))
 
     def _setup_styles(self):
         self.style = ttk.Style()
@@ -201,12 +224,36 @@ class YTMDesktopApp:
         )
         lbl.pack(fill=tk.X)
 
+    def _show_error(self, message: str, retry_func=None):
+        self._clear_content()
+        err_box = tk.Frame(self.scroll_content, bg=BG_DARK, pady=40)
+        err_box.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            err_box, text="⚠️ Unable to Load Content",
+            font=("Sans", 14, "bold"), fg=ACCENT_RED, bg=BG_DARK
+        ).pack(pady=(0, 8))
+
+        tk.Label(
+            err_box, text=message,
+            font=("Sans", 10), fg=FG_MUTED, bg=BG_DARK, wraplength=600
+        ).pack(pady=(0, 16))
+
+        if retry_func:
+            tk.Button(
+                err_box, text="🔄 Retry", command=retry_func,
+                bg=BG_CARD, fg=FG_WHITE, relief=tk.FLAT, padx=14, pady=6, font=("Sans", 9, "bold")
+            ).pack()
+
     def load_home(self):
         self._show_loading("Loading YouTube Music Home (Listen Again, Quick Picks)...")
 
         def worker():
-            sections = self.client.get_home_sections(limit=6)
-            self.root.after(0, lambda: self._render_sections(sections, "Home & Recommendations"))
+            try:
+                sections = self.client.get_home_sections(limit=6)
+                self._dispatch_to_ui(self._render_sections, sections, "Home & Recommendations")
+            except Exception as e:
+                self._dispatch_to_ui(self._show_error, f"Failed to load home: {e}", self.load_home)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -214,8 +261,11 @@ class YTMDesktopApp:
         self._show_loading("Loading Charts and Trending...")
 
         def worker():
-            charts = self.client.get_charts()
-            self.root.after(0, lambda: self._render_sections(charts, "Charts & Trending"))
+            try:
+                charts = self.client.get_charts()
+                self._dispatch_to_ui(self._render_sections, charts, "Charts & Trending")
+            except Exception as e:
+                self._dispatch_to_ui(self._show_error, f"Failed to load charts: {e}", self.load_charts)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -227,8 +277,11 @@ class YTMDesktopApp:
         self._show_loading(f"Searching for '{query}'...")
 
         def worker():
-            tracks = self.client.search_tracks(query, limit=25)
-            self.root.after(0, lambda: self._render_track_list(tracks, f"Search Results for '{query}'"))
+            try:
+                tracks = self.client.search_tracks(query, limit=25)
+                self._dispatch_to_ui(self._render_track_list, tracks, f"Search Results for '{query}'")
+            except Exception as e:
+                self._dispatch_to_ui(self._show_error, f"Search error: {e}", self.do_search)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -263,10 +316,17 @@ class YTMDesktopApp:
             ).pack(anchor="w", pady=(0, 6))
 
             for item in items[:8]:
-                if isinstance(item, Track):
-                    self._render_track_row(sec_frame, item)
-                elif isinstance(item, dict):
-                    self._render_playlist_row(sec_frame, item)
+                try:
+                    if isinstance(item, Track):
+                        self._render_track_row(sec_frame, item)
+                    elif isinstance(item, dict):
+                        self._render_playlist_row(sec_frame, item)
+                except Exception:
+                    continue
+
+        # Force geometry recalculation so scrolling works immediately
+        self.scroll_content.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _render_track_list(self, tracks: List[Track], title: str):
         self._clear_content()
@@ -285,7 +345,13 @@ class YTMDesktopApp:
             return
 
         for track in tracks:
-            self._render_track_row(self.scroll_content, track)
+            try:
+                self._render_track_row(self.scroll_content, track)
+            except Exception:
+                continue
+
+        self.scroll_content.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _render_track_row(self, parent: tk.Widget, track: Track):
         row = tk.Frame(parent, bg=BG_CARD, padx=12, pady=8, bd=1, relief=tk.SOLID)
@@ -361,12 +427,17 @@ class YTMDesktopApp:
         self.status_label.config(text=f"Fetching radio for {track.title}...")
 
         def worker():
-            tracks = self.client.get_watch_playlist_tracks(track.id, limit=25)
-            if tracks:
-                self.root.after(0, lambda: self._render_track_list(tracks, f"Radio: {track.display_title()}"))
-                self.root.after(0, lambda: self._launch_ytstr_engine(track.web_url, f"Radio: {track.title}"))
-            else:
-                self.root.after(0, lambda: messagebox.showwarning("Radio", "Could not fetch radio tracks."))
+            try:
+                tracks = self.client.get_watch_playlist_tracks(track.id, limit=25)
+                if tracks:
+                    def on_success():
+                        self._render_track_list(tracks, f"Radio: {track.display_title()}")
+                        self._launch_ytstr_engine(track.web_url, f"Radio: {track.title}")
+                    self._dispatch_to_ui(on_success)
+                else:
+                    self._dispatch_to_ui(lambda: messagebox.showwarning("Radio", "Could not fetch radio tracks."))
+            except Exception as e:
+                self._dispatch_to_ui(lambda err=str(e): messagebox.showerror("Radio Error", f"Radio failed: {err}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -495,7 +566,7 @@ class YTMDesktopApp:
                         import_status_lbl.config(text=msg, fg=ACCENT_RED)
                         messagebox.showwarning("Login Incomplete", msg, parent=modal)
 
-                self.root.after(0, on_done)
+                self._dispatch_to_ui(on_done)
 
             threading.Thread(target=worker, daemon=True).start()
 

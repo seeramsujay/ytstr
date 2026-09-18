@@ -35,7 +35,7 @@ class YouTubeMusicClient:
     def is_authenticated(self) -> bool:
         return self.auth_manager.is_authenticated()
 
-    def get_home_sections(self, limit: int = 5) -> List[Dict[str, Any]]:
+    def get_home_sections(self, limit: int = 6) -> List[Dict[str, Any]]:
         """
         Fetch YouTube Music home feed sections (Listen Again, Quick Picks, etc.).
 
@@ -94,23 +94,26 @@ class YouTubeMusicClient:
         chart_sections = []
         try:
             charts = self._ytm.get_charts(country=country)
+            if not isinstance(charts, dict):
+                return []
             for key in ["videos", "genres"]:
-                entries = charts.get(key, [])
+                entries = charts.get(key)
+                if not isinstance(entries, list) or not entries:
+                    continue
                 items = []
-                if isinstance(entries, list):
-                    for item in entries:
-                        if not item or not isinstance(item, dict):
-                            continue
-                        if item.get("playlistId"):
-                            items.append({
-                                "type": "playlist",
-                                "id": item.get("playlistId"),
-                                "title": item.get("title", "Top Chart"),
-                            })
-                        else:
-                            t = self._parse_item_to_track(item)
-                            if t:
-                                items.append(t)
+                for item in entries:
+                    if not item or not isinstance(item, dict):
+                        continue
+                    if item.get("playlistId"):
+                        items.append({
+                            "type": "playlist",
+                            "id": item.get("playlistId"),
+                            "title": item.get("title", "Top Chart"),
+                        })
+                    else:
+                        t = self._parse_item_to_track(item)
+                        if t:
+                            items.append(t)
                 if items:
                     chart_sections.append({"title": f"Charts: {key.capitalize()}", "items": items})
         except Exception:
@@ -125,10 +128,13 @@ class YouTubeMusicClient:
         tracks: List[Track] = []
         try:
             results = self._ytm.search(query, filter=filter_type, limit=limit)
-            for r in results:
-                t = self._parse_item_to_track(r)
-                if t:
-                    tracks.append(t)
+            if isinstance(results, list):
+                for r in results:
+                    if not r or not isinstance(r, dict):
+                        continue
+                    t = self._parse_item_to_track(r)
+                    if t:
+                        tracks.append(t)
         except Exception:
             pass
         return tracks
@@ -141,10 +147,15 @@ class YouTubeMusicClient:
         tracks: List[Track] = []
         try:
             playlist = self._ytm.get_playlist(playlist_id, limit=100)
-            for item in playlist.get("tracks", []):
-                t = self._parse_item_to_track(item)
-                if t:
-                    tracks.append(t)
+            if isinstance(playlist, dict):
+                raw_tracks = playlist.get("tracks", [])
+                if isinstance(raw_tracks, list):
+                    for item in raw_tracks:
+                        if not item or not isinstance(item, dict):
+                            continue
+                        t = self._parse_item_to_track(item)
+                        if t:
+                            tracks.append(t)
         except Exception:
             pass
         return tracks
@@ -157,10 +168,15 @@ class YouTubeMusicClient:
         tracks: List[Track] = []
         try:
             radio = self._ytm.get_watch_playlist(videoId=video_id, limit=limit)
-            for item in radio.get("tracks", []):
-                t = self._parse_item_to_track(item)
-                if t:
-                    tracks.append(t)
+            if isinstance(radio, dict):
+                raw_tracks = radio.get("tracks", [])
+                if isinstance(raw_tracks, list):
+                    for item in raw_tracks:
+                        if not item or not isinstance(item, dict):
+                            continue
+                        t = self._parse_item_to_track(item)
+                        if t:
+                            tracks.append(t)
         except Exception:
             pass
         return tracks
