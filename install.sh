@@ -82,7 +82,7 @@ fi
 # 4. Sync Virtual Environment via uv
 echo -e "${CYAN}→ Building virtual environment and installing dependencies...${NC}"
 cd "$SOURCE_DIR"
-uv sync --quiet --extra media-keys
+uv sync --quiet --all-extras
 
 # 5. Create Standalone CLI and GUI Launchers in ~/.local/bin
 mkdir -p "$HOME/.local/bin"

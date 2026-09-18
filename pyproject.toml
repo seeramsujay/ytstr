@@ -35,6 +35,12 @@ dev = [
     "pytest-cov>=4.1.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+]
+
 [project.scripts]
 ytstr = "ytstr.cli:main"
 ytstr-gui = "ytstr.ytm.gui:main"
