@@ -24,8 +24,10 @@ if os.path.exists(venv_python) and os.path.realpath(sys.executable) != os.path.r
 elif not os.path.exists(venv_python) and shutil.which("uv"):
     os.execvp("uv", ["uv", "--directory", repo_root, "run", sys.argv[0]] + sys.argv[1:])
 
-# Ensure src/ is on sys.path for direct repository execution
+# Ensure src/ is on sys.path and remove cwd from sys.path[0] to prevent shadowing
 src_dir = os.path.join(repo_root, "src")
+if sys.path and (sys.path[0] == "" or os.path.abspath(sys.path[0]) == repo_root):
+    sys.path.pop(0)
 if os.path.exists(src_dir) and src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 

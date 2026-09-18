@@ -44,3 +44,6 @@ bin/
 *.wav
 *.opus
 .agent/
+
+# Standalone compiled binary
+/ytstr
