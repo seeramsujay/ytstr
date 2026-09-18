@@ -1,187 +1,188 @@
-# 🎧 ytstr: High-Speed CLI & Interactive TUI YouTube Music Streamer
+<div align="center">
 
-`ytstr` is a high-performance terminal YouTube and YouTube Music audio streamer equipped with an intelligent, automated spectral DJ transition engine, an ultra-low-RAM streaming pipeline (< 30 MB peak RAM), and an interactive **curses-based Terminal User Interface (TUI)**.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/banner.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/banner.svg">
+  <img alt="ytstr banner" src="assets/banner.svg" width="100%">
+</picture>
 
----
+<br/><br/>
 
-## ⚡ Key Capabilities & Features
+[![GitHub Release](https://img.shields.io/github/v/release/seeramsujay/ytstr?style=flat-square&color=00f5d4)](https://github.com/seeramsujay/ytstr/releases)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square)](LICENSE)
+[![Python: >=3.9](https://img.shields.io/badge/Python->=3.9-3776ab.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![RAM Footprint: <30MB](https://img.shields.io/badge/RAM%20Peak-<30MB-brightgreen?style=flat-square&logo=speedtest&logoColor=white)](https://github.com/seeramsujay/ytstr#benchmarks)
+[![Backend: mpv](https://img.shields.io/badge/Engine-Direct%20MPV-800080?style=flat-square)](https://mpv.io)
+[![Installer: One-Line](https://img.shields.io/badge/Install-1--Liner-orange?style=flat-square)](https://github.com/seeramsujay/ytstr#installation)
 
-- **Interactive Terminal User Interface (TUI)**:
-  - Built with Python's standard library `curses` (< 5 MB RAM, zero extra dependencies).
-  - Browse YouTube Music personalized sections (**"Listen Again"**, **"From Your Library"**, **"Mixed For You"**).
-  - Browse **"Charts & Trending"** songs and videos.
-  - Interactive search with `/` hotkey and instantaneous playback.
-  - Live ASCII audio progress bar, playback timer, and volume adjustment.
-  - Radio generator: Press `r` on any track to auto-generate endless recommendations.
-- **1-Click Browser Authentication (Zen, Chrome, Firefox, Brave, etc.)**:
-  - Automatically imports your authenticated YouTube session cookies from local browser profiles.
-  - Full support for **Zen Browser**, standard **Firefox**, **Chrome**, **Brave**, **LibreWolf**, **Edge**, and **Chromium**.
-  - No manual DevTools inspection or password entry required.
-- **Ultra-Low Memory Footprint**:
-  - **`--no-mix` Mode**: Direct native `mpv` playback with **< 30 MB RSS** (a 74% reduction).
-  - **`--stream` Mode**: Streams audio URLs directly over HTTPS with **zero disk writes** and **< 30 MB RSS**.
-  - **Bounded Cache & `--save`**: Replaced `/dev/shm` RAM storage with an on-disk sliding-window cache (`~/.cache/ytstr`). Automatically cleans up played tracks or exports them file-by-file with `--save [DIR]`.
-- **Intelligent Spectral Auto-DJ**:
-  - Analyzes RMS energy, kick/bass (< 250 Hz), treble (> 2 kHz), and amplitude variance to dynamically render:
-    - **Bass Swap**: Exponential high-pass filter sweep with sub-120 Hz incoming kill.
-    - **Filter Wash**: Progressive high-pass filter sweep up to 2 kHz with resonance masking.
-    - **Dynamic Rise**: Equal-power crossfade paired with an active +4 dB drop gain swell.
-    - **Tape Stop / Start**: Progressive turntable frame-rate drop simulation.
-    - **Melt**: Multi-tap echo delay lines with 3 kHz low-pass atmospheric dissolve.
-    - **Blend**: 10-second groove lock for compatible tempos.
-    - **Cut-In**: Beat-boundary switch with 15 ms anti-pop micro-fades.
-    - **Fade**: Classic sinusoidal equal-power crossfade.
+**A high-performance YouTube & YouTube Music audio streamer and automated DJ engine designed for weak desktops and power users alike.**
+
+[Installation](#-installation) • [Key Features](#-key-features) • [Interactive TUI](#-interactive-tui) • [Keybindings](#-keybindings) • [Benchmarks](#-memory-benchmarks) • [Releases](https://github.com/seeramsujay/ytstr/releases)
+
+</div>
 
 ---
 
-## 📊 Memory Benchmarks (Peak RSS)
+## ✨ Overview
 
-| Mode | Previous Architecture | **ytstr v2.1.0 (Optimized)** | RAM Reduction |
-| :--- | :---: | :---: | :---: |
-| **Direct No-Mix (`--no-mix`)** | 114.31 MB | **29.92 MB** | **-73.8%** |
-| **Direct Stream (`--stream`)** | N/A | **29.65 MB** | **Ultra-Low** |
-| **Light Mix (`--light-mix`)** | 110.96 MB | **30.10 MB** | **-72.9%** |
-| **Auto-DJ (Spectral Transitions)** | 111.48 MB | **29.86 MB** | **-73.2%** |
+`ytstr` delivers an uncompromising audio experience right from the Linux terminal:
+- **Ultra-Low Resource Footprint**: Engineered with strict memory boundaries (< 30 MB peak RAM) using direct MPV IPC streaming, zero unnecessary disk churn, and bounded sliding-window caches.
+- **Interactive Curses TUI**: Effortlessly browse personalized YouTube Music feeds, library playlists, liked songs, live continuous radio queues, and search directly inside a rich terminal interface.
+- **1-Click Browser Authentication**: Seamlessly authenticates with your active YouTube Music account from **Zen Browser**, **Firefox**, **Chrome**, **Brave**, **LibreWolf**, or **Edge**—no manual cookie exports or header pasting required.
+- **Spectral Auto-DJ & Micro-Mixing**: An intelligent decision engine analyzing RMS, sub-bass (< 250 Hz), treble (> 2 kHz), and energy to execute 8 dynamic psychoacoustic transitions (Bass Swaps, Filter Washes, Tape Stops, Dynamic Rises, and Melts).
 
 ---
 
-## 🚀 Quick Start & Installation
+## ⚡ Installation
 
-### 1. One-Line Installer (Recommended)
-
-Run the single-script installer:
+### 1. One-Line Script (Recommended)
+Installs system dependencies check, builds the environment via `uv`, adds standalone binaries to `~/.local/bin/`, and automatically configures your shell `$PATH`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/seeramsujay/ytstr/master/install.sh | bash
 ```
 
-The script verifies system decoders (`mpv`, `ffmpeg`), installs `uv` if missing, builds the environment, and creates standalone executables at `~/.local/bin/ytstr` and `~/.local/bin/ytstr-tui`.
-
-### 2. 1-Click Login (Zen, Firefox, Chrome, Brave)
-
-To connect your YouTube Music account:
+### 2. Standalone Binary (Zero Python Runtime Needed)
+Download the single standalone ELF binary from the [Latest Release](https://github.com/seeramsujay/ytstr/releases):
 
 ```bash
-ytstr --login
-# Or specify your browser directly:
-ytstr --login zen
+curl -L -o ytstr https://github.com/seeramsujay/ytstr/releases/latest/download/ytstr
+chmod +x ytstr
+mv ytstr ~/.local/bin/
 ```
 
-This extracts your session cookies automatically without asking for credentials or storing passwords.
+### 3. Build from Source
+```bash
+git clone https://github.com/seeramsujay/ytstr.git
+cd ytstr
+uv sync
+./ytstr.py
+```
+
+To compile your own standalone single-file binary:
+```bash
+./build.sh
+```
 
 ---
 
-## 🖥️ Interactive TUI Navigation
+## 🔑 1-Click Browser Authentication
 
-Launch the TUI:
+Connect your YouTube Music library and personal recommendations with a single command:
+
+```bash
+# Auto-detects session from Zen, Firefox, Chrome, Brave, Edge, etc.
+ytstr --login
+
+# Or target your browser profile directly:
+ytstr --login zen
+ytstr --login chrome
+```
+
+---
+
+## 🖥️ Interactive TUI
+
+Launch the full interactive terminal player:
 
 ```bash
 ytstr
-# or:
-ytstr --tui
 ```
 
-### Keybindings
+<div align="center">
+  <img alt="ytstr TUI preview" src="assets/banner.svg" width="90%">
+</div>
 
-| Key | Action |
-| :---: | :--- |
-| `1` - `6` / `Tab` | Switch tabs: **Recommended**, **My Playlists**, **Liked Songs**, **Radio Queue**, **Search**, **Account** |
-| `↑` / `↓` or `k` / `j` | Navigate items in list |
-| `Enter` | Play selected track & start continuous radio / Drill down into playlist |
-| `Backspace` / `Esc` | Return from playlist drill-down to playlist list |
-| `Shift` + `P` | Queue and play entire playlist directly |
-| `Space` | Toggle Pause / Resume |
-| `←` / `→` or `h` / `l` | **Rewind / Fast-Forward 5s** (like mpv) |
-| `[` / `]` | **Rewind / Fast-Forward 30s** |
-| **Hardware Media Keys** | Play/Pause, Next Track, Prev Track, Volume (top keyboard keys) |
-| `>` or `.` / `n` | Skip to next track in radio queue |
-| `<` or `,` / `p` | Skip to previous track |
-| `d` or `Delete` | Remove/skip upcoming song from radio queue |
-| `u` | Jump to Radio Queue view |
-| `9` / `0` or `-` / `+` | Volume down / up (5% steps) |
-| `/` | Open YouTube Music search bar |
-| `r` | Force seed new radio station from selected track |
-| `s` | Save selected track or playlist locally |
-| `m` | Cycle Playback Mode (Direct Low-RAM -> Light Mix -> Stream -> Auto-DJ) |
-| `x` | Stop playback |
-| `q` | Quit TUI |
+### 🎛️ Keybindings
+
+| Key | Action | Description |
+| :---: | :--- | :--- |
+| <kbd>1</kbd> – <kbd>6</kbd> / <kbd>Tab</kbd> | **Switch Tab** | Switch: Recommended, Playlists, Liked Songs, Radio Queue, Search, Account |
+| <kbd>↑</kbd> / <kbd>↓</kbd> or <kbd>k</kbd> / <kbd>j</kbd> | **Navigate** | Move cursor up / down through track or playlist lists |
+| <kbd>Enter</kbd> | **Play / Open** | Start track & spawn infinite radio / Drill into playlist |
+| <kbd>Backspace</kbd> / <kbd>Esc</kbd> | **Back** | Exit playlist drilldown back to playlist list |
+| <kbd>Shift</kbd> + <kbd>P</kbd> | **Play Playlist** | Queue and play entire selected playlist directly |
+| <kbd>Space</kbd> | **Play / Pause** | Toggle playback pause / resume |
+| <kbd>←</kbd> / <kbd>→</kbd> or <kbd>h</kbd> / <kbd>l</kbd> | **Seek (5s)** | Fast-forward or rewind current track by 5 seconds (MPV style) |
+| <kbd>[</kbd> / <kbd>]</kbd> | **Seek (30s)** | Fast-forward or rewind current track by 30 seconds |
+| <kbd>&gt;</kbd> or <kbd>.</kbd> / <kbd>n</kbd> | **Next Track** | Advance to next track in radio queue |
+| <kbd>&lt;</kbd> or <kbd>,</kbd> / <kbd>p</kbd> | **Previous Track** | Skip back to previous track |
+| <kbd>d</kbd> or <kbd>Delete</kbd> | **Discard Track** | Drop upcoming song from radio queue (or highlighted song in Queue tab) |
+| <kbd>u</kbd> | **Queue View** | Jump directly to live Radio Queue tab |
+| <kbd>9</kbd> / <kbd>0</kbd> or <kbd>-</kbd> / <kbd>+</kbd> | **Volume** | Step volume down / up by 5% |
+| <kbd>/</kbd> | **Search** | Open instant search prompt across YouTube Music catalog |
+| <kbd>r</kbd> | **Start Radio** | Force seed a brand new radio station from highlighted track |
+| <kbd>m</kbd> | **Cycle Mode** | Switch between Direct Low-RAM → Light Mix → Stream → Auto-DJ |
+| **Media Keys** | **Hardware Controls** | Top-row keyboard keys: Play/Pause, Next Track, Prev Track, Volume |
+| <kbd>q</kbd> | **Quit** | Cleanly terminate playback and exit |
 
 ---
 
-## 💻 CLI Usage Options
+## 📊 Memory Benchmarks
+
+All modes were audited with peak Resident Set Size (RSS) monitoring under continuous audio playback:
+
+| Playback Mode | Previous Architecture | **ytstr v2.1.0 (Optimized)** | Efficiency Gain |
+| :--- | :---: | :---: | :---: |
+| **Direct No-Mix (`--no-mix`)** | 114.3 MB | **29.9 MB** | **-73.8% RAM** |
+| **Direct Stream (`--stream`)** | N/A | **29.6 MB** | **Zero Disk Writes** |
+| **Light Mix (`--light-mix`)** | 110.9 MB | **30.1 MB** | **-72.9% RAM** |
+| **Spectral Auto-DJ** | 111.5 MB | **29.8 MB** | **-73.2% RAM** |
+
+---
+
+## 💻 CLI Usage
+
+Prefer a command-line one-liner without launching the TUI? `ytstr` provides a fast CLI:
 
 ```bash
-# Stream by search query in Direct Low-RAM mode (ideal for weak desktops)
+# Stream by search query in Direct Low-RAM mode (ideal for low-spec systems)
 ytstr "synthwave chill mix" --no-mix
 
-# Stream directly from network without saving files to disk
+# Direct HTTPS stream with zero disk writes
 ytstr "lofi hip hop radio" --stream
 
 # Auto-DJ mode with psychoacoustic spectral transitions
 ytstr "https://www.youtube.com/playlist?list=PL4fGSI1pDJn5kI81J1fYWK5eZRl1zJ5kM"
 
 # Fast equal-power crossfade (Light Mix)
-ytstr "cyberpunk 2077 radio" --light-mix
+ytstr "cyberpunk 2077 ambient" --light-mix
 
-# Save files file-by-file into ~/Music/ytstr while streaming
+# Save tracks file-by-file into ~/Music while playing
 ytstr "chill hop essentials" --save ~/Music/ytstr
 
-# List saved playlists
+# List or manage saved playlist shortcuts
 ytstr --list
-
-# Add a saved playlist
 ytstr --add "Focus Beats" "https://www.youtube.com/playlist?list=..."
-```
-
-### CLI Reference
-
-| Flag | Description |
-| :--- | :--- |
-| `target` | YouTube URL, search query, or saved playlist number. |
-| `--tui` | Launch interactive terminal user interface (default if no target given). |
-| `--no-mix` | Ultra-low RAM direct playback without mixing (< 30 MB RSS). |
-| `--stream` | Direct network streaming without writing files to disk. |
-| `--light-mix` | Fast sinusoidal crossfade skipping spectral analysis (low CPU). |
-| `--save [DIR]` | Save downloaded tracks file-by-file to destination directory. |
-| `--no-shuffle` | Play tracks in original sequential order. |
-| `--login [BROWSER]` | 1-click browser login (auto, zen, chrome, firefox, brave, etc.). |
-| `--logout` | Clear saved YouTube Music credentials. |
-| `--list` | List all saved playlists. |
-| `--add NAME URL` | Save a playlist with a friendly name. |
-| `--remove NUM` | Remove a saved playlist by index. |
-
----
-
-## 🧪 Testing & Benchmarks
-
-Run the automated test suite with `uv`:
-
-```bash
-uv run pytest -v
-```
-
-Run memory profiling benchmarks:
-
-```bash
-bash test_mem.sh
+ytstr --remove 1
 ```
 
 ---
 
-## 📄 License
+## 🏗️ Architecture
 
-This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
+```
+ytstr/
+├── src/ytstr/
+│   ├── cli.py             # CLI parser and command router
+│   ├── config.py          # Paths, defaults, and styling
+│   ├── core/              # Player coordinator and playlist management
+│   ├── dsp/               # Audio filters, equal-power curves, energy analysis
+│   ├── downloader/        # yt-dlp wrapper and bounded cache manager
+│   ├── engine/            # Spectral transition decision engine
+│   ├── playback/          # Direct MPV IPC controller and DJ player
+│   ├── ui/                # Curses TUI, input listener, and status rendering
+│   └── ytm/               # 1-Click browser auth and YouTube Music API client
+├── tests/                 # Comprehensive test suite (36 unit & integration tests)
+├── assets/                # Visual assets and vector banners
+├── install.sh             # Universal single-script installer
+└── build.sh               # Standalone binary compiler (PyInstaller)
+```
 
 ---
 
-## 🛡️ Licensing & Privacy Protection
+## 🤝 Contributing & License
 
-Because this repository contains personal code, portfolios, or intellectual property, **strict privacy protections are in place**.
+Contributions, bug reports, and suggestions are welcome! Feel free to open an issue or pull request.
 
-### ⚠️ Prohibitions on AI Training & Scraping
-This repository is published for direct human viewing only. Automated data scraping, harvesting, and crawling are strictly prohibited under the author's personal copyright terms.
-
-**By accessing this repository or its contents, you agree to the following terms:**
-* **NO AI/LLM Ingestion:** Any ingestion of code, text, layouts, designs, or assets for training, validation, testing, or tuning of machine learning models, neural networks, or artificial intelligence systems (such as Large Language Models) is strictly prohibited.
-* **NO Automated Data Scraping:** Any automated extraction, parsing, harvesting, or scraping of content by bots, crawlers, scripts, or spiders is prohibited.
-* **Personal Use Only:** Human viewing for personal or educational review is permitted. No duplication, modification, adaptation, or commercial distribution of this work is allowed without express written permission.
+Distributed under the [GNU General Public License v3.0 or later](LICENSE).
