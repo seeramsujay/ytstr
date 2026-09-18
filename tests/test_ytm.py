@@ -1,16 +1,14 @@
 """
-Unit tests for YouTube Music client, authentication, and GUI components.
+Unit tests for YouTube Music client, authentication, and parsing.
 """
 from http.cookiejar import Cookie
 import tempfile
-import tkinter as tk
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from ytstr.core.types import Track
 from ytstr.ytm.auth import AuthManager
 from ytstr.ytm.client import YouTubeMusicClient
-from ytstr.ytm.gui import YTMDesktopApp
 
 
 def make_mock_cookie(name: str, value: str, domain: str = ".youtube.com") -> Cookie:
@@ -57,7 +55,7 @@ def test_auth_manager_browser_extraction():
         auth_file = Path(tmpdir) / "test_auth.json"
         auth = AuthManager(auth_path=auth_file)
 
-        mock_cookies = [
+        mock_cookies = [\
             make_mock_cookie("SAPISID", "valid_sapisid_token"),
             make_mock_cookie("SID", "valid_sid"),
             make_mock_cookie("__Secure-3PAPISID", "valid_secure_token"),
@@ -87,14 +85,3 @@ def test_ytm_client_parse_item():
     assert track.artist == "The Weeknd, Daft Punk"
     assert track.duration_sec == 230.0
     assert track.web_url == "https://www.youtube.com/watch?v=abc123xyz"
-
-
-def test_gui_initialization():
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        app = YTMDesktopApp(root)
-        assert app.root == root
-        assert app.mode_var.get() == "Direct Low-RAM (--no-mix)"
-    finally:
-        root.destroy()

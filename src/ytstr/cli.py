@@ -21,7 +21,7 @@ def main(argv: Optional[list] = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="ytstr",
-        description=f"ytstr v{VERSION} — YouTube & YT Music Streamer with Auto-DJ and Low-RAM Streaming",
+        description=f"ytstr v{VERSION} — YouTube & YT Music Streamer with Auto-DJ, Low-RAM Streaming & Interactive TUI",
         add_help=False,
     )
 
@@ -29,13 +29,14 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--list", action="store_true", help="List all saved playlists")
     parser.add_argument("--add", nargs=2, metavar=("NAME", "URL"), help="Save a playlist with a friendly name")
     parser.add_argument("--remove", type=int, metavar="NUM", help="Remove a saved playlist by index")
-    parser.add_argument("--gui", action="store_true", help="Launch lightweight YouTube Music desktop GUI")
+    parser.add_argument("--tui", action="store_true", help="Launch interactive terminal user interface")
+    parser.add_argument("--gui", action="store_true", help="Alias for --tui (interactive terminal interface)")
     parser.add_argument(
         "--login",
         nargs="?",
         const="auto",
         metavar="BROWSER",
-        help="Log in to YouTube Music via browser (auto, chrome, firefox, brave, edge, etc.)",
+        help="Log in to YouTube Music via browser (auto, zen, chrome, firefox, brave, edge, etc.)",
     )
     parser.add_argument("--logout", action="store_true", help="Log out of YouTube Music and clear credentials")
 
@@ -51,6 +52,7 @@ def main(argv: Optional[list] = None) -> int:
         metavar="DIR",
         help="Save audio files file-by-file to destination directory",
     )
+    parser.add_argument("--ipc-socket", metavar="PATH", help="Path to mpv Unix IPC domain socket")
     parser.add_argument("-h", "--help", action="store_true", help="Show this help message and exit")
     parser.add_argument("-v", "--version", action="store_true", help="Show version number and exit")
 
@@ -88,13 +90,13 @@ def main(argv: Optional[list] = None) -> int:
             info("Make sure you are logged into YouTube in your browser, then re-run: ytstr --login")
             return 1
 
-    if args.gui:
+    if args.tui or args.gui or (not args.target and not args.list and not args.add and not args.remove):
         try:
-            from ytstr.ytm.gui import main as run_gui
-            run_gui()
+            from ytstr.ui.tui import main as run_tui
+            run_tui()
             return 0
         except Exception as e:
-            error(f"Failed to launch GUI: {e}")
+            error(f"Failed to launch TUI: {e}")
             return 1
 
     playlists = parse_playlists()
@@ -111,70 +113,52 @@ def main(argv: Optional[list] = None) -> int:
     if args.add:
         name, url = args.add
         if add_playlist(name, url):
-            success(f"Added playlist: '{name}'")
+            success(f"Added playlist: '{name}' -> {url}")
             return 0
-        error("Failed to add playlist.")
-        return 1
+        else:
+            error("Failed to add playlist.")
+            return 1
 
     if args.remove is not None:
         idx = args.remove - 1
-        removed = remove_playlist(idx)
-        if removed:
-            success(f"Removed playlist: '{removed['name']}'")
-            return 0
+        if 0 <= idx < len(playlists):
+            removed = playlists[idx]
+            if remove_playlist(idx):
+                success(f"Removed playlist: '{removed['name']}'")
+                return 0
         error(f"Invalid playlist number: {args.remove}")
         return 1
 
+    # Playback mode determination
+    if args.stream:
+        mode = PlaybackMode.DIRECT_STREAM
+    elif args.no_mix:
+        mode = PlaybackMode.DIRECT_NO_MIX
+    elif args.light_mix:
+        mode = PlaybackMode.LIGHT_MIX
+    else:
+        mode = PlaybackMode.AUTO_DJ
+
+    shuffle = not args.no_shuffle
+
+    # Resolve target: URL, saved playlist number, or search query
     target = args.target
-
-    if not target:
-        if not playlists:
-            info("Usage: ytstr <search-query-or-url> [options]")
-            info("Or run: ytstr --gui to browse YouTube Music")
-            return 0
-
-        info("Select a saved playlist:")
-        for i, p in enumerate(playlists):
-            print(f"  {GREEN}{i + 1}.{NC} {p['name']}")
-
-        try:
-            choice = input(f"\n{YELLOW}Enter playlist number:{NC} ").strip()
-            idx = int(choice) - 1
-            if 0 <= idx < len(playlists):
-                target = playlists[idx]["url"]
-            else:
-                error("Invalid selection.")
-                return 1
-        except (ValueError, KeyboardInterrupt, EOFError):
-            return 0
-
-    # Resolve numerical shortcut
     if target.isdigit():
         idx = int(target) - 1
         if 0 <= idx < len(playlists):
             target = playlists[idx]["url"]
+            info(f"Using saved playlist #{idx + 1}: {playlists[idx]['name']}")
         else:
-            error(f"Playlist index {target} not found in saved list.")
+            error(f"Saved playlist #{target} does not exist.")
             return 1
-
-    # Determine playback mode
-    mode = PlaybackMode.AUTO_DJ
-    if args.stream:
-        mode = PlaybackMode.STREAM
-    elif args.no_mix:
-        mode = PlaybackMode.NO_MIX
-    elif args.light_mix:
-        mode = PlaybackMode.LIGHT_MIX
 
     coordinator = YtstrCoordinator(
         target=target,
         mode=mode,
-        shuffle=not args.no_shuffle,
+        shuffle=shuffle,
         save_dir=args.save,
     )
-    coordinator.run()
-    return 0
+    if args.ipc_socket:
+        coordinator.cache_mgr.ipc_socket = args.ipc_socket
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+    return coordinator.run()

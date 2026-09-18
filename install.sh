@@ -22,7 +22,7 @@ echo "   \ V /| __/ __| __| '__|"
 echo "    | | | |_\__ \ |_| |   "
 echo "    |_|  \__|___/\__|_|   "
 echo -e "${NC}"
-echo -e "${BOLD}Installing ytstr — High-Speed CLI & GUI YouTube Music Streamer${NC}\n"
+echo -e "${BOLD}Installing ytstr — High-Speed CLI & Interactive TUI YouTube Music Streamer${NC}\n"
 
 # 1. Check System Dependencies (mpv, ffmpeg)
 MISSING_DEPS=""
@@ -84,7 +84,7 @@ echo -e "${CYAN}→ Building virtual environment and installing dependencies...$
 cd "$SOURCE_DIR"
 uv sync --quiet --all-extras
 
-# 5. Create Standalone CLI and GUI Launchers in ~/.local/bin
+# 5. Create Standalone CLI and TUI Launchers in ~/.local/bin
 mkdir -p "$HOME/.local/bin"
 
 # CLI launcher
@@ -95,16 +95,19 @@ EOF
 sed -i "s|\$SOURCE_DIR_PLACEHOLDER|$SOURCE_DIR|g" "$HOME/.local/bin/ytstr"
 chmod +x "$HOME/.local/bin/ytstr"
 
-# GUI launcher
-cat << 'EOF' > "$HOME/.local/bin/ytstr-gui"
+# TUI launcher
+cat << 'EOF' > "$HOME/.local/bin/ytstr-tui"
 #!/usr/bin/env bash
-exec uv --directory "$SOURCE_DIR_PLACEHOLDER" run ytstr-gui "$@"
+exec uv --directory "$SOURCE_DIR_PLACEHOLDER" run ytstr-tui "$@"
 EOF
-sed -i "s|\$SOURCE_DIR_PLACEHOLDER|$SOURCE_DIR|g" "$HOME/.local/bin/ytstr-gui"
-chmod +x "$HOME/.local/bin/ytstr-gui"
+sed -i "s|\$SOURCE_DIR_PLACEHOLDER|$SOURCE_DIR|g" "$HOME/.local/bin/ytstr-tui"
+chmod +x "$HOME/.local/bin/ytstr-tui"
+
+# Backward compatibility launcher
+ln -sf "$HOME/.local/bin/ytstr-tui" "$HOME/.local/bin/ytstr-gui"
 
 # 6. Verify Installation
-echo -e "${GREEN}✓ Executables installed to ~/.local/bin/ytstr and ~/.local/bin/ytstr-gui${NC}"
+echo -e "${GREEN}✓ Executables installed to ~/.local/bin/ytstr and ~/.local/bin/ytstr-tui${NC}"
 
 # Shell PATH warning if ~/.local/bin not in PATH
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
@@ -114,8 +117,9 @@ fi
 
 echo -e "\n${BOLD}${GREEN}Installation Complete!${NC}"
 echo -e "──────────────────────────────────────────────────────"
+echo -e "  ${BOLD}Interactive TUI:${NC}        ytstr  (or ytstr --tui)"
 echo -e "  ${BOLD}Run ytstr CLI:${NC}          ytstr \"lofi hip hop\" --no-mix"
 echo -e "  ${BOLD}Run Direct Stream:${NC}      ytstr \"synthwave mix\" --stream"
 echo -e "  ${BOLD}Run Auto-DJ:${NC}            ytstr \"techno playlist\""
-echo -e "  ${BOLD}Launch Desktop GUI:${NC}     ytstr-gui  (or ytstr --gui)"
+echo -e "  ${BOLD}1-Click Login:${NC}          ytstr --login zen"
 echo -e "──────────────────────────────────────────────────────\n"
