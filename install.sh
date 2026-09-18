@@ -106,14 +106,37 @@ chmod +x "$HOME/.local/bin/ytstr-tui"
 # Backward compatibility launcher
 ln -sf "$HOME/.local/bin/ytstr-tui" "$HOME/.local/bin/ytstr-gui"
 
-# 6. Verify Installation
-echo -e "${GREEN}✓ Executables installed to ~/.local/bin/ytstr and ~/.local/bin/ytstr-tui${NC}"
+# 6. Automatically Add ~/.local/bin to PATH in Shell Configs
+ADDED_TO_PROFILE=false
+PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 
-# Shell PATH warning if ~/.local/bin not in PATH
-if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    echo -e "${YELLOW}Note: Add ~/.local/bin to your PATH in ~/.bashrc or ~/.zshrc:${NC}"
-    echo -e "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+# List candidate shell rc / profile files
+SHELL_FILES=()
+[ -f "$HOME/.bashrc" ] && SHELL_FILES+=("$HOME/.bashrc")
+[ -f "$HOME/.zshrc" ] && SHELL_FILES+=("$HOME/.zshrc")
+[ -f "$HOME/.profile" ] && SHELL_FILES+=("$HOME/.profile")
+
+# If no standard shell rc files exist, default to creating ~/.bashrc
+if [ ${#SHELL_FILES[@]} -eq 0 ]; then
+    SHELL_FILES=("$HOME/.bashrc")
 fi
+
+for rc in "${SHELL_FILES[@]}"; do
+    if ! grep -q ".local/bin" "$rc" 2>/dev/null; then
+        echo "" >> "$rc"
+        echo "# Added by ytstr installer" >> "$rc"
+        echo "$PATH_LINE" >> "$rc"
+        ADDED_TO_PROFILE=true
+        echo -e "${GREEN}✓ Added ~/.local/bin to PATH in $rc${NC}"
+    fi
+done
+
+if [ "$ADDED_TO_PROFILE" = true ]; then
+    echo -e "${CYAN}→ Run: ${BOLD}source ~/.bashrc${NC}${CYAN} (or restart your terminal) to update PATH in current session.${NC}"
+fi
+
+# 7. Verify Installation
+echo -e "${GREEN}✓ Executables installed to ~/.local/bin/ytstr and ~/.local/bin/ytstr-tui${NC}"
 
 echo -e "\n${BOLD}${GREEN}Installation Complete!${NC}"
 echo -e "──────────────────────────────────────────────────────"
