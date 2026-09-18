@@ -69,17 +69,6 @@ class YTMDesktopApp:
             background=[("active", BG_CARD_HOVER), ("pressed", ACCENT_RED)],
             foreground=[("active", FG_WHITE)],
         )
-        self.style.configure(
-            "Accent.TButton",
-            background=ACCENT_RED,
-            foreground=FG_WHITE,
-            padding=6,
-            font=("Sans", 9, "bold"),
-        )
-        self.style.map(
-            "Accent.TButton",
-            background=[("active", "#cc0000")],
-        )
         self.style.configure("TCombobox", fieldbackground=BG_CARD, background=BG_CARD, foreground=FG_WHITE)
 
     def _build_header(self):
@@ -156,7 +145,6 @@ class YTMDesktopApp:
         self.auth_btn.pack(side=tk.RIGHT)
 
     def _build_content_area(self):
-        # Scrollable container
         self.canvas_frame = tk.Frame(self.root, bg=BG_DARK)
         self.canvas_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
 
@@ -177,7 +165,6 @@ class YTMDesktopApp:
             lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width)
         )
 
-        # Mousewheel binding
         self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
         self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
 
@@ -275,7 +262,6 @@ class YTMDesktopApp:
                 font=("Sans", 12, "bold"), fg=ACCENT_RED, bg=BG_DARK
             ).pack(anchor="w", pady=(0, 6))
 
-            # Render item cards / rows
             for item in items[:8]:
                 if isinstance(item, Track):
                     self._render_track_row(sec_frame, item)
@@ -365,16 +351,13 @@ class YTMDesktopApp:
         ).pack(side=tk.LEFT, padx=3)
 
     def play_track(self, track: Track):
-        """Launch ytstr playback for a single track."""
         self._launch_ytstr_engine(target=track.web_url, label=track.display_title())
 
     def play_playlist(self, playlist_id: str, name: str):
-        """Launch ytstr playback for a playlist."""
         url = f"https://www.youtube.com/playlist?list={playlist_id}"
         self._launch_ytstr_engine(target=url, label=f"Playlist: {name}")
 
     def start_radio(self, track: Track):
-        """Fetch radio recommendations and start streaming."""
         self.status_label.config(text=f"Fetching radio for {track.title}...")
 
         def worker():
@@ -388,7 +371,6 @@ class YTMDesktopApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def add_to_saved_playlists(self, track: Track):
-        """Append track to ~/.config/ytstr/playlists."""
         try:
             with open(PLAYLIST_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{track.display_title()}|{track.web_url}\n")
@@ -397,7 +379,6 @@ class YTMDesktopApp:
             messagebox.showerror("Error", f"Failed to save: {e}")
 
     def _launch_ytstr_engine(self, target: str, label: str):
-        """Spawn ytstr player process in chosen mode."""
         self.stop_playback()
 
         mode_choice = self.mode_var.get()
@@ -434,66 +415,132 @@ class YTMDesktopApp:
         self.status_label.config(text="Player stopped.")
 
     def open_login_modal(self):
-        """Modal window for YouTube Music Login / Authentication."""
+        """Modal window for YouTube Music Login (Auto Browser Extraction & Browser Launch)."""
         modal = tk.Toplevel(self.root)
         modal.title("YouTube Music Login")
-        modal.geometry("580x480")
+        modal.geometry("620x560")
         modal.configure(bg=BG_DARK)
         modal.transient(self.root)
         modal.grab_set()
 
         tk.Label(
             modal, text="YouTube Music Authentication",
-            font=("Sans", 13, "bold"), fg=ACCENT_RED, bg=BG_DARK
-        ).pack(pady=(16, 8))
+            font=("Sans", 14, "bold"), fg=ACCENT_RED, bg=BG_DARK
+        ).pack(pady=(16, 6))
 
         status_txt = "Logged In ✓" if self.auth_mgr.is_authenticated() else "Not Logged In"
         status_color = ACCENT_GREEN if self.auth_mgr.is_authenticated() else FG_MUTED
 
-        tk.Label(
-            modal, text=f"Current Status: {status_txt}",
+        status_lbl = tk.Label(
+            modal, text=f"Account Status: {status_txt}",
             font=("Sans", 10, "bold"), fg=status_color, bg=BG_DARK
-        ).pack(pady=(0, 12))
-
-        # Instructions
-        instr = (
-            "Authenticate to unlock your personal Listen Again, Quick Picks,\n"
-            "Liked Music, and Playlists directly from YouTube Music.\n\n"
-            "Quick Cookie Setup (Recommended):\n"
-            "1. Open music.youtube.com in your browser and log in.\n"
-            "2. Open Developer Tools (F12) -> Network tab.\n"
-            "3. Click any request to 'browse' or 'music.youtube.com'.\n"
-            "4. Copy Request Headers and paste them into the box below:"
         )
+        status_lbl.pack(pady=(0, 12))
+
+        # Card 1: 1-Click Browser Login (Sonora / Modern Style)
+        auto_card = tk.LabelFrame(
+            modal, text=" ⚡ 1-Click Browser Login (Recommended) ",
+            bg=BG_CARD, fg=FG_WHITE, font=("Sans", 10, "bold"), padx=14, pady=12, relief=tk.GROOVE
+        )
+        auto_card.pack(fill=tk.X, padx=16, pady=8)
+
         tk.Label(
-            modal, text=instr, justify=tk.LEFT,
-            font=("Sans", 9), fg=FG_WHITE, bg=BG_DARK
-        ).pack(padx=16, anchor="w")
+            auto_card,
+            text="Step 1: Open YouTube Music in your browser and sign in.",
+            font=("Sans", 9), fg=FG_WHITE, bg=BG_CARD
+        ).pack(anchor="w", pady=(0, 6))
+
+        tk.Button(
+            auto_card, text="🌐 Open music.youtube.com in Browser",
+            command=self.auth_mgr.open_browser_for_login,
+            bg="#222222", fg=ACCENT_BLUE, relief=tk.FLAT, font=("Sans", 9, "bold"), padx=10, pady=4
+        ).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(
+            auto_card,
+            text="Step 2: Automatically import the active session:",
+            font=("Sans", 9), fg=FG_WHITE, bg=BG_CARD
+        ).pack(anchor="w", pady=(4, 6))
+
+        import_row = tk.Frame(auto_card, bg=BG_CARD)
+        import_row.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(import_row, text="Browser:", fg=FG_MUTED, bg=BG_CARD, font=("Sans", 9)).pack(side=tk.LEFT, padx=(0, 6))
+
+        browser_var = tk.StringVar(value="auto")
+        browser_combo = ttk.Combobox(
+            import_row, textvariable=browser_var, width=18, state="readonly",
+            values=["auto", "chrome", "firefox", "brave", "edge", "chromium", "opera", "vivaldi"]
+        )
+        browser_combo.pack(side=tk.LEFT, padx=(0, 10))
+
+        import_status_lbl = tk.Label(auto_card, text="", fg=FG_MUTED, bg=BG_CARD, font=("Sans", 8))
+
+        def do_auto_import():
+            chosen_browser = browser_var.get()
+            import_status_lbl.config(text=f"Importing session from {chosen_browser}...", fg=YELLOW)
+            auto_card.update()
+
+            def worker():
+                success, msg = self.auth_mgr.import_cookies_from_browser(chosen_browser)
+                def on_done():
+                    if success:
+                        messagebox.showinfo("Success", f"{msg}\nAccount active!", parent=modal)
+                        self.client._init_ytm()
+                        self.auth_btn.config(text="Account ✓", bg=ACCENT_GREEN)
+                        status_lbl.config(text="Account Status: Logged In ✓", fg=ACCENT_GREEN)
+                        modal.destroy()
+                        self.load_home()
+                    else:
+                        import_status_lbl.config(text=msg, fg=ACCENT_RED)
+                        messagebox.showwarning("Login Incomplete", msg, parent=modal)
+
+                self.root.after(0, on_done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        tk.Button(
+            import_row, text="⚡ Import Session & Log In", command=do_auto_import,
+            bg=ACCENT_RED, fg=FG_WHITE, relief=tk.FLAT, font=("Sans", 9, "bold"), padx=12, pady=4
+        ).pack(side=tk.LEFT)
+
+        import_status_lbl.pack(anchor="w", pady=(4, 0))
+
+        # Card 2: Manual Headers Fallback
+        manual_card = tk.LabelFrame(
+            modal, text=" 📝 Manual Headers Fallback ",
+            bg=BG_CARD, fg=FG_MUTED, font=("Sans", 9, "bold"), padx=14, pady=8, relief=tk.GROOVE
+        )
+        manual_card.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
+
+        tk.Label(
+            manual_card,
+            text="Optional: Paste raw request headers from DevTools (F12 -> Network):",
+            font=("Sans", 8), fg=FG_MUTED, bg=BG_CARD
+        ).pack(anchor="w", pady=(0, 4))
 
         headers_text = tk.Text(
-            modal, height=8, bg=BG_CARD, fg=FG_WHITE, insertbackground=FG_WHITE,
-            relief=tk.FLAT, bd=6, font=("Monospace", 8)
+            manual_card, height=4, bg="#111111", fg=FG_WHITE, insertbackground=FG_WHITE,
+            relief=tk.FLAT, bd=4, font=("Monospace", 8)
         )
-        headers_text.pack(fill=tk.X, padx=16, pady=8)
+        headers_text.pack(fill=tk.BOTH, expand=True, pady=4)
 
-        btn_row = tk.Frame(modal, bg=BG_DARK)
-        btn_row.pack(fill=tk.X, padx=16, pady=8)
+        manual_btn_row = tk.Frame(manual_card, bg=BG_CARD)
+        manual_btn_row.pack(fill=tk.X, pady=(4, 0))
 
-        def save_cookie():
+        def save_manual_headers():
             content = headers_text.get("1.0", tk.END).strip()
             if not content:
-                messagebox.showwarning("Empty", "Please paste the request headers or cookie.", parent=modal)
+                messagebox.showwarning("Empty", "Please paste headers.", parent=modal)
                 return
-
-            success = self.auth_mgr.save_headers(content)
-            if success:
-                messagebox.showinfo("Success", "Authenticated successfully! Reloading home...", parent=modal)
+            if self.auth_mgr.save_headers(content):
+                messagebox.showinfo("Success", "Authenticated via headers!", parent=modal)
                 self.client._init_ytm()
                 self.auth_btn.config(text="Account ✓", bg=ACCENT_GREEN)
                 modal.destroy()
                 self.load_home()
             else:
-                messagebox.showerror("Error", "Could not parse headers. Ensure cookie / authorization headers are present.", parent=modal)
+                messagebox.showerror("Error", "Could not parse headers.", parent=modal)
 
         def do_logout():
             self.auth_mgr.logout()
@@ -504,14 +551,14 @@ class YTMDesktopApp:
             self.load_home()
 
         tk.Button(
-            btn_row, text="💾 Save Headers & Log In", command=save_cookie,
-            bg=ACCENT_RED, fg=FG_WHITE, relief=tk.FLAT, font=("Sans", 9, "bold"), padx=12, pady=6
+            manual_btn_row, text="💾 Save Pasted Headers", command=save_manual_headers,
+            bg="#333333", fg=FG_WHITE, relief=tk.FLAT, font=("Sans", 8), padx=8, pady=3
         ).pack(side=tk.LEFT)
 
         if self.auth_mgr.is_authenticated():
             tk.Button(
-                btn_row, text="🚪 Log Out", command=do_logout,
-                bg="#444444", fg=FG_WHITE, relief=tk.FLAT, font=("Sans", 9), padx=12, pady=6
+                manual_btn_row, text="🚪 Log Out", command=do_logout,
+                bg="#551111", fg=FG_WHITE, relief=tk.FLAT, font=("Sans", 8), padx=8, pady=3
             ).pack(side=tk.RIGHT)
 
 

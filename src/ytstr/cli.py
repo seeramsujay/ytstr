@@ -11,6 +11,7 @@ from ytstr.core.player import YtstrCoordinator
 from ytstr.core.playlist import add_playlist, parse_playlists, remove_playlist
 from ytstr.core.types import PlaybackMode
 from ytstr.ui.terminal import error, info, success, warn
+from ytstr.ytm.auth import AuthManager
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -29,6 +30,14 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--add", nargs=2, metavar=("NAME", "URL"), help="Save a playlist with a friendly name")
     parser.add_argument("--remove", type=int, metavar="NUM", help="Remove a saved playlist by index")
     parser.add_argument("--gui", action="store_true", help="Launch lightweight YouTube Music desktop GUI")
+    parser.add_argument(
+        "--login",
+        nargs="?",
+        const="auto",
+        metavar="BROWSER",
+        help="Log in to YouTube Music via browser (auto, chrome, firefox, brave, edge, etc.)",
+    )
+    parser.add_argument("--logout", action="store_true", help="Log out of YouTube Music and clear credentials")
 
     # Playback Modes
     parser.add_argument("--no-shuffle", action="store_true", help="Play tracks in original sequential order")
@@ -57,6 +66,27 @@ def main(argv: Optional[list] = None) -> int:
     if args.help:
         parser.print_help()
         return 0
+
+    auth_mgr = AuthManager()
+
+    if args.logout:
+        auth_mgr.logout()
+        success("Logged out. YouTube Music credentials removed.")
+        return 0
+
+    if args.login:
+        browser_choice = args.login
+        info(f"Connecting to YouTube Music via browser ({browser_choice})...")
+        auth_mgr.open_browser_for_login()
+        info("Default browser opened to https://music.youtube.com. Attempting session extraction...")
+        ok, msg = auth_mgr.import_cookies_from_browser(browser_choice)
+        if ok:
+            success(f"✓ {msg}")
+            return 0
+        else:
+            warn(f"Note: {msg}")
+            info("Make sure you are logged into YouTube in your browser, then re-run: ytstr --login")
+            return 1
 
     if args.gui:
         try:

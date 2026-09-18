@@ -1,6 +1,7 @@
 """
 Unit tests for YouTube Music client, authentication, and GUI components.
 """
+from http.cookiejar import Cookie
 import tempfile
 import tkinter as tk
 from pathlib import Path
@@ -10,6 +11,27 @@ from ytstr.core.types import Track
 from ytstr.ytm.auth import AuthManager
 from ytstr.ytm.client import YouTubeMusicClient
 from ytstr.ytm.gui import YTMDesktopApp
+
+
+def make_mock_cookie(name: str, value: str, domain: str = ".youtube.com") -> Cookie:
+    return Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=True,
+        domain_initial_dot=True,
+        path="/",
+        path_specified=True,
+        secure=True,
+        expires=None,
+        discard=False,
+        comment=None,
+        comment_url=None,
+        rest={},
+    )
 
 
 def test_auth_manager_lifecycle():
@@ -28,6 +50,25 @@ def test_auth_manager_lifecycle():
         auth.logout()
         assert not auth.is_authenticated()
         assert not auth_file.exists()
+
+
+def test_auth_manager_browser_extraction():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        auth_file = Path(tmpdir) / "test_auth.json"
+        auth = AuthManager(auth_path=auth_file)
+
+        mock_cookies = [
+            make_mock_cookie("SAPISID", "valid_sapisid_token"),
+            make_mock_cookie("SID", "valid_sid"),
+            make_mock_cookie("__Secure-3PAPISID", "valid_secure_token"),
+        ]
+
+        with patch("ytstr.ytm.auth.extract_cookies_from_browser", return_value=mock_cookies):
+            ok, msg = auth.import_cookies_from_browser("chrome")
+            assert ok is True
+            assert "Chrome" in msg
+            assert auth.is_authenticated()
+            assert auth_file.exists()
 
 
 def test_ytm_client_parse_item():
