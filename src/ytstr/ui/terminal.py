@@ -39,7 +39,7 @@ def print_banner(version: str, mode: PlaybackMode, save_dir: str = ""):
     if save_dir:
         print(f"{MAGENTA}Save Destination:{NC} {save_dir}")
     print(
-        f"{YELLOW}Controls: Space=pause, 9/0=volume, >=next, <=previous, q=next song, Q=quit{NC}\n"
+        f"{YELLOW}Controls: Space=pause, 9/0=volume, >/n=next, </p=prev, q=quit{NC}\n"
     )
 
 

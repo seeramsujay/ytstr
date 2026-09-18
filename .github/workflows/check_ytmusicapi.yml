@@ -1,0 +1,83 @@
+name: Check ytmusicapi Updates & Compatibility
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC to check for upstream ytmusicapi changes
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Allows manual trigger anytime
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-ytmusicapi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Check latest PyPI version of ytmusicapi
+        id: check-version
+        run: |
+          CURRENT_VER=$(grep 'ytmusicapi' pyproject.toml | sed -E 's/.*>=([0-9.]+).*/\1/')
+          LATEST_VER=$(curl -s https://pypi.org/pypi/ytmusicapi/json | jq -r '.info.version')
+          echo "Current pinned baseline: $CURRENT_VER"
+          echo "Latest available upstream: $LATEST_VER"
+          echo "current=$CURRENT_VER" >> $GITHUB_OUTPUT
+          echo "latest=$LATEST_VER" >> $GITHUB_OUTPUT
+
+      - name: Run Test Suite against latest ytmusicapi
+        id: run-tests
+        continue-on-error: true
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+          uv pip install --upgrade ytmusicapi
+          uv run pytest tests/test_ytm.py -v
+
+      - name: Open Notification Issue on Breaking Change or Version Bump
+        if: steps.run-tests.outcome == 'failure' || steps.check-version.outputs.current != steps.check-version.outputs.latest
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const current = "${{ steps.check-version.outputs.current }}";
+            const latest = "${{ steps.check-version.outputs.latest }}";
+            const testPassed = "${{ steps.run-tests.outcome }}" === "success";
+            
+            const title = !testPassed
+              ? `🚨 [Alert] ytmusicapi v${latest} has breaking changes!`
+              : `🔔 [Notice] New ytmusicapi release available: v${latest} (current: v${current})`;
+            
+            const body = !testPassed
+              ? `### ⚠️ Breaking Change Detected in ytmusicapi!\n\nUpstream version **v${latest}** failed unit tests.\n\nPlease inspect changes in ytmusicapi and update parser mappings in \`src/ytstr/ytm/\`.\n\n[PyPI release](https://pypi.org/project/ytmusicapi/${latest}/)`
+              : `### ℹ️ New upstream ytmusicapi release\n\nUpstream published **v${latest}** (current in pyproject: >=${current}).\nUnit tests passed successfully with this release. Consider updating \`pyproject.toml\`.\n\n[PyPI release](https://pypi.org/project/ytmusicapi/${latest}/)`;
+            
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            const existing = issues.data.find(i => i.title.includes('ytmusicapi'));
+            if (!existing) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['dependencies', 'automated-check']
+              });
+              console.log("Created notification issue:", title);
+            } else {
+              console.log("Issue already open:", existing.title);
+            }

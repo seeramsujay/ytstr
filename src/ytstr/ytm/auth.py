@@ -142,10 +142,16 @@ class AuthManager:
                     continue
 
                 yt_cookies: Dict[str, str] = {}
+                # Two passes: first collect google.com, then overwrite with youtube.com
+                # so specific YouTube session tokens (SID, SSID, HSID, SAPISID, etc.) always take precedence!
                 for cookie in cookie_jar:
                     domain = getattr(cookie, "domain", "")
-                    if "youtube.com" in domain or "google.com" in domain:
-                        # Only retain essential authentication & session tokens
+                    if "google.com" in domain and "youtube.com" not in domain:
+                        if cookie.name in AUTH_COOKIE_KEYS:
+                            yt_cookies[cookie.name] = cookie.value
+                for cookie in cookie_jar:
+                    domain = getattr(cookie, "domain", "")
+                    if "youtube.com" in domain:
                         if cookie.name in AUTH_COOKIE_KEYS:
                             yt_cookies[cookie.name] = cookie.value
 

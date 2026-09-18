@@ -137,6 +137,9 @@ def spawn_mpv_process(
         mpv_cmd.extend([
             "--gapless-audio=yes",
             "--idle=yes",
+            "--prefetch-playlist=yes",
+            "--demuxer-max-bytes=100M",
+            "--demuxer-readahead-secs=60",
         ])
 
     proc = subprocess.Popen(

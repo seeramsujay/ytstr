@@ -209,22 +209,24 @@ class TUIApp:
             self.mode_idx = (self.mode_idx + 1) % len(MODES)
             self.status_msg = f"Switched mode to: {MODE_LABELS[self.mode_idx]}"
 
-        # Skip Next / Previous
-        elif ch in (ord('n'), ord('N')):
+        # Skip Next: '>' or '.' or 'n' or 'N' (mpv standard '>' / '<')
+        elif ch in (ord('>'), ord('.'), ord('n'), ord('N')):
             if self.ipc:
                 self.ipc.send_command(["playlist-next"])
-                self.status_msg = "Skipped to next track."
-        elif ch in (ord('p'), ord('P')):
+                self.status_msg = "Skipped to next track (>)."
+
+        # Skip Previous: '<' or ',' or 'p' or 'P'
+        elif ch in (ord('<'), ord(','), ord('p'), ord('P')):
             if self.ipc:
                 self.ipc.send_command(["playlist-prev"])
-                self.status_msg = "Skipped to previous track."
+                self.status_msg = "Skipped to previous track (<)."
 
-        # Volume
-        elif ch in (ord('+'), ord('=')):
+        # Volume: 9/0 (mpv standard) as well as +/-
+        elif ch in (ord('0'), ord('+'), ord('=')):
             if self.ipc:
                 self.ipc.adjust_volume(5)
                 self.status_msg = "Volume +5%"
-        elif ch in (ord('-'), ord('_')):
+        elif ch in (ord('9'), ord('-'), ord('_')):
             if self.ipc:
                 self.ipc.adjust_volume(-5)
                 self.status_msg = "Volume -5%"
@@ -838,9 +840,9 @@ class TUIApp:
         # 6. Footer / Keybindings
         footer_y = max_y - 1
         if self.in_playlist_name:
-            footer = " [Enter] Play Song & Radio  [Backspace] Back to Playlists  [Space] Pause  [m] Mode  [q] Quit"
+            footer = " [Enter] Play Song & Radio  [Backspace] Back to Playlists  [Space] Pause  [>/<] Next/Prev  [9/0] Vol  [m] Mode  [q] Quit"
         else:
-            footer = " [Enter] Play & Radio  [u] Queue  [Tab] Switch Tab  [Space] Pause  [n/p] Next/Prev  [/] Search  [q] Quit"
+            footer = " [Enter] Play & Radio  [u] Queue  [Tab] Switch Tab  [Space] Pause  [>/<] Next/Prev  [9/0] Vol  [/] Search  [q] Quit"
         self.stdscr.addstr(footer_y, 0, footer[:max_x - 1], curses.A_REVERSE | curses.color_pair(6))
 
         self.stdscr.refresh()

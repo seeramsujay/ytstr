@@ -79,15 +79,15 @@ class KeyboardListener:
                     ch = sys.stdin.read(1)
                     if ch == " ":
                         self.on_toggle_pause()
-                    elif ch in (">", "q"):
+                    elif ch in (">", ".", "n"):
                         self.on_next()
-                    elif ch == "<":
+                    elif ch in ("<", ",", "p"):
                         self.on_prev()
-                    elif ch == "9":
+                    elif ch in ("9", "-"):
                         self.on_volume_down()
-                    elif ch == "0":
+                    elif ch in ("0", "+", "="):
                         self.on_volume_up()
-                    elif ch == "Q":
+                    elif ch in ("q", "Q"):
                         self._running = False
                         self.on_quit()
                         break
