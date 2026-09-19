@@ -19,19 +19,20 @@ import sys
 repo_root = os.path.dirname(os.path.abspath(__file__))
 venv_python = os.path.join(repo_root, ".venv", "bin", "python")
 
-if os.path.exists(venv_python) and os.path.realpath(sys.executable) != os.path.realpath(venv_python):
-    os.execv(venv_python, [venv_python] + sys.argv)
-elif not os.path.exists(venv_python) and shutil.which("uv"):
-    os.execvp("uv", ["uv", "--directory", repo_root, "run", sys.argv[0]] + sys.argv[1:])
+if __name__ == "__main__":
+    if os.path.exists(venv_python) and os.path.realpath(sys.executable) != os.path.realpath(venv_python):
+        os.execv(venv_python, [venv_python] + sys.argv)
+    elif not os.path.exists(venv_python) and shutil.which("uv"):
+        os.execvp("uv", ["uv", "--directory", repo_root, "run", sys.argv[0]] + sys.argv[1:])
 
-# Ensure src/ is on sys.path and remove cwd from sys.path[0] to prevent shadowing
+# Make ytstr.py act as a package proxy if imported accidentally
+src_pkg = os.path.join(repo_root, "src", "ytstr")
+__path__ = [src_pkg]
+
 src_dir = os.path.join(repo_root, "src")
-if sys.path and (sys.path[0] == "" or os.path.abspath(sys.path[0]) == repo_root):
-    sys.path.pop(0)
-if os.path.exists(src_dir) and src_dir not in sys.path:
+if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from ytstr.cli import main
-
 if __name__ == "__main__":
+    from ytstr.cli import main
     sys.exit(main())

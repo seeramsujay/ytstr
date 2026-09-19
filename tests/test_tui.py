@@ -105,7 +105,13 @@ def test_tui_draw_no_crash():
 
 def test_tui_remove_from_queue():
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"),          patch("curses.use_default_colors"),          patch("curses.has_colors", return_value=True),          patch("curses.init_pair"),          patch("curses.color_pair", return_value=0),          patch.object(TUIApp, "_ensure_mpv"),          patch.object(TUIApp, "fetch_recommended_async"):
+    with patch("curses.curs_set"), \
+         patch("curses.use_default_colors"), \
+         patch("curses.has_colors", return_value=True), \
+         patch("curses.init_pair"), \
+         patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
+         patch.object(TUIApp, "fetch_recommended_async"):
         app = TUIApp(stdscr)
         t1 = Track(id="1", title="Track 1")
         t2 = Track(id="2", title="Track 2")
@@ -120,3 +126,41 @@ def test_tui_remove_from_queue():
         app._handle_input(ord('d'))
         assert len(app.queue_tracks) == 2
         assert app.queue_tracks[1].id == "3"
+
+
+def test_tui_auto_dj_handoff():
+    stdscr = make_mock_stdscr()
+    with patch("curses.curs_set"), \
+         patch("curses.use_default_colors"), \
+         patch("curses.has_colors", return_value=True), \
+         patch("curses.init_pair"), \
+         patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
+         patch.object(TUIApp, "fetch_recommended_async"):
+        app = TUIApp(stdscr)
+        app.ipc = MagicMock()
+
+        t1 = Track(id="1", title="Track 1", duration_sec=180.0)
+        t2 = Track(id="2", title="Track 2", duration_sec=200.0)
+        app.now_playing = t1.display_title()
+        app.queue_tracks = [t1, t2]
+        app.current_queue_idx = 0
+        app.duration = 180.0
+        app.time_pos = 100.0
+        app.mode_idx = 0  # Direct Low-RAM
+
+        # Cycle mode to 1 (Light Mix) -> should trigger pending_dj_handoff
+        app._handle_input(ord('m'))
+        assert app.mode_idx == 1
+        assert app.pending_dj_handoff is True
+        assert "DJ engine warming up" in app.status_msg
+
+        # Mock playback nearing end (remaining <= 4.0s)
+        app.time_pos = 177.0
+        with patch.object(app, "play_track_and_start_radio") as mock_play:
+            with patch("os.path.exists", return_value=True):
+                app._update_playback_status()
+                assert app.pending_dj_handoff is False
+                assert mock_play.called
+                args, kwargs = mock_play.call_args
+                assert args[0].id == "2"
