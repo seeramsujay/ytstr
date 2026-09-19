@@ -2,12 +2,15 @@
 DJ streaming player engine with spectral handoff transitions, pydub mixing,
 and bounded hysteresis streaming.
 """
+from __future__ import annotations
+
 import gc
+import logging
 import os
 import subprocess
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from pydub import AudioSegment
 
 from ytstr.audio.dsp import get_audio_chunk, get_audio_duration
@@ -19,10 +22,12 @@ from ytstr.downloader.cache import CacheManager
 from ytstr.downloader.ytdlp import Downloader
 from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process
 
+logger = logging.getLogger(__name__)
+
 # Bounded Hysteresis Streaming Parameters
-STREAM_CHUNK_SEC = 6.0       # Duration of each audio slice written to mpv
-HIGH_WATERMARK_SEC = 22.0    # Maximum unplayed audio buffered ahead in MPV
-LOW_WATERMARK_SEC = 8.0      # Resume writing when buffer drops below this threshold
+STREAM_CHUNK_SEC: float = 6.0       # Duration of each audio slice written to mpv
+HIGH_WATERMARK_SEC: float = 22.0    # Maximum unplayed audio buffered ahead in MPV
+LOW_WATERMARK_SEC: float = 8.0      # Resume writing when buffer drops below this threshold
 
 
 class DJPlayer:
@@ -65,15 +70,15 @@ class DJPlayer:
         self.mpv_process: Optional[subprocess.Popen] = None
         self.ipc: Optional[MPVIPCClient] = None
 
-        # Precomputed transition cache: (from_idx, to_idx) -> (overlap_chunk, eff_fade_ms, trans_type)
+        # Precomputed transition cache: (from_idx, to_idx, overlap_chunk, eff_fade_ms, trans_type)
         self._precomputed_transition: Optional[Tuple[int, int, AudioSegment, int, str]] = None
 
         # Stream timeline mapping for accurate progress tracking
-        # Each entry: {"idx": int, "track": Track, "stream_start_s": float, "stream_end_s": float, "duration": float, "transition": str}
-        self.timeline: List[Dict] = []
+        # Each entry: {"idx": int, "track": Track, "stream_start_s": float, "duration": float, "transition": str}
+        self.timeline: List[Dict[str, Any]] = []
         self.total_written_s = 0.0
 
-    def start(self):
+    def start(self) -> threading.Thread:
         """Launch download prefetcher and audio streaming worker threads."""
         t_down = threading.Thread(target=self._download_worker, daemon=True, name="ytstr-dj-download")
         t_stream = threading.Thread(target=self._stream_worker, daemon=True, name="ytstr-dj-stream")
@@ -82,7 +87,7 @@ class DJPlayer:
         t_stream.start()
         return t_stream
 
-    def append_tracks(self, new_tracks: List[Track]):
+    def append_tracks(self, new_tracks: List[Track]) -> None:
         """Thread-safely append upcoming tracks (e.g. from radio generation)."""
         with self._lock:
             existing_ids = {t.id for t in self.tracks}
@@ -94,12 +99,12 @@ class DJPlayer:
     def remove_track(self, index: int) -> bool:
         """Remove a future track from the upcoming playback queue."""
         with self._lock:
-            if index > self.playing_idx and index < len(self.tracks):
+            if self.playing_idx < index < len(self.tracks):
                 self.tracks.pop(index)
                 return True
         return False
 
-    def _launch_mpv(self):
+    def _launch_mpv(self) -> None:
         """Spawns an MPV instance listening for raw PCM over stdin."""
         if self.mpv_process:
             try:
@@ -109,7 +114,7 @@ class DJPlayer:
         self.mpv_process = spawn_mpv_process(self.ipc_socket, raw_pcm_mode=True)
         self.ipc = MPVIPCClient(self.ipc_socket)
 
-    def _download_worker(self):
+    def _download_worker(self) -> None:
         """Prefetches audio files up to 2 tracks ahead onto disk in the background."""
         while not self._quit_flag:
             with self._lock:
@@ -121,10 +126,7 @@ class DJPlayer:
                 if self.downloaded_idx <= curr_playing + 1:
                     target_idx = self.downloaded_idx + 1
                     with self._lock:
-                        if target_idx < len(self.tracks):
-                            track = self.tracks[target_idx]
-                        else:
-                            track = None
+                        track = self.tracks[target_idx] if target_idx < len(self.tracks) else None
 
                     if track:
                         target_path = self.cache_mgr.get_track_cache_path(target_idx, "opus")
@@ -137,7 +139,7 @@ class DJPlayer:
             else:
                 time.sleep(0.5)
 
-    def _precompute_transition_if_needed(self, curr_idx: int, curr_file: str, curr_dur_s: float):
+    def _precompute_transition_if_needed(self, curr_idx: int, curr_file: str, curr_dur_s: float) -> None:
         """Pre-compute the spectral crossfade before reaching track tail so boundary has zero delay."""
         next_idx = curr_idx + 1
         with self._lock:
@@ -168,74 +170,61 @@ class DJPlayer:
                     trans_type, fade_chunk_out, fade_chunk_in, self.crossfade_ms
                 )
                 self._precomputed_transition = (curr_idx, next_idx, overlap, eff_fade, trans_type)
-            del fade_chunk_out, fade_chunk_in
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Error precomputing transition: %s", e)
 
-    def _stream_worker(self):
-        """Main audio processing and hysteresis streaming loop."""
-        # Wait for first track to start downloading
-        while self.downloaded_idx < 0 and not self._quit_flag:
-            time.sleep(0.1)
-        if self._quit_flag:
-            return
-
+    def _stream_worker(self) -> None:
+        """
+        Active audio streaming loop using Bounded Hysteresis:
+        Pipes 6s raw PCM chunks into MPV until HIGH_WATERMARK (22s) is reached.
+        Waits until MPV playback drains buffer below LOW_WATERMARK (8s) before resuming.
+        """
         self._launch_mpv()
-
         curr_idx = 0
         curr_time_s = 0.0
-        self.total_written_s = 0.0
         pending_overlap: Optional[AudioSegment] = None
 
         while not self._quit_flag:
             with self._lock:
-                if curr_idx >= len(self.tracks):
-                    # End of queue, idle wait for more tracks or exit
-                    time.sleep(0.3)
-                    continue
+                total_tracks = len(self.tracks)
 
-            # Handle user skip forward
+            if curr_idx >= total_tracks:
+                time.sleep(0.5)
+                continue
+
+            # Process user controls
             if self.skip_to_next:
                 self.skip_to_next = False
-                with self._lock:
-                    self.cache_mgr.on_track_finished(curr_idx, self.tracks[curr_idx])
-                    curr_idx += 1
+                self._launch_mpv()
+                curr_idx += 1
                 curr_time_s = 0.0
                 pending_overlap = None
                 self._precomputed_transition = None
-                self._launch_mpv()
-                self.total_written_s = 0.0
-                self.timeline.clear()
                 continue
 
-            # Handle user skip backward
             if self.skip_to_prev:
                 self.skip_to_prev = False
-                with self._lock:
-                    curr_idx = max(0, curr_idx - 1)
+                self._launch_mpv()
+                curr_idx = max(0, curr_idx - 1)
                 curr_time_s = 0.0
                 pending_overlap = None
                 self._precomputed_transition = None
-                self._launch_mpv()
-                self.total_written_s = 0.0
-                self.timeline.clear()
                 continue
 
-            # Handle pause toggle
             if self.toggle_pause:
                 self.toggle_pause = False
                 if self.ipc:
                     self.ipc.cycle_pause()
 
-            # Bounded Hysteresis: throttle if MPV buffer is > HIGH_WATERMARK_SEC ahead
+            # Bounded Hysteresis backpressure control: check MPV playback time
             mpv_time_s = 0.0
             if self.ipc:
-                playback_val = self.ipc.get_property("playback-time")
-                if playback_val is not None:
-                    try:
-                        mpv_time_s = float(playback_val)
-                    except (ValueError, TypeError):
-                        pass
+                try:
+                    pt = self.ipc.get_property("playback-time")
+                    if pt is not None:
+                        mpv_time_s = float(pt)
+                except Exception:
+                    pass
 
             buffered_s = self.total_written_s - mpv_time_s
             if buffered_s > HIGH_WATERMARK_SEC:
@@ -260,7 +249,7 @@ class DJPlayer:
                 continue
 
             with self._lock:
-                is_last = curr_idx == len(self.tracks) - 1
+                is_last = (curr_idx == len(self.tracks) - 1)
                 curr_track = self.tracks[curr_idx]
 
             end_limit_s = track_dur_s if is_last else max(0.0, track_dur_s - self.fade_s)
@@ -310,12 +299,7 @@ class DJPlayer:
                     self._write_pcm_to_mpv(chunk.raw_data)
                     self.total_written_s += len(chunk) / 1000.0
                     del chunk
-                elif pending_overlap is not None:
-                    self._write_pcm_to_mpv(pending_overlap.raw_data)
-                    self.total_written_s += len(pending_overlap) / 1000.0
-                    pending_overlap = None
 
-                # Perform seamless transition into next track without silence
                 if not is_last:
                     # Retrieve precomputed transition or compute immediately
                     if (
@@ -336,7 +320,7 @@ class DJPlayer:
                         continue
 
                     if self._precomputed_transition and self._precomputed_transition[0] == curr_idx:
-                        _, next_i, overlap, eff_fade, trans_type = self._precomputed_transition
+                        _, _, overlap, eff_fade, trans_type = self._precomputed_transition
                         self.last_transition = trans_type
                         self._precomputed_transition = None
 
@@ -358,7 +342,7 @@ class DJPlayer:
 
                 curr_idx += 1
 
-    def _write_pcm_to_mpv(self, raw_bytes: bytes):
+    def _write_pcm_to_mpv(self, raw_bytes: bytes) -> None:
         """Safely write PCM bytes to mpv stdin with backpressure guard."""
         if not self.mpv_process or not self.mpv_process.stdin:
             return
@@ -368,9 +352,10 @@ class DJPlayer:
         except (BrokenPipeError, OSError):
             pass
 
-    def get_playback_status(self) -> Dict:
+    def get_playback_status(self) -> Dict[str, Any]:
         """
         Query current playback position mapped to current track timeline.
+
         Returns:
             dict containing: {
                 'index': int,
@@ -381,18 +366,29 @@ class DJPlayer:
                 'transition': str
             }
         """
+        fallback_track = self.tracks[self.playing_idx] if 0 <= self.playing_idx < len(self.tracks) else None
         if not self.ipc:
-            return {"index": self.playing_idx, "track": None, "time_pos": 0.0, "duration": 0.0, "is_paused": False, "transition": ""}
+            return {
+                "index": self.playing_idx,
+                "track": fallback_track,
+                "time_pos": 0.0,
+                "duration": fallback_track.duration_sec if fallback_track else 0.0,
+                "is_paused": False,
+                "transition": "",
+            }
 
         mpv_time_s = 0.0
         is_paused = False
         try:
             pt = self.ipc.get_property("playback-time")
+            if pt is not None and not isinstance(pt, (int, float, str)):
+                pt = None
             if pt is not None:
                 mpv_time_s = float(pt)
+
             p = self.ipc.get_property("pause")
-            if p is not None:
-                is_paused = bool(p)
+            if p is not None and isinstance(p, bool):
+                is_paused = p
         except Exception:
             pass
 
@@ -419,23 +415,35 @@ class DJPlayer:
                 "transition": active_entry.get("transition", ""),
             }
 
-        with self._lock:
-            curr_track = self.tracks[self.playing_idx] if self.playing_idx < len(self.tracks) else None
         return {
             "index": self.playing_idx,
-            "track": curr_track,
+            "track": fallback_track,
             "time_pos": 0.0,
-            "duration": curr_track.duration_sec if curr_track else 0.0,
+            "duration": fallback_track.duration_sec if fallback_track else 0.0,
             "is_paused": is_paused,
-            "transition": self.last_transition,
+            "transition": "",
         }
 
-    def stop(self):
-        """Terminate mpv and cleanup workers."""
+    def stop(self) -> None:
+        """Clean up threads, subprocesses, and temporary cache."""
         self._quit_flag = True
-        if self.mpv_process:
+        if self.ipc:
             try:
-                self.mpv_process.kill()
+                self.ipc.stop()
+                self.ipc.close()
             except Exception:
                 pass
+            self.ipc = None
+
+        if self.mpv_process:
+            try:
+                if self.mpv_process.stdin:
+                    self.mpv_process.stdin.close()
+                self.mpv_process.terminate()
+                self.mpv_process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.mpv_process.kill()
+                except Exception:
+                    pass
             self.mpv_process = None

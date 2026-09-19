@@ -3,6 +3,8 @@ Terminal User Interface (TUI) for YouTube Music and ytstr.
 Built using standard library curses for zero-dependency, ultra-lightweight performance.
 Integrates direct MPV playback, automatic continuous radio queuing, and library browsing.
 """
+from __future__ import annotations
+
 import curses
 import os
 import signal
@@ -18,13 +20,13 @@ from ytstr.downloader.cache import CacheManager
 from ytstr.downloader.ytdlp import Downloader
 from ytstr.playback.dj_player import DJPlayer
 from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process
+from ytstr.ytm.auth import AuthManager
+from ytstr.ytm.client import YouTubeMusicClient
 
 try:
     from pynput import keyboard as pynput_keyboard
 except ImportError:
     pynput_keyboard = None
-from ytstr.ytm.auth import AuthManager
-from ytstr.ytm.client import YouTubeMusicClient
 
 SOCKET_PATH = f"/tmp/ytstr_tui_mpv_{os.getpid()}.sock"
 
@@ -96,7 +98,8 @@ class TUIApp:
         self._ensure_mpv(raw_pcm_mode=False)
         self.fetch_recommended_async()
 
-    def _setup_curses(self):
+    def _setup_curses(self) -> None:
+        """Initialize curses screen, colors, and input polling options."""
         try:
             curses.curs_set(0)
         except Exception:
@@ -115,7 +118,7 @@ class TUIApp:
             except Exception:
                 pass
 
-    def _ensure_mpv(self, raw_pcm_mode: bool = False):
+    def _ensure_mpv(self, raw_pcm_mode: bool = False) -> None:
         """Ensure background MPV process is active and listening on IPC socket."""
         if self.mpv_process and self.mpv_process.poll() is None:
             return
@@ -125,41 +128,23 @@ class TUIApp:
         except Exception:
             pass
 
-    def _start_global_media_listener(self):
-        """Intercept hardware keyboard media keys (Play/Pause, Next, Prev, etc.)."""
+    def _start_global_media_listener(self) -> None:
+        """Intercept hardware keyboard media keys (Play/Pause, Next, Prev, Volume)."""
         if not pynput_keyboard:
             return
 
         def on_press(key):
             try:
-                # Play / Pause
                 if key in (pynput_keyboard.Key.media_play_pause, pynput_keyboard.Key.f8):
                     self.toggle_pause()
-                # Next Track
                 elif key in (pynput_keyboard.Key.media_next, pynput_keyboard.Key.f9):
-                    if self.dj_player and self.mode_idx in (1, 3):
-                        self.dj_player.skip_to_next = True
-                        self.status_msg = "Skipped to next track (Media Key)."
-                    elif self.ipc:
-                        self.ipc.send_command(["playlist-next"])
-                        self.status_msg = "Skipped to next track (Media Key)."
-                # Previous Track
+                    self._skip_next()
                 elif key in (pynput_keyboard.Key.media_previous, pynput_keyboard.Key.f7):
-                    if self.dj_player and self.mode_idx in (1, 3):
-                        self.dj_player.skip_to_prev = True
-                        self.status_msg = "Skipped to previous track (Media Key)."
-                    elif self.ipc:
-                        self.ipc.send_command(["playlist-prev"])
-                        self.status_msg = "Skipped to previous track (Media Key)."
-                # Volume
+                    self._skip_prev()
                 elif key == getattr(pynput_keyboard.Key, 'media_volume_up', None):
-                    if self.ipc:
-                        self.ipc.adjust_volume(5)
-                        self.status_msg = "Volume +5%"
+                    self._adjust_volume(5)
                 elif key == getattr(pynput_keyboard.Key, 'media_volume_down', None):
-                    if self.ipc:
-                        self.ipc.adjust_volume(-5)
-                        self.status_msg = "Volume -5%"
+                    self._adjust_volume(-5)
             except Exception:
                 pass
 
@@ -170,7 +155,7 @@ class TUIApp:
         except Exception:
             pass
 
-    def cleanup(self):
+    def cleanup(self) -> None:
         """Clean up MPV, workers, and temporary sockets on exit."""
         if self.global_listener:
             try:
@@ -185,125 +170,147 @@ class TUIApp:
             except OSError:
                 pass
 
-    def _handle_input(self, ch: int):
+    def _handle_input(self, ch: int) -> None:
+        """Top-level key dispatcher delegating to specialized handlers."""
+        if self._handle_navigation_keys(ch):
+            return
+        if self._handle_playback_keys(ch):
+            return
+        self._handle_action_keys(ch)
+
+    def _handle_navigation_keys(self, ch: int) -> bool:
+        """Handle screen navigation, scrolling, and tab switching."""
         # Back navigation from playlist drill-down: Backspace, Esc, or 'h'
         if self.in_playlist_name and ch in (127, 8, 27, ord('h'), ord('H'), curses.KEY_BACKSPACE):
             self._exit_playlist_view()
-            return
+            return True
 
         # Direct tab switching: 1-6
         if ch in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6')):
-            idx = ch - ord('1')
-            self._switch_tab(idx)
-            return
-        elif ch == 9:  # Tab key
+            self._switch_tab(ch - ord('1'))
+            return True
+        if ch == 9:  # Tab key
             self._switch_tab((self.current_tab + 1) % len(TAB_NAMES))
-            return
-        elif ch == curses.KEY_BTAB:  # Shift-Tab
+            return True
+        if ch == curses.KEY_BTAB:  # Shift-Tab
             self._switch_tab((self.current_tab - 1) % len(TAB_NAMES))
-            return
-
-        # Quick switch to Queue tab with 'u'
-        elif ch in (ord('u'), ord('U')):
+            return True
+        if ch in (ord('u'), ord('U')):
             self._switch_tab(TAB_QUEUE)
-            return
+            return True
 
         # Up / Down / PageUp / PageDown / j / k
         if ch in (curses.KEY_UP, ord('k'), ord('K')):
             self._move_selection(-1)
-        elif ch in (curses.KEY_DOWN, ord('j'), ord('J')):
+            return True
+        if ch in (curses.KEY_DOWN, ord('j'), ord('J')):
             self._move_selection(1)
-        elif ch == curses.KEY_PPAGE:
+            return True
+        if ch == curses.KEY_PPAGE:
             self._move_selection(-10)
-        elif ch == curses.KEY_NPAGE:
+            return True
+        if ch == curses.KEY_NPAGE:
             self._move_selection(10)
+            return True
 
-        # Fast Forward / Rewind: Left/Right Arrow (5s), Shift+Left/Shift+Right or [/] (30s)
-        elif ch in (curses.KEY_RIGHT, ord('l'), ord('L')):
-            if self.ipc:
-                self.ipc.send_command(["seek", 5, "relative"])
-                self.time_pos = min(self.duration, self.time_pos + 5)
-                self.status_msg = "Fast Forward +5s (→)"
-        elif ch in (curses.KEY_LEFT, ord('h'), ord('H')):
-            if self.ipc:
-                self.ipc.send_command(["seek", -5, "relative"])
-                self.time_pos = max(0.0, self.time_pos - 5)
-                self.status_msg = "Rewind -5s (←)"
-        elif ch in (ord(']'), curses.KEY_SRIGHT):
-            if self.ipc:
-                self.ipc.send_command(["seek", 30, "relative"])
-                self.time_pos = min(self.duration, self.time_pos + 30)
-                self.status_msg = "Fast Forward +30s (])"
-        elif ch in (ord('['), curses.KEY_SLEFT):
-            if self.ipc:
-                self.ipc.send_command(["seek", -30, "relative"])
-                self.time_pos = max(0.0, self.time_pos - 30)
-                self.status_msg = "Rewind -30s ([)"
+        return False
 
-        # Enter / Return -> Activate
-        elif ch in (10, 13, curses.KEY_ENTER):
+    def _handle_playback_keys(self, ch: int) -> bool:
+        """Handle seeking, volume, pause, track skipping, and mode toggling."""
+        if ch in (10, 13, curses.KEY_ENTER):
             self._activate_selected()
-
-        # Play entire playlist directly: Shift+P
-        elif ch in (ord('P'),):
-            self._play_playlist_direct()
-
-        # Space -> Pause / Resume
-        elif ch == ord(' '):
+            return True
+        if ch == ord(' '):
             self.toggle_pause()
-
-        # Search / Save
-        elif ch == ord('/'):
-            self._prompt_search()
-        elif ch in (ord('s'), ord('S')):
-            self._save_selected()
-
-        # Remove / Skip song from upcoming radio queue: 'd', 'D', or Delete
-        elif ch in (ord('d'), ord('D'), curses.KEY_DC):
-            self._remove_selected_from_queue()
-
-        # Radio force trigger
-        elif ch in (ord('r'), ord('R')):
-            self._start_radio_selected()
-
-        # Cycle playback mode & manage live handoff
-        elif ch in (ord('m'), ord('M')):
+            return True
+        if ch in (curses.KEY_RIGHT, ord('l'), ord('L')):
+            self._seek(5)
+            return True
+        if ch in (curses.KEY_LEFT, ord('h'), ord('H')):
+            self._seek(-5)
+            return True
+        if ch in (ord(']'), curses.KEY_SRIGHT):
+            self._seek(30)
+            return True
+        if ch in (ord('['), curses.KEY_SLEFT):
+            self._seek(-30)
+            return True
+        if ch in (ord('>'), ord('.'), ord('n'), ord('N')):
+            self._skip_next()
+            return True
+        if ch in (ord('<'), ord(','), ord('p'), ord('P')):
+            self._skip_prev()
+            return True
+        if ch in (ord('0'), ord('+'), ord('=')):
+            self._adjust_volume(5)
+            return True
+        if ch in (ord('9'), ord('-'), ord('_')):
+            self._adjust_volume(-5)
+            return True
+        if ch in (ord('m'), ord('M')):
             self._handle_mode_switch()
-
-        # Skip Next: '>' or '.' or 'n' or 'N'
-        elif ch in (ord('>'), ord('.'), ord('n'), ord('N')):
-            if self.dj_player and self.mode_idx in (1, 3):
-                self.dj_player.skip_to_next = True
-                self.status_msg = "Skipped to next track (>)."
-            elif self.ipc:
-                self.ipc.send_command(["playlist-next"])
-                self.status_msg = "Skipped to next track (>)."
-
-        # Skip Previous: '<' or ',' or 'p' or 'P'
-        elif ch in (ord('<'), ord(','), ord('p'), ord('P')):
-            if self.dj_player and self.mode_idx in (1, 3):
-                self.dj_player.skip_to_prev = True
-                self.status_msg = "Skipped to previous track (<)."
-            elif self.ipc:
-                self.ipc.send_command(["playlist-prev"])
-                self.status_msg = "Skipped to previous track (<)."
-
-        # Volume: 9/0 (mpv standard) as well as +/-
-        elif ch in (ord('0'), ord('+'), ord('=')):
-            if self.ipc:
-                self.ipc.adjust_volume(5)
-                self.status_msg = "Volume +5%"
-        elif ch in (ord('9'), ord('-'), ord('_')):
-            if self.ipc:
-                self.ipc.adjust_volume(-5)
-                self.status_msg = "Volume -5%"
-
-        # Stop
-        elif ch in (ord('x'), ord('X')):
+            return True
+        if ch in (ord('x'), ord('X')):
             self.stop_playback()
             self.status_msg = "Playback stopped."
+            return True
 
-    def _handle_mode_switch(self):
+        return False
+
+    def _handle_action_keys(self, ch: int) -> bool:
+        """Handle search, save, queue drop, and playlist bulk play."""
+        if ch in (ord('P'),):
+            self._play_playlist_direct()
+            return True
+        if ch == ord('/'):
+            self._prompt_search()
+            return True
+        if ch in (ord('s'), ord('S')):
+            self._save_selected()
+            return True
+        if ch in (ord('d'), ord('D'), curses.KEY_DC):
+            self._remove_selected_from_queue()
+            return True
+        if ch in (ord('r'), ord('R')):
+            self._start_radio_selected()
+            return True
+
+        return False
+
+    def _seek(self, seconds: float) -> None:
+        """Seek forward or backward by the specified amount."""
+        if self.ipc:
+            self.ipc.seek(seconds, "relative")
+            self.time_pos = max(0.0, min(self.duration, self.time_pos + seconds))
+            direction = "→" if seconds > 0 else "←"
+            self.status_msg = f"Seek {seconds:+d}s ({direction})"
+
+    def _skip_next(self) -> None:
+        """Skip to next track in queue or playlist."""
+        if self.dj_player and self.mode_idx in (1, 3):
+            self.dj_player.skip_to_next = True
+            self.status_msg = "Skipped to next track (>)."
+        elif self.ipc:
+            self.ipc.playlist_next()
+            self.status_msg = "Skipped to next track (>)."
+
+    def _skip_prev(self) -> None:
+        """Skip to previous track in queue or playlist."""
+        if self.dj_player and self.mode_idx in (1, 3):
+            self.dj_player.skip_to_prev = True
+            self.status_msg = "Skipped to previous track (<)."
+        elif self.ipc:
+            self.ipc.playlist_prev()
+            self.status_msg = "Skipped to previous track (<)."
+
+    def _adjust_volume(self, delta: float) -> None:
+        """Adjust mpv audio volume."""
+        if self.ipc:
+            self.ipc.adjust_volume(delta)
+            sign = "+" if delta > 0 else ""
+            self.status_msg = f"Volume {sign}{int(delta)}%"
+
+    def _handle_mode_switch(self) -> None:
         """Cycle playback mode and manage live handoff between Direct and DJ engines."""
         self.mode_idx = (self.mode_idx + 1) % len(MODES)
         mode_label = MODE_LABELS[self.mode_idx]
@@ -318,11 +325,9 @@ class TUIApp:
                 self.dj_player.light_mix = (self.mode_idx == 1)
                 self.status_msg = f"🎛️ Switched to {mode_label}"
             else:
-                # Direct mode -> DJ mode: Keep current song playing!
                 self.pending_dj_handoff = True
                 self.status_msg = f"🎛️ Switched to {mode_label}: Song continuing, DJ engine warming up for handoff..."
 
-                # Prefetch next track in background so boundary has zero delay
                 def warm_up():
                     next_idx = self.current_queue_idx + 1
                     if 0 <= next_idx < len(self.queue_tracks):
@@ -337,7 +342,8 @@ class TUIApp:
             else:
                 self.status_msg = f"Switched mode to: {mode_label}"
 
-    def _switch_tab(self, new_tab: int):
+    def _switch_tab(self, new_tab: int) -> None:
+        """Change active UI tab and load its contents if empty."""
         self.current_tab = new_tab
         self.selected_idx = 0
         self.scroll_offset = 0
@@ -348,65 +354,47 @@ class TUIApp:
                 self.fetch_recommended_async()
             else:
                 self._rebuild_items_from_sections(self.recommended_sections)
-
         elif new_tab == TAB_PLAYLISTS:
             if not self.my_playlists:
                 self.fetch_playlists_async()
             else:
                 self.items = list(self.my_playlists)
-
         elif new_tab == TAB_LIKED:
             if not self.liked_tracks:
                 self.fetch_liked_async()
             else:
                 self.items = list(self.liked_tracks)
-
         elif new_tab == TAB_QUEUE:
             self.items = list(self.queue_tracks)
-            if self.current_queue_idx >= 0 and self.current_queue_idx < len(self.items):
+            if 0 <= self.current_queue_idx < len(self.items):
                 self.selected_idx = self.current_queue_idx
                 self.scroll_offset = max(0, self.selected_idx - 5)
-
         elif new_tab == TAB_SEARCH:
             self.items = list(self.search_results)
             if not self.items and not self.search_query:
                 self.status_msg = "Press '/' to search YouTube Music catalog."
-
         elif new_tab == TAB_LOGIN:
             self._build_login_items()
 
-    def _move_selection(self, delta: int):
+    def _move_selection(self, delta: int) -> None:
+        """Move cursor up or down within item boundaries."""
         if not self.items:
             return
         new_idx = self.selected_idx + delta
         self.selected_idx = max(0, min(new_idx, len(self.items) - 1))
 
-    def _activate_selected(self):
+    def _activate_selected(self) -> None:
+        """Perform primary action on currently selected item."""
         if not self.items or self.selected_idx >= len(self.items):
             return
 
         item = self.items[self.selected_idx]
 
         if self.current_tab == TAB_LOGIN:
-            action_code = item.get("action") if isinstance(item, dict) else None
-            if action_code == "auto_login":
-                self.status_msg = "Extracting session cookies from installed browsers (Zen, Firefox, Chrome...)..."
-                self._run_browser_login_async("auto")
-            elif action_code == "zen_login":
-                self.status_msg = "Extracting session cookies from Zen Browser..."
-                self._run_browser_login_async("zen")
-            elif action_code == "open_browser":
-                self.auth_mgr.open_browser_for_login()
-                self.status_msg = "Opened https://music.youtube.com in default browser."
-            elif action_code == "logout":
-                self.auth_mgr.logout()
-                self.client._init_ytm()
-                self.status_msg = "Logged out. Credentials cleared."
-                self._build_login_items()
+            self._handle_login_action(item)
             return
 
         if self.current_tab == TAB_QUEUE and isinstance(item, Track):
-            # Jump directly to track in the active queue
             target_idx = self.selected_idx
             if self.dj_player:
                 self.stop_playback(keep_queue=True)
@@ -422,20 +410,32 @@ class TUIApp:
 
         if isinstance(item, Track):
             self.play_track_and_start_radio(item)
-
         elif isinstance(item, dict) and item.get("type") == "playlist":
-            pl_id = item.get("id")
-            title = item.get("title", "Playlist")
-            self._open_playlist_drilldown(pl_id, title)
-
+            self._open_playlist_drilldown(item.get("id", ""), item.get("title", "Playlist"))
         elif isinstance(item, tuple) and item[0] == "saved":
             _, name, url = item
             self._play_external_target(url, f"Saved: {name}")
 
-    def play_track_and_start_radio(self, track: Track, existing_queue: Optional[List[Track]] = None):
-        """
-        Play track immediately in MPV or DJPlayer and automatically queue its radio recommendations.
-        """
+    def _handle_login_action(self, item: Any) -> None:
+        """Execute selected authentication action."""
+        action_code = item.get("action") if isinstance(item, dict) else None
+        if action_code == "auto_login":
+            self.status_msg = "Extracting session cookies from installed browsers (Zen, Firefox, Chrome...)..."
+            self._run_browser_login_async("auto")
+        elif action_code == "zen_login":
+            self.status_msg = "Extracting session cookies from Zen Browser..."
+            self._run_browser_login_async("zen")
+        elif action_code == "open_browser":
+            self.auth_mgr.open_browser_for_login()
+            self.status_msg = "Opened https://music.youtube.com in default browser."
+        elif action_code == "logout":
+            self.auth_mgr.logout()
+            self.client._init_ytm()
+            self.status_msg = "Logged out. Credentials cleared."
+            self._build_login_items()
+
+    def play_track_and_start_radio(self, track: Track, existing_queue: Optional[List[Track]] = None) -> None:
+        """Play track immediately in MPV or DJPlayer and automatically queue its radio recommendations."""
         self.stop_playback(keep_queue=False)
         self.now_playing = track.display_title()
         self.next_playing = "Loading radio queue..." if not existing_queue else (existing_queue[1].display_title() if len(existing_queue) > 1 else None)
@@ -480,7 +480,6 @@ class TUIApp:
             def worker():
                 radio_tracks = self.client.get_watch_playlist_tracks(track_id, limit=35)
                 if radio_tracks:
-                    # Deduplicate against seed track
                     filtered = [t for t in radio_tracks if t.id != track_id]
                     self.queue_tracks.extend(filtered)
                     if self.dj_player:
@@ -500,7 +499,7 @@ class TUIApp:
 
             threading.Thread(target=worker, daemon=True).start()
 
-    def _on_dj_track_change(self, idx: int, track: Track, transition: str = ""):
+    def _on_dj_track_change(self, idx: int, track: Track, transition: str = "") -> None:
         """Callback from DJ engine when a new track boundary is reached."""
         self.current_queue_idx = idx
         self.now_playing = track.display_title()
@@ -514,7 +513,7 @@ class TUIApp:
         if self.current_tab == TAB_QUEUE:
             self.items = list(self.queue_tracks)
 
-    def _update_next_track(self):
+    def _update_next_track(self) -> None:
         """Update next_playing label based on queue position."""
         next_idx = self.current_queue_idx + 1
         if 0 <= next_idx < len(self.queue_tracks):
@@ -522,7 +521,7 @@ class TUIApp:
         else:
             self.next_playing = None
 
-    def _open_playlist_drilldown(self, playlist_id: str, title: str):
+    def _open_playlist_drilldown(self, playlist_id: str, title: str) -> None:
         """Fetch tracks inside a playlist and view them interactively."""
         self.is_loading = True
         self.loading_text = f"Opening '{title}'..."
@@ -545,7 +544,8 @@ class TUIApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _exit_playlist_view(self):
+    def _exit_playlist_view(self) -> None:
+        """Return from playlist track list to playlist view."""
         if self.playlist_back_items:
             self.items = self.playlist_back_items
             self.selected_idx = self.playlist_back_selected
@@ -553,13 +553,13 @@ class TUIApp:
         self.in_playlist_name = None
         self.status_msg = "Back to playlists."
 
-    def _play_playlist_direct(self):
+    def _play_playlist_direct(self) -> None:
         """Play entire playlist: load track 1 and queue the rest."""
         if not self.items or self.selected_idx >= len(self.items):
             return
         item = self.items[self.selected_idx]
         if isinstance(item, dict) and item.get("type") == "playlist":
-            pl_id = item.get("id")
+            pl_id = item.get("id", "")
             title = item.get("title", "Playlist")
             self.status_msg = f"Queuing playlist '{title}'..."
 
@@ -574,19 +574,18 @@ class TUIApp:
 
             threading.Thread(target=worker, daemon=True).start()
 
-    def _play_external_target(self, target: str, title: str):
+    def _play_external_target(self, target: str, title: str) -> None:
         """Fallback to direct MPV playback for custom target URLs."""
         self._ensure_mpv(raw_pcm_mode=False)
         if self.ipc:
             self.ipc.load_file(target, mode="replace")
 
-    def _remove_selected_from_queue(self):
+    def _remove_selected_from_queue(self) -> None:
         """Remove/skip selected song from upcoming radio queue."""
         if not self.queue_tracks:
             self.status_msg = "Queue is empty."
             return
 
-        # Determine target index in queue: if on Queue tab, use selected_idx, else target next upcoming track
         target_idx = -1
         if self.current_tab == TAB_QUEUE:
             if 0 <= self.selected_idx < len(self.queue_tracks):
@@ -609,12 +608,12 @@ class TUIApp:
             if self.dj_player:
                 self.dj_player.skip_to_next = True
             elif self.ipc:
-                self.ipc.send_command(["playlist-next"])
+                self.ipc.playlist_next()
             del self.queue_tracks[target_idx]
             self.status_msg = f"Removed currently playing '{title[:25]}' and advanced."
         else:
             if self.ipc and not self.dj_player:
-                self.ipc.send_command(["playlist-remove", target_idx])
+                self.ipc.playlist_remove(target_idx)
             del self.queue_tracks[target_idx]
             if target_idx < self.current_queue_idx:
                 self.current_queue_idx -= 1
@@ -625,14 +624,16 @@ class TUIApp:
             self.items = list(self.queue_tracks)
             self.selected_idx = min(self.selected_idx, max(0, len(self.items) - 1))
 
-    def _start_radio_selected(self):
+    def _start_radio_selected(self) -> None:
+        """Start a fresh radio station based on selected track."""
         if not self.items or self.selected_idx >= len(self.items):
             return
         item = self.items[self.selected_idx]
         if isinstance(item, Track):
             self.play_track_and_start_radio(item)
 
-    def _save_selected(self):
+    def _save_selected(self) -> None:
+        """Download currently selected track to ~/Music."""
         if not self.items or self.selected_idx >= len(self.items):
             return
         item = self.items[self.selected_idx]
@@ -648,7 +649,7 @@ class TUIApp:
 
             threading.Thread(target=worker, daemon=True).start()
 
-    def _prompt_search(self):
+    def _prompt_search(self) -> None:
         """Open curses line-input prompt to search YouTube Music."""
         curses.echo()
         curses.curs_set(1)
@@ -686,7 +687,8 @@ class TUIApp:
         else:
             self.status_msg = "Search cancelled."
 
-    def _build_login_items(self):
+    def _build_login_items(self) -> None:
+        """Populate items for account tab."""
         is_auth = self.auth_mgr.is_authenticated()
         self.items = [
             {"title": "⚡ 1-Click Auto-Detect Login (Zen, Chrome, Firefox...)", "action": "auto_login", "desc": "Imports session cookies from installed browser profiles automatically"},
@@ -696,7 +698,8 @@ class TUIApp:
         if is_auth:
             self.items.append({"title": "🚪 Log Out / Clear Saved Credentials", "action": "logout", "desc": "Delete cached headers and reset to anonymous session"})
 
-    def _run_browser_login_async(self, browser_name: str):
+    def _run_browser_login_async(self, browser_name: str) -> None:
+        """Run browser cookie extraction in background."""
         self.is_loading = True
         self.loading_text = f"Importing session cookies ({browser_name})..."
 
@@ -713,7 +716,8 @@ class TUIApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def fetch_recommended_async(self):
+    def fetch_recommended_async(self) -> None:
+        """Fetch personalized home feed sections."""
         self.is_loading = True
         self.loading_text = "Fetching personalized recommendations..."
 
@@ -730,7 +734,8 @@ class TUIApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _rebuild_items_from_sections(self, sections: List[Dict[str, Any]]):
+    def _rebuild_items_from_sections(self, sections: List[Dict[str, Any]]) -> None:
+        """Flatten nested feed sections into item list."""
         flattened: List[Any] = []
         for sec in sections:
             title = sec.get("title", "Section")
@@ -741,7 +746,8 @@ class TUIApp:
         self.items = flattened
         self.selected_idx = 1 if len(flattened) > 1 else 0
 
-    def fetch_playlists_async(self):
+    def fetch_playlists_async(self) -> None:
+        """Fetch user playlists from YouTube Music."""
         self.is_loading = True
         self.loading_text = "Fetching library playlists..."
 
@@ -755,7 +761,8 @@ class TUIApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def fetch_liked_async(self):
+    def fetch_liked_async(self) -> None:
+        """Fetch user liked songs."""
         self.is_loading = True
         self.loading_text = "Fetching Liked Songs..."
 
@@ -769,18 +776,8 @@ class TUIApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _load_saved_playlists(self):
-        if not self.saved_local_playlists and os.path.exists(PLAYLIST_FILE):
-            try:
-                with open(PLAYLIST_FILE, "r") as f:
-                    for line in f:
-                        parts = line.strip().split("|", 1)
-                        if len(parts) == 2:
-                            self.saved_local_playlists.append((parts[0].strip(), parts[1].strip()))
-            except Exception:
-                pass
-
-    def toggle_pause(self):
+    def toggle_pause(self) -> None:
+        """Toggle play/pause state across direct and DJ engines."""
         if self.dj_player:
             self.dj_player.toggle_pause = True
             self.is_paused = not self.is_paused
@@ -790,7 +787,8 @@ class TUIApp:
             self.is_paused = not self.is_paused
             self.status_msg = "Paused." if self.is_paused else "Resumed."
 
-    def stop_playback(self, keep_queue: bool = False):
+    def stop_playback(self, keep_queue: bool = False) -> None:
+        """Stop audio playback and clean up active engines."""
         if self.dj_player:
             try:
                 self.dj_player.stop()
@@ -801,14 +799,19 @@ class TUIApp:
         if self.ipc and os.path.exists(SOCKET_PATH):
             try:
                 self.ipc.stop()
+                self.ipc.close()
             except Exception:
                 pass
 
         if self.mpv_process:
             try:
                 self.mpv_process.terminate()
+                self.mpv_process.wait(timeout=0.5)
             except Exception:
-                pass
+                try:
+                    self.mpv_process.kill()
+                except Exception:
+                    pass
             self.mpv_process = None
 
         if not keep_queue:
@@ -820,12 +823,12 @@ class TUIApp:
             self.time_pos = 0.0
             self.duration = 0.0
 
-    def _update_playback_status(self):
+    def _update_playback_status(self) -> None:
+        """Update playback time, duration, and track synchronization from MPV or DJPlayer."""
         if not os.path.exists(SOCKET_PATH):
             return
 
         if self.dj_player and self.mode_idx in (1, 3):
-            # DJ Mode active
             st = self.dj_player.get_playback_status()
             self.time_pos = st["time_pos"]
             self.duration = st["duration"]
@@ -842,29 +845,38 @@ class TUIApp:
 
         # Direct MPV mode
         try:
-            t = self.ipc.get_property("time-pos")
-            d = self.ipc.get_property("duration")
+            pt = self.ipc.get_property("time-pos")
+            if pt is not None and not isinstance(pt, (int, float, str)):
+                pt = None
+            if pt is not None:
+                self.time_pos = max(0.0, float(pt))
+
+            dur = self.ipc.get_property("duration")
+            if dur is not None and not isinstance(dur, (int, float, str)):
+                dur = None
+            if dur is not None:
+                d_val = float(dur)
+                if d_val > 0:
+                    self.duration = d_val
+
             p = self.ipc.get_property("pause")
+            if p is not None and isinstance(p, bool):
+                self.is_paused = p
+
             pos = self.ipc.get_property("playlist-pos")
-
-            if t is not None:
-                self.time_pos = float(t)
-            if d is not None:
-                self.duration = float(d)
-            if p is not None:
-                self.is_paused = bool(p)
-
-            # Auto-detect track advancement in MPV's queue
-            if pos is not None and isinstance(pos, int) and pos >= 0:
-                if pos != self.current_queue_idx and pos < len(self.queue_tracks):
+            if pos is not None and isinstance(pos, int):
+                if pos >= 0 and pos != self.current_queue_idx and pos < len(self.queue_tracks):
                     self.current_queue_idx = pos
                     current_track = self.queue_tracks[pos]
                     self.now_playing = current_track.display_title()
                     self._update_next_track()
                     if self.current_tab == TAB_QUEUE:
                         self.items = list(self.queue_tracks)
+        except Exception:
+            pass
 
-            # Check for pending DJ handoff as current track nears its end
+        # Check for pending DJ handoff as current track nears its end
+        try:
             if self.pending_dj_handoff and self.duration > 0:
                 remaining = self.duration - self.time_pos
                 next_idx = self.current_queue_idx + 1
@@ -872,14 +884,13 @@ class TUIApp:
                     self.pending_dj_handoff = False
                     next_track = self.queue_tracks[next_idx]
                     self.status_msg = f"🎛️ Auto-DJ handoff: Transitioning to {next_track.display_title()}..."
-                    # Seamlessly hand off to DJ engine with remaining queue
                     self.stop_playback(keep_queue=True)
                     self.current_queue_idx = next_idx
                     self.play_track_and_start_radio(next_track, existing_queue=self.queue_tracks[next_idx:])
         except Exception:
             pass
 
-    def _draw(self):
+    def _draw(self) -> None:
         """Render the complete TUI screen."""
         self.stdscr.erase()
         max_y, max_x = self.stdscr.getmaxyx()
@@ -888,7 +899,15 @@ class TUIApp:
             self.stdscr.refresh()
             return
 
-        # 1. Header Bar
+        self._draw_header(max_x)
+        self._draw_tabs(max_x)
+        self._draw_content(max_y, max_x)
+        self._draw_playback_bar(max_y, max_x)
+        self._draw_footer(max_y, max_x)
+        self.stdscr.refresh()
+
+    def _draw_header(self, max_x: int) -> None:
+        """Render top branding and authentication badge."""
         auth_status = "Logged In ✓" if self.auth_mgr.is_authenticated() else "Not Logged In"
         auth_pair = curses.color_pair(3) if self.auth_mgr.is_authenticated() else curses.color_pair(5)
 
@@ -903,7 +922,8 @@ class TUIApp:
             self.stdscr.addstr(0, max_x - len(header_right), header_right, auth_pair)
         self.stdscr.attroff(curses.A_BOLD)
 
-        # 2. Tabs Row or Drill-down Breadcrumb
+    def _draw_tabs(self, max_x: int) -> None:
+        """Render interactive navigation tabs or breadcrumbs."""
         if self.in_playlist_name:
             tab_str = f" 📁 My Playlists > 🎵 {self.in_playlist_name} (Press Backspace or Esc to return) "
             self.stdscr.addstr(1, 0, tab_str[:max_x - 1], curses.A_REVERSE | curses.color_pair(4))
@@ -916,10 +936,10 @@ class TUIApp:
                     tab_str += f" {name}   "
             self.stdscr.addstr(1, 0, tab_str[:max_x - 1], curses.A_REVERSE | curses.color_pair(4))
 
-        # 3. Separator
         self.stdscr.addstr(2, 0, "─" * (max_x - 1), curses.color_pair(6))
 
-        # 4. Content Area
+    def _draw_content(self, max_y: int, max_x: int) -> None:
+        """Render scrollable items in the content area."""
         content_top = 3
         content_bottom = max_y - 4
         content_height = content_bottom - content_top
@@ -927,56 +947,59 @@ class TUIApp:
         if self.is_loading:
             loading_msg = f"⏳ {self.loading_text}"
             self.stdscr.addstr(content_top + 2, max(0, (max_x - len(loading_msg)) // 2), loading_msg, curses.color_pair(5) | curses.A_BOLD)
+            return
 
-        elif not self.items:
+        if not self.items:
             empty_msg = "No items available. Press '1' to refresh or '6' to login."
             if self.current_tab == TAB_SEARCH and not self.search_query:
                 empty_msg = "Press '/' to search YouTube Music tracks and albums."
             self.stdscr.addstr(content_top + 2, max(0, (max_x - len(empty_msg)) // 2), empty_msg, curses.color_pair(6))
+            return
 
-        else:
-            if self.selected_idx < self.scroll_offset:
-                self.scroll_offset = self.selected_idx
-            elif self.selected_idx >= self.scroll_offset + content_height:
-                self.scroll_offset = self.selected_idx - content_height + 1
+        if self.selected_idx < self.scroll_offset:
+            self.scroll_offset = self.selected_idx
+        elif self.selected_idx >= self.scroll_offset + content_height:
+            self.scroll_offset = self.selected_idx - content_height + 1
 
-            for row_idx in range(content_height):
-                item_idx = self.scroll_offset + row_idx
-                if item_idx >= len(self.items):
-                    break
+        for row_idx in range(content_height):
+            item_idx = self.scroll_offset + row_idx
+            if item_idx >= len(self.items):
+                break
 
-                y = content_top + row_idx
-                item = self.items[item_idx]
-                is_sel = (item_idx == self.selected_idx)
+            y = content_top + row_idx
+            item = self.items[item_idx]
+            is_sel = (item_idx == self.selected_idx)
 
-                line_str = ""
-                attr = curses.A_NORMAL
+            line_str = ""
+            attr = curses.A_NORMAL
 
-                if isinstance(item, dict) and item.get("type") == "section_header":
-                    line_str = f"── {item.get('title')} ──"
-                    attr = curses.A_BOLD | curses.color_pair(4)
-                elif isinstance(item, Track):
-                    prefix = " ▶ " if self.now_playing and item.title in self.now_playing else "   "
-                    line_str = f"{prefix}{item.display_title()}"
-                    attr = curses.color_pair(2) if is_sel else (curses.color_pair(3) if "▶" in prefix else curses.color_pair(6))
-                elif isinstance(item, dict) and item.get("type") == "playlist":
-                    line_str = f" 📁 {item.get('title', 'Playlist')} ({item.get('count', '?')} tracks)"
-                    attr = curses.color_pair(2) if is_sel else curses.color_pair(4)
-                elif isinstance(item, dict) and "action" in item:
-                    line_str = f" {item.get('title')} — {item.get('desc')}"
-                    attr = curses.color_pair(2) if is_sel else curses.color_pair(6)
-                elif isinstance(item, tuple) and len(item) == 2:
-                    name, url = item
-                    line_str = f" ★ {name} ({url})"
-                    attr = curses.color_pair(2) if is_sel else curses.color_pair(6)
+            if isinstance(item, dict) and item.get("type") == "section_header":
+                line_str = f"── {item.get('title', 'Section')} ──"
+                attr = curses.A_BOLD | curses.color_pair(4)
+            elif isinstance(item, Track):
+                is_current = bool(self.now_playing and item.title and item.title in self.now_playing)
+                prefix = " ▶ " if is_current else "   "
+                line_str = f"{prefix}{item.display_title()}"
+                attr = curses.color_pair(2) if is_sel else (curses.color_pair(3) if is_current else curses.color_pair(6))
+            elif isinstance(item, dict) and item.get("type") == "playlist":
+                line_str = f" 📁 {item.get('title', 'Playlist')} ({item.get('count', '?')} tracks)"
+                attr = curses.color_pair(2) if is_sel else curses.color_pair(4)
+            elif isinstance(item, dict) and "action" in item:
+                line_str = f" {item.get('title', '')} — {item.get('desc', '')}"
+                attr = curses.color_pair(2) if is_sel else curses.color_pair(6)
+            elif isinstance(item, tuple) and len(item) == 2:
+                name, url = item
+                line_str = f" ★ {name} ({url})"
+                attr = curses.color_pair(2) if is_sel else curses.color_pair(6)
 
-                line_str = line_str.ljust(max_x - 1)[:max_x - 1]
-                if is_sel:
-                    self.stdscr.addstr(y, 0, line_str, curses.A_REVERSE | curses.A_BOLD)
-                else:
-                    self.stdscr.addstr(y, 0, line_str, attr)
+            line_str = line_str.ljust(max_x - 1)[:max_x - 1]
+            if is_sel:
+                self.stdscr.addstr(y, 0, line_str, curses.A_REVERSE | curses.A_BOLD)
+            else:
+                self.stdscr.addstr(y, 0, line_str, attr)
 
-        # 5. Playback Bar (Above Bottom Separator)
+    def _draw_playback_bar(self, max_y: int, max_x: int) -> None:
+        """Render active playback bar, progress slider, and upcoming track label."""
         play_bar_y = max_y - 4
         self.stdscr.addstr(play_bar_y, 0, "─" * (max_x - 1), curses.color_pair(6))
 
@@ -999,16 +1022,16 @@ class TUIApp:
             self.stdscr.addstr(info_y, 0, f" Status: {self.status_msg}"[:max_x - 1], curses.color_pair(5))
             self.stdscr.addstr(max_y - 2, 0, " " * (max_x - 1))
 
-        # 6. Controls Footer
+    def _draw_footer(self, max_y: int, max_x: int) -> None:
+        """Render keybindings footer bar."""
         footer_y = max_y - 1
         footer_str = " [Enter] Play/Drill  [Space] Pause  [←/→] Seek  [>/<] Skip  [d] Drop  [r] Radio  [m] Mode  [/] Search  [q] Quit "
         self.stdscr.addstr(footer_y, 0, footer_str[:max_x - 1], curses.A_REVERSE | curses.color_pair(4))
 
-        self.stdscr.refresh()
-
     def _render_progress_bar(self, width: int = 20) -> str:
-        if self.duration <= 0:
-            return " " * width
+        """Render ASCII playback progress bar."""
+        if self.duration <= 0 or width <= 0:
+            return " " * max(1, width)
         ratio = min(1.0, max(0.0, self.time_pos / self.duration))
         filled = int(ratio * width)
         if filled > 0:
@@ -1016,12 +1039,13 @@ class TUIApp:
         return "-" * width
 
     def _fmt_sec(self, sec: float) -> str:
-        s = int(sec)
+        """Format seconds into MM:SS format."""
+        s = int(max(0.0, sec))
         m = s // 60
         s = s % 60
         return f"{m:02d}:{s:02d}"
 
-    def run(self):
+    def run(self) -> None:
         """Main event loop."""
         while True:
             self._update_playback_status()
@@ -1034,7 +1058,7 @@ class TUIApp:
 
             if ch in (ord('q'), ord('Q')):
                 break
-            elif ch != -1:
+            if ch != -1:
                 self._handle_input(ch)
 
         self.cleanup()

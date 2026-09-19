@@ -192,6 +192,14 @@ class AuthManager:
             )
         return False, last_err or f"Could not extract cookies from {browser_name.capitalize()}."
 
+    def setup_from_browser(self, browser_name: str = "auto") -> bool:
+        """
+        Convenience method returning boolean status indicating whether browser
+        cookie extraction and auth file initialization succeeded.
+        """
+        ok, _ = self.import_cookies_from_browser(browser_name)
+        return ok
+
     def save_headers(self, raw_headers: str) -> bool:
         """
         Parse raw request headers copied from browser developer tools

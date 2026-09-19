@@ -2,17 +2,44 @@
 yt-dlp wrapper for metadata extraction, streaming URL resolution, and bounded downloading.
 """
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import yt_dlp
 
 from ytstr.core.types import Track
 
 
 class Downloader:
-    """Wrapper for yt_dlp operations."""
+    """Wrapper for yt_dlp operations with safe parsing and fallbacks."""
 
     def __init__(self, quiet: bool = True):
         self.quiet = quiet
+
+    @staticmethod
+    def _entry_to_track(entry: Optional[Dict[str, Any]]) -> Optional[Track]:
+        """Convert a yt-dlp metadata entry into a validated Track object."""
+        if not entry or not isinstance(entry, dict):
+            return None
+        video_id = entry.get("id")
+        if not video_id:
+            return None
+
+        # Safely parse duration
+        duration_raw = entry.get("duration")
+        try:
+            duration_sec = float(duration_raw) if duration_raw is not None else 0.0
+        except (ValueError, TypeError):
+            duration_sec = 0.0
+
+        title = entry.get("title") or "Unknown Title"
+        artist = entry.get("uploader") or entry.get("channel") or entry.get("artist")
+
+        return Track(
+            id=str(video_id),
+            title=str(title),
+            artist=str(artist) if artist else None,
+            duration_sec=max(0.0, duration_sec),
+            url=f"https://www.youtube.com/watch?v={video_id}",
+        )
 
     def fetch_playlist_tracks(self, target: str) -> List[Track]:
         """
@@ -37,38 +64,23 @@ class Downloader:
             query_url = f"ytsearch10:{target}"
 
         tracks: List[Track] = []
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            res = ydl.extract_info(query_url, download=False)
-            if not res:
-                return tracks
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                res = ydl.extract_info(query_url, download=False)
+                if not res:
+                    return tracks
 
-            if "entries" in res:
-                for entry in res["entries"]:
-                    if not entry:
-                        continue
-                    video_id = entry.get("id")
-                    if video_id:
-                        tracks.append(
-                            Track(
-                                id=video_id,
-                                title=entry.get("title", "Unknown Title"),
-                                artist=entry.get("uploader") or entry.get("channel"),
-                                duration_sec=float(entry.get("duration") or 0.0),
-                                url=f"https://www.youtube.com/watch?v={video_id}",
-                            )
-                        )
-            else:
-                video_id = res.get("id")
-                if video_id:
-                    tracks.append(
-                        Track(
-                            id=video_id,
-                            title=res.get("title", "Unknown Title"),
-                            artist=res.get("uploader") or res.get("channel"),
-                            duration_sec=float(res.get("duration") or 0.0),
-                            url=f"https://www.youtube.com/watch?v={video_id}",
-                        )
-                    )
+                if "entries" in res:
+                    for entry in res["entries"]:
+                        track = self._entry_to_track(entry)
+                        if track:
+                            tracks.append(track)
+                else:
+                    track = self._entry_to_track(res)
+                    if track:
+                        tracks.append(track)
+        except Exception:
+            return tracks
 
         return tracks
 
@@ -118,8 +130,6 @@ class Downloader:
             "outtmpl": str(dest_path),
             "quiet": True,
             "no_warnings": True,
-            "noprogress": True,
-            "overwrites": True,
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:

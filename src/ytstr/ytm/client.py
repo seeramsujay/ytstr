@@ -1,12 +1,17 @@
 """
 High-level YouTube Music client wrapping ytmusicapi with unified data models.
 """
+from __future__ import annotations
+
+import logging
 from typing import Any, Dict, List, Optional
 import ytmusicapi
 from ytmusicapi import YTMusic
 
 from ytstr.core.types import Track
 from ytstr.ytm.auth import AuthManager
+
+logger = logging.getLogger(__name__)
 
 # Keywords identifying personalized recommendation sections vs generic global charts
 PERSONALIZED_KEYWORDS = {
@@ -33,22 +38,25 @@ class YouTubeMusicClient:
         self._ytm: Optional[YTMusic] = None
         self._init_ytm()
 
-    def _init_ytm(self):
+    def _init_ytm(self) -> None:
+        """Initialize authenticated or fallback public ytmusicapi instance."""
         auth_file = self.auth_manager.get_auth_filepath()
         if auth_file:
             try:
                 self._ytm = YTMusic(auth_file)
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed initializing authenticated YTMusic: %s", e)
         # Fallback to unauthenticated public client
         try:
             self._ytm = YTMusic()
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed initializing public YTMusic: %s", e)
             self._ytm = None
 
     @property
     def is_authenticated(self) -> bool:
+        """Return True if user is authenticated with personal Google session."""
         return self.auth_manager.is_authenticated()
 
     def get_home_sections(self, limit: int = 8, personalized_only: bool = True) -> List[Dict[str, Any]]:
@@ -77,7 +85,6 @@ class YouTubeMusicClient:
             title_lower = title.lower()
 
             if personalized_only and self.is_authenticated:
-                # Keep sections that match personalized keywords or artist/recommendation feeds
                 is_personal = any(k in title_lower for k in PERSONALIZED_KEYWORDS) or "for you" in title_lower
                 if not is_personal and "hits" in title_lower:
                     continue
@@ -86,7 +93,7 @@ class YouTubeMusicClient:
             if not isinstance(contents, list):
                 continue
 
-            items = []
+            items: List[Any] = []
             for item in contents:
                 if not item or not isinstance(item, dict):
                     continue
@@ -99,7 +106,7 @@ class YouTubeMusicClient:
                         if pl_id:
                             items.append({
                                 "type": "playlist",
-                                "id": pl_id,
+                                "id": str(pl_id),
                                 "title": item.get("title", "Untitled Playlist"),
                                 "count": item.get("itemCount") or item.get("count"),
                                 "thumbnails": item.get("thumbnails", []),
@@ -112,12 +119,16 @@ class YouTubeMusicClient:
 
         return sections
 
+    def get_personalized_feed(self, limit: int = 8) -> List[Dict[str, Any]]:
+        """Convenience alias for get_home_sections with personalized filtering enabled."""
+        return self.get_home_sections(limit=limit, personalized_only=True)
+
     def get_library_playlists(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Fetch all playlists saved in the user's personal YouTube Music library."""
         if not self._ytm or not self.is_authenticated:
             return []
 
-        playlists = []
+        playlists: List[Dict[str, Any]] = []
         try:
             raw_pls = self._ytm.get_library_playlists(limit=limit)
             if isinstance(raw_pls, list):
@@ -131,14 +142,18 @@ class YouTubeMusicClient:
                     count = p.get("count")
                     playlists.append({
                         "type": "playlist",
-                        "id": pl_id,
-                        "title": title,
+                        "id": str(pl_id),
+                        "title": str(title),
                         "count": count,
                         "description": f"{count} tracks" if count else "Playlist",
                     })
         except Exception:
             pass
         return playlists
+
+    def get_user_playlists(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Convenience alias for get_library_playlists."""
+        return self.get_library_playlists(limit=limit)
 
     def get_liked_songs(self, limit: int = 100) -> List[Track]:
         """Fetch user's Liked Music tracks."""
@@ -166,7 +181,7 @@ class YouTubeMusicClient:
         if not self._ytm:
             return []
 
-        chart_sections = []
+        chart_sections: List[Dict[str, Any]] = []
         try:
             charts = self._ytm.get_charts(country=country)
             if not isinstance(charts, dict):
@@ -175,7 +190,7 @@ class YouTubeMusicClient:
                 entries = charts.get(key)
                 if not isinstance(entries, list) or not entries:
                     continue
-                items = []
+                items: List[Any] = []
                 for item in entries:
                     if not item or not isinstance(item, dict):
                         continue
@@ -214,6 +229,10 @@ class YouTubeMusicClient:
             pass
         return tracks
 
+    def search(self, query: str, limit: int = 25) -> List[Track]:
+        """Convenience alias for search_tracks."""
+        return self.search_tracks(query, filter_type="songs", limit=limit)
+
     def get_playlist_tracks(self, playlist_id: str) -> List[Track]:
         """Extract tracks from a YouTube Music playlist."""
         if not self._ytm:
@@ -236,7 +255,7 @@ class YouTubeMusicClient:
         return tracks
 
     def get_watch_playlist_tracks(self, video_id: str, limit: int = 25) -> List[Track]:
-        """Get infinite radio / recommendations seeded by a track."""
+        """Get continuous radio / recommendations seeded by a track."""
         if not self._ytm:
             return []
 
@@ -256,7 +275,7 @@ class YouTubeMusicClient:
             pass
         return tracks
 
-    def _parse_item_to_track(self, item: Dict[str, Any]) -> Optional[Track]:
+    def _parse_item_to_track(self, item: Optional[Dict[str, Any]]) -> Optional[Track]:
         """Convert a raw ytmusicapi dictionary into a strongly typed Track object."""
         if not item or not isinstance(item, dict):
             return None
@@ -269,18 +288,18 @@ class YouTubeMusicClient:
         if isinstance(title, dict):
             title = title.get("text", "Unknown Title")
 
-        # Artists
-        artist_names = []
+        # Extract artists
+        artist_names: List[str] = []
         artists_data = item.get("artists")
         if isinstance(artists_data, list):
             for a in artists_data:
                 if isinstance(a, dict) and "name" in a:
-                    artist_names.append(a["name"])
+                    artist_names.append(str(a["name"]))
                 elif isinstance(a, str):
                     artist_names.append(a)
-        artist_str = ", ".join(artist_names) if artist_names else ""
+        artist_str = ", ".join(artist_names).strip()
 
-        # Duration
+        # Parse duration
         duration_sec = 0.0
         if "duration_seconds" in item and item["duration_seconds"]:
             try:
@@ -297,17 +316,19 @@ class YouTubeMusicClient:
             except (ValueError, TypeError):
                 pass
 
-        # Thumbnail
+        # Thumbnail URL
         thumb_url = None
         thumbs = item.get("thumbnails")
         if isinstance(thumbs, list) and thumbs:
-            thumb_url = thumbs[-1].get("url")
+            last_thumb = thumbs[-1]
+            if isinstance(last_thumb, dict):
+                thumb_url = last_thumb.get("url")
 
         return Track(
             id=str(video_id),
-            title=str(title),
-            artist=artist_str,
-            duration_sec=duration_sec,
+            title=str(title) if title else "Unknown Title",
+            artist=artist_str if artist_str else None,
+            duration_sec=max(0.0, duration_sec),
             url=f"https://www.youtube.com/watch?v={video_id}",
-            thumbnail_url=thumb_url,
+            thumbnail_url=str(thumb_url) if thumb_url else None,
         )

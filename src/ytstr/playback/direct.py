@@ -2,6 +2,8 @@
 Direct MPV playback engine for ultra-low RAM sequential playback (--no-mix & --stream).
 Bypasses Python audio decoding completely, achieving minimal memory footprint (< 25 MB RSS).
 """
+from __future__ import annotations
+
 import subprocess
 import threading
 import time
@@ -44,7 +46,7 @@ class DirectPlayer:
         self.mpv_process: Optional[subprocess.Popen] = None
         self.ipc: Optional[MPVIPCClient] = None
 
-    def start(self):
+    def start(self) -> threading.Thread:
         """Initialize mpv process and worker threads."""
         self.mpv_process = spawn_mpv_process(self.cache_mgr.ipc_socket, raw_pcm_mode=False)
         self.ipc = MPVIPCClient(self.cache_mgr.ipc_socket)
@@ -59,23 +61,27 @@ class DirectPlayer:
         t_play.start()
         return t_play
 
-    def _download_worker(self):
+    def _download_worker(self) -> None:
         """Worker thread to download up to 2 tracks ahead onto disk."""
         while not self._quit_flag and self.downloaded_idx < len(self.tracks) - 1:
             if self.downloaded_idx <= self.playing_idx + 1:
                 target_idx = self.downloaded_idx + 1
-                track = self.tracks[target_idx]
-                target_path = self.cache_mgr.get_track_cache_path(target_idx, "opus")
+                if target_idx < len(self.tracks):
+                    track = self.tracks[target_idx]
+                    target_path = self.cache_mgr.get_track_cache_path(target_idx, "opus")
 
-                if not self.cache_mgr.track_is_cached(target_idx):
-                    self.downloader.download_track(track, target_path)
+                    if not self.cache_mgr.track_is_cached(target_idx):
+                        self.downloader.download_track(track, target_path)
 
-                self.downloaded_idx = target_idx
+                    self.downloaded_idx = target_idx
             else:
                 time.sleep(0.5)
 
     def _resolve_track_target(self, idx: int) -> Optional[str]:
         """Resolve either direct stream URL or disk cached path."""
+        if idx >= len(self.tracks):
+            return None
+
         track = self.tracks[idx]
         if self.direct_stream:
             stream_url = self.downloader.get_direct_stream_url(track.id)
@@ -94,7 +100,7 @@ class DirectPlayer:
             time.sleep(0.2)
         return None
 
-    def _playback_loop(self):
+    def _playback_loop(self) -> None:
         """Supervisor loop managing mpv track queue, skips, and position tracking."""
         while not self._quit_flag and self.playing_idx < len(self.tracks):
             curr_idx = self.playing_idx
@@ -134,18 +140,18 @@ class DirectPlayer:
 
                 # Check mpv status
                 if self.ipc:
-                    playback_time = self.ipc.get_property("playback-time")
-                    eof_reached = self.ipc.get_property("eof-reached")
-                    idle_active = self.ipc.get_property("idle-active")
+                    playback_time = self.ipc.get_float_property("playback-time", default=0.0)
+                    eof_reached = self.ipc.get_bool_property("eof-reached", default=False)
+                    idle_active = self.ipc.get_bool_property("idle-active", default=False)
 
-                    if playback_time is not None and float(playback_time) > 0.5:
+                    if playback_time > 0.5:
                         has_started = True
 
-                    if has_started and (eof_reached is True or idle_active is True):
+                    if has_started and (eof_reached or idle_active):
                         track_ended = True
                         break
 
-                time.sleep(0.3)
+                time.sleep(0.25)
 
             # Track completed or skipped: trigger cache cleanup / save
             if not self.direct_stream:
@@ -154,14 +160,17 @@ class DirectPlayer:
 
             self.playing_idx += 1
 
-    def stop(self):
+    def stop(self) -> None:
         """Terminate mpv and cleanup resources."""
         self._quit_flag = True
         if self.ipc:
             try:
                 self.ipc.stop()
+                self.ipc.close()
             except Exception:
                 pass
+            self.ipc = None
+
         if self.mpv_process:
             try:
                 self.mpv_process.terminate()
@@ -171,3 +180,4 @@ class DirectPlayer:
                     self.mpv_process.kill()
                 except Exception:
                     pass
+            self.mpv_process = None

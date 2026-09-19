@@ -1,7 +1,7 @@
 """
 Data models, enums, and types used across ytstr.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -30,7 +30,7 @@ class TransitionType(str, Enum):
 class Track:
     """Represents a playable YouTube / YouTube Music track."""
     id: str
-    title: str
+    title: str = "Unknown Title"
     artist: Optional[str] = None
     duration_sec: float = 0.0
     url: Optional[str] = None
@@ -47,9 +47,10 @@ class Track:
 
     def display_title(self) -> str:
         """User-friendly title with artist if present."""
+        clean_title = self.title or "Unknown Title"
         if self.artist:
-            return f"{self.artist} - {self.title}"
-        return self.title
+            return f"{self.artist} - {clean_title}"
+        return clean_title
 
 
 @dataclass

@@ -1,6 +1,8 @@
 """
 Unified player coordinator connecting engines, cache, and user interfaces.
 """
+from __future__ import annotations
+
 import signal
 import sys
 from typing import List, Optional
@@ -12,6 +14,7 @@ from ytstr.downloader.cache import CacheManager
 from ytstr.downloader.ytdlp import Downloader
 from ytstr.playback.direct import DirectPlayer
 from ytstr.playback.dj_player import DJPlayer
+from ytstr.playback.mpv_ipc import MPVIPCClient
 from ytstr.ui.input import KeyboardListener
 from ytstr.ui.terminal import error, info, print_banner, print_track_card, success, warn
 
@@ -43,15 +46,25 @@ class YtstrCoordinator:
 
         self._install_signals()
 
-    def _install_signals(self):
+    @property
+    def active_ipc(self) -> Optional[MPVIPCClient]:
+        """Return the active MPVIPCClient from whichever player engine is running."""
+        if self.direct_player and self.direct_player.ipc:
+            return self.direct_player.ipc
+        if self.dj_player and self.dj_player.ipc:
+            return self.dj_player.ipc
+        return None
+
+    def _install_signals(self) -> None:
+        """Register process signal handlers for clean exit."""
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
-    def _handle_signal(self, signum=None, frame=None):
+    def _handle_signal(self, signum=None, frame=None) -> None:
         self.stop()
         sys.exit(0)
 
-    def run(self):
+    def run(self) -> None:
         """Fetch tracks, initialize engine, print banner, and enter playback loop."""
         info("Fetching audio tracks...")
         self.tracks = self.downloader.fetch_playlist_tracks(self.target)
@@ -77,12 +90,12 @@ class YtstrCoordinator:
 
         self._start_keyboard_listener()
 
-    def _on_track_change(self, idx: int, track: Track, transition: str = ""):
+    def _on_track_change(self, idx: int, track: Track, transition: str = "") -> None:
         next_track = self.tracks[idx + 1] if idx + 1 < len(self.tracks) else None
         print_track_card(idx, len(self.tracks), track, next_track, transition)
 
-    def _start_direct_playback(self):
-        is_stream = self.mode == PlaybackMode.STREAM
+    def _start_direct_playback(self) -> None:
+        is_stream = (self.mode == PlaybackMode.STREAM)
         self.direct_player = DirectPlayer(
             tracks=self.tracks,
             cache_manager=self.cache_mgr,
@@ -92,8 +105,8 @@ class YtstrCoordinator:
         )
         self.direct_player.start()
 
-    def _start_dj_playback(self):
-        is_light = self.mode == PlaybackMode.LIGHT_MIX
+    def _start_dj_playback(self) -> None:
+        is_light = (self.mode == PlaybackMode.LIGHT_MIX)
         self.dj_player = DJPlayer(
             tracks=self.tracks,
             cache_manager=self.cache_mgr,
@@ -104,7 +117,7 @@ class YtstrCoordinator:
         )
         self.dj_player.start()
 
-    def _start_keyboard_listener(self):
+    def _start_keyboard_listener(self) -> None:
         def on_pause():
             if self.direct_player:
                 self.direct_player.toggle_pause = True
@@ -124,32 +137,20 @@ class YtstrCoordinator:
                 self.dj_player.skip_to_prev = True
 
         def on_vol_up():
-            ipc = (
-                self.direct_player.ipc if self.direct_player else (self.dj_player.ipc if self.dj_player else None)
-            )
-            if ipc:
-                ipc.adjust_volume(5)
+            if self.active_ipc:
+                self.active_ipc.adjust_volume(5)
 
         def on_vol_down():
-            ipc = (
-                self.direct_player.ipc if self.direct_player else (self.dj_player.ipc if self.dj_player else None)
-            )
-            if ipc:
-                ipc.adjust_volume(-5)
+            if self.active_ipc:
+                self.active_ipc.adjust_volume(-5)
 
         def on_seek_fwd(sec: int = 5):
-            ipc = (
-                self.direct_player.ipc if self.direct_player else (self.dj_player.ipc if self.dj_player else None)
-            )
-            if ipc:
-                ipc.send_command(["seek", sec, "relative"])
+            if self.active_ipc:
+                self.active_ipc.seek(sec, "relative")
 
         def on_seek_back(sec: int = 5):
-            ipc = (
-                self.direct_player.ipc if self.direct_player else (self.dj_player.ipc if self.dj_player else None)
-            )
-            if ipc:
-                ipc.send_command(["seek", -sec, "relative"])
+            if self.active_ipc:
+                self.active_ipc.seek(-sec, "relative")
 
         def on_quit():
             self.stop()
@@ -167,18 +168,23 @@ class YtstrCoordinator:
 
         try:
             self.keyboard_listener.start()
+        except KeyboardInterrupt:
+            pass
         except Exception:
             pass
         finally:
             self.stop()
             success("\nPlayback stopped.")
 
-    def stop(self):
+    def stop(self) -> None:
         """Halt all playback and cleanup temporary directory."""
         if self.direct_player:
             self.direct_player.stop()
+            self.direct_player = None
         if self.dj_player:
             self.dj_player.stop()
+            self.dj_player = None
         if self.keyboard_listener:
             self.keyboard_listener.stop()
+            self.keyboard_listener = None
         self.cache_mgr.cleanup()
