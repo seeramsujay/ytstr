@@ -237,3 +237,57 @@ def test_tui_rewind_and_prev():
             assert app.current_queue_idx == 0
             assert app.now_playing == tracks[0].display_title()
             mock_play.assert_called_once_with(0)
+
+
+def test_tui_playback_modes_and_live_switching():
+    """Verify cycling modes, direct stream zero-cache routing, and active_ipc behavior."""
+    stdscr = make_mock_stdscr()
+    with patch("curses.curs_set"), \
+         patch("curses.use_default_colors"), \
+         patch("curses.has_colors", return_value=True), \
+         patch("curses.init_pair"), \
+         patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
+         patch.object(TUIApp, "fetch_recommended_async"):
+        app = TUIApp(stdscr)
+        mock_ipc = MagicMock()
+        app.ipc = mock_ipc
+
+        t0 = Track(id="track0", title="Track 0", duration_sec=180.0)
+        t1 = Track(id="track1", title="Track 1", duration_sec=200.0)
+        app.queue_tracks = [t0, t1]
+        app.current_queue_idx = 0
+        app.now_playing = t0.display_title()
+        app.duration = 180.0
+        app.time_pos = 20.0
+
+        # Mode 0 (Direct Low-RAM) -> seek & volume use direct IPC
+        app._seek(5.0)
+        mock_ipc.seek.assert_called_with(5.0, "relative")
+        app._adjust_volume(5.0)
+        mock_ipc.adjust_volume.assert_called_with(5.0)
+
+        # Mode switch to Mode 1 (Light Mix) -> sets pending handoff
+        app._handle_mode_switch()
+        assert app.mode_idx == 1
+        assert app.pending_dj_handoff is True
+
+        # Mode switch to Mode 2 (Direct Stream) -> pending handoff cleared
+        app._handle_mode_switch()
+        assert app.mode_idx == 2
+        assert app.pending_dj_handoff is False
+
+        # In Mode 2 (Direct Stream), play track must fetch direct URL with no disk caching
+        with patch.object(app.downloader, "get_direct_stream_url", return_value="https://googlevideo.com/stream"):
+            app._play_direct_track_at_index(1)
+            mock_ipc.load_file.assert_called_with("https://googlevideo.com/stream", mode="replace")
+
+        # Mode switch to Mode 3 (Auto-DJ Spectral)
+        app._handle_mode_switch()
+        assert app.mode_idx == 3
+        assert app.pending_dj_handoff is True
+
+        # Mode switch back to Mode 0 (Direct Low-RAM)
+        app._handle_mode_switch()
+        assert app.mode_idx == 0
+        assert app.pending_dj_handoff is False

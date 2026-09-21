@@ -45,7 +45,7 @@ MODE_LABELS = ["Direct Low-RAM", "Light Mix", "Direct Stream", "Auto-DJ (Spectra
 class TUIApp:
     """Terminal User Interface for personalized YouTube Music streaming with radio queues."""
 
-    def __init__(self, stdscr):
+    def __init__(self, stdscr, initial_mode_idx: int = 0) -> None:
         self.stdscr = stdscr
         self.auth_mgr = AuthManager()
         self.client = YouTubeMusicClient(self.auth_mgr)
@@ -53,7 +53,7 @@ class TUIApp:
         self.downloader = Downloader()
 
         self.current_tab = TAB_RECOMMENDED
-        self.mode_idx = 0  # Default to Direct Low-RAM
+        self.mode_idx = initial_mode_idx  # Default to Direct Low-RAM (0)
 
         # Navigation & list items
         self.items: List[Any] = []
@@ -75,6 +75,7 @@ class TUIApp:
         self.saved_local_playlists: List[Tuple[str, str]] = []
 
         # Playback status via embedded MPV or DJPlayer
+        self._active_engine: str = "none"  # "none", "direct", "dj"
         self.mpv_process: Optional[subprocess.Popen] = None
         self.ipc = MPVIPCClient(SOCKET_PATH)
         self.dj_player: Optional[DJPlayer] = None
@@ -112,6 +113,28 @@ class TUIApp:
             pass
         curses.use_default_colors()
         self.stdscr.timeout(200)
+
+    @property
+    def active_engine(self) -> str:
+        """Return currently active engine family ('dj', 'direct', or 'none')."""
+        if self._active_engine != "none":
+            return self._active_engine
+        if self.dj_player:
+            return "dj"
+        if self.now_playing:
+            return "direct"
+        return "none"
+
+    @active_engine.setter
+    def active_engine(self, val: str) -> None:
+        self._active_engine = val
+
+    @property
+    def active_ipc(self) -> Optional[MPVIPCClient]:
+        """Return the active MPVIPCClient instance from either DJPlayer or Direct MPV."""
+        if self.active_engine == "dj" and self.dj_player and self.dj_player.ipc:
+            return self.dj_player.ipc
+        return self.ipc
 
         if curses.has_colors():
             try:
@@ -277,11 +300,11 @@ class TUIApp:
 
     def _seek(self, seconds: float) -> None:
         """Seek forward or backward by the specified amount."""
-        if self.ipc:
-            self.ipc.seek(seconds, "relative")
+        if self.active_ipc:
+            self.active_ipc.seek(seconds, "relative")
             self.time_pos = max(0.0, min(self.duration, self.time_pos + seconds))
             direction = "→" if seconds > 0 else "←"
-            self.status_msg = f"Seek {seconds:+d}s ({direction})"
+            self.status_msg = f"Seek {int(seconds):+d}s ({direction})"
 
     def _skip_next(self) -> None:
         """Skip to next track in queue or playlist."""
@@ -289,25 +312,34 @@ class TUIApp:
         if 0 <= next_idx < len(self.queue_tracks):
             self.current_queue_idx = next_idx
             next_track = self.queue_tracks[next_idx]
-            if self.dj_player and self.mode_idx in (1, 3):
-                self.dj_player.jump_to(next_idx)
+            if self.mode_idx in (1, 3):
+                if self.active_engine == "dj" and self.dj_player:
+                    self.dj_player.jump_to(next_idx)
+                else:
+                    self.stop_playback(keep_queue=True)
+                    self.current_queue_idx = next_idx
+                    self.play_track_and_start_radio(next_track, existing_queue=self.queue_tracks, start_idx=next_idx)
             else:
+                if self.active_engine == "dj":
+                    self.stop_playback(keep_queue=True)
                 self._play_direct_track_at_index(next_idx)
             self.now_playing = next_track.display_title()
+            self.duration = next_track.duration_sec
+            self.time_pos = 0.0
             self._update_next_track()
             self.status_msg = f"⏭️ Skipped to: {next_track.display_title()}"
             if self.current_tab == TAB_QUEUE:
                 self.selected_idx = next_idx
-        elif self.ipc:
-            self.ipc.playlist_next()
+        elif self.active_ipc:
+            self.active_ipc.playlist_next()
             self.status_msg = "End of queue reached."
 
     def _skip_prev(self) -> None:
         """Rewind within track or jump to previous track in queue."""
         # If currently playing track has progressed more than 3.0 seconds, rewind track to beginning
         if self.time_pos > 3.0:
-            if self.ipc:
-                self.ipc.seek(0.0, "absolute")
+            if self.active_ipc:
+                self.active_ipc.seek(0.0, "absolute")
                 self.time_pos = 0.0
                 self.status_msg = "⏮️ Rewound track to beginning."
                 return
@@ -317,18 +349,27 @@ class TUIApp:
         if 0 <= prev_idx < len(self.queue_tracks):
             prev_track = self.queue_tracks[prev_idx]
             self.current_queue_idx = prev_idx
-            if self.dj_player and self.mode_idx in (1, 3):
-                self.dj_player.jump_to(prev_idx)
+            if self.mode_idx in (1, 3):
+                if self.active_engine == "dj" and self.dj_player:
+                    self.dj_player.jump_to(prev_idx)
+                else:
+                    self.stop_playback(keep_queue=True)
+                    self.current_queue_idx = prev_idx
+                    self.play_track_and_start_radio(prev_track, existing_queue=self.queue_tracks, start_idx=prev_idx)
             else:
+                if self.active_engine == "dj":
+                    self.stop_playback(keep_queue=True)
                 self._play_direct_track_at_index(prev_idx)
             self.now_playing = prev_track.display_title()
+            self.duration = prev_track.duration_sec
+            self.time_pos = 0.0
             self._update_next_track()
             self.status_msg = f"⏮️ Rewound to: {prev_track.display_title()}"
             if self.current_tab == TAB_QUEUE:
                 self.selected_idx = prev_idx
         else:
-            if self.ipc:
-                self.ipc.seek(0.0, "absolute")
+            if self.active_ipc:
+                self.active_ipc.seek(0.0, "absolute")
             self.status_msg = "Already at first track in queue."
 
     def _play_direct_track_at_index(self, idx: int) -> None:
@@ -342,21 +383,27 @@ class TUIApp:
         self.time_pos = 0.0
         self._update_next_track()
 
-        cached = self.cache_mgr.find_cached_file(track)
-        target = str(cached) if (cached and cached.exists()) else track.web_url
+        # In Mode 2 (Direct Stream): zero-disk direct stream URL
+        if self.mode_idx == 2:
+            target = self.downloader.get_direct_stream_url(track.id) or track.web_url
+        else:
+            cached = self.cache_mgr.find_cached_file(track)
+            if cached and cached.exists():
+                target = str(cached)
+            else:
+                target = self.downloader.get_direct_stream_url(track.id) or track.web_url
 
+        self.active_engine = "direct"
         self._ensure_mpv(raw_pcm_mode=False)
+        if not self.ipc:
+            self.ipc = MPVIPCClient(SOCKET_PATH)
         if self.ipc:
             self.ipc.load_file(target, mode="replace")
-            # Populate upcoming queue items into MPV playlist
-            for t in self.queue_tracks[idx + 1:]:
-                c = self.cache_mgr.find_cached_file(t)
-                self.ipc.load_file(str(c) if (c and c.exists()) else t.web_url, mode="append")
 
     def _adjust_volume(self, delta: float) -> None:
         """Adjust mpv audio volume."""
-        if self.ipc:
-            self.ipc.adjust_volume(delta)
+        if self.active_ipc:
+            self.active_ipc.adjust_volume(delta)
             sign = "+" if delta > 0 else ""
             self.status_msg = f"Volume {sign}{int(delta)}%"
 
@@ -366,14 +413,22 @@ class TUIApp:
         mode_label = MODE_LABELS[self.mode_idx]
         is_dj_mode = self.mode_idx in (1, 3)
 
-        if not self.now_playing:
+        if not self.now_playing or self.active_engine == "none":
             self.status_msg = f"Playback mode: {mode_label}"
             return
 
-        if is_dj_mode:
-            if self.dj_player:
-                self.dj_player.light_mix = (self.mode_idx == 1)
+        if self.active_engine == "dj":
+            if is_dj_mode:
+                if self.dj_player:
+                    self.dj_player.light_mix = (self.mode_idx == 1)
                 self.status_msg = f"🎛️ Switched to {mode_label}"
+            else:
+                self.pending_dj_handoff = False
+                self.status_msg = f"Switched to {mode_label}: Current song continuing, switching mode on next track..."
+        elif self.active_engine == "direct":
+            if not is_dj_mode:
+                self.pending_dj_handoff = False
+                self.status_msg = f"Switched to {mode_label} (active on next track)"
             else:
                 self.pending_dj_handoff = True
                 self.status_msg = f"🎛️ Switched to {mode_label}: Song continuing, DJ engine warming up for handoff..."
@@ -385,12 +440,6 @@ class TUIApp:
                         if not self.cache_mgr.track_is_cached(self.queue_tracks[next_idx]):
                             self.downloader.download_track(self.queue_tracks[next_idx], target_path)
                 threading.Thread(target=warm_up, daemon=True).start()
-        else:
-            if self.dj_player:
-                self.pending_dj_handoff = False
-                self.status_msg = f"Switched to {mode_label}: Current song continuing, switching mode on next track..."
-            else:
-                self.status_msg = f"Switched mode to: {mode_label}"
 
     def _switch_tab(self, new_tab: int) -> None:
         """Change active UI tab and load its contents if empty."""
@@ -446,9 +495,16 @@ class TUIApp:
 
         if self.current_tab == TAB_QUEUE and isinstance(item, Track):
             target_idx = self.selected_idx
-            if self.dj_player and self.mode_idx in (1, 3):
-                self.dj_player.jump_to(target_idx)
+            if self.mode_idx in (1, 3):
+                if self.active_engine == "dj" and self.dj_player:
+                    self.dj_player.jump_to(target_idx)
+                else:
+                    self.stop_playback(keep_queue=True)
+                    self.current_queue_idx = target_idx
+                    self.play_track_and_start_radio(item, existing_queue=self.queue_tracks, start_idx=target_idx)
             else:
+                if self.active_engine == "dj":
+                    self.stop_playback(keep_queue=True)
                 self._play_direct_track_at_index(target_idx)
             self.current_queue_idx = target_idx
             self.now_playing = item.display_title()
@@ -512,6 +568,7 @@ class TUIApp:
 
         if is_dj_mode:
             is_light = (self.mode_idx == 1)
+            self.active_engine = "dj"
             self.dj_player = DJPlayer(
                 tracks=self.queue_tracks,
                 cache_manager=self.cache_mgr,
@@ -524,6 +581,7 @@ class TUIApp:
             )
             self.dj_player.start()
         else:
+            self.active_engine = "direct"
             self._play_direct_track_at_index(self.current_queue_idx)
 
         # Asynchronously fetch radio if existing_queue wasn't provided
@@ -559,7 +617,7 @@ class TUIApp:
             tracks = list(self.queue_tracks)
             total = len(tracks)
 
-            if total == 0 or curr_idx < 0 or curr_idx >= total or self.mode_idx == 2:
+            if total == 0 or curr_idx < 0 or curr_idx >= total or self.mode_idx == 2 or self.active_engine == "dj":
                 time.sleep(0.4)
                 continue
 
@@ -908,10 +966,10 @@ class TUIApp:
 
     def toggle_pause(self) -> None:
         """Toggle playback pause state across either Direct MPV or Auto-DJ player."""
-        if self.dj_player and self.mode_idx in (1, 3):
+        if self.active_engine == "dj" and self.dj_player:
             self.dj_player.toggle_pause = True
-        elif self.ipc:
-            self.ipc.cycle_pause()
+        elif self.active_ipc:
+            self.active_ipc.cycle_pause()
         self.is_paused = not self.is_paused
         state_str = "Paused" if self.is_paused else "Resumed"
         self.status_msg = f"Playback {state_str}."
@@ -931,6 +989,7 @@ class TUIApp:
                 self.ipc.close()
             except Exception:
                 pass
+            self.ipc = None
 
         if self.mpv_process:
             try:
@@ -942,6 +1001,8 @@ class TUIApp:
                 except Exception:
                     pass
             self.mpv_process = None
+
+        self.active_engine = "none"
 
         if not keep_queue:
             self.now_playing = None
@@ -957,50 +1018,70 @@ class TUIApp:
         if not os.path.exists(SOCKET_PATH):
             return
 
-        if self.dj_player and self.mode_idx in (1, 3):
+        # 1. DJ Player active
+        if self.active_engine == "dj" and self.dj_player:
             st = self.dj_player.get_playback_status()
             self.time_pos = st.get("time_pos", 0.0)
             self.duration = st.get("duration", 0.0)
             self.is_paused = st.get("paused", False)
             if st.get("track"):
                 self.now_playing = st["track"].display_title()
-                self.current_queue_idx = st.get("playing_idx", self.current_queue_idx)
-                self._update_next_track()
+                new_idx = st.get("playing_idx", self.current_queue_idx)
+                if new_idx != self.current_queue_idx:
+                    self.current_queue_idx = new_idx
+                    self._update_next_track()
+                    # Check if user switched mode to Direct while DJ was playing
+                    if self.mode_idx in (0, 2):
+                        self.stop_playback(keep_queue=True)
+                        self._play_direct_track_at_index(new_idx)
+                        return
                 if st.get("transition"):
                     self.status_msg = f"▶ Playing: {self.now_playing} | 🎛️ Auto-DJ: {st['transition']}"
                 if self.current_tab == TAB_QUEUE:
                     self.items = list(self.queue_tracks)
             return
 
-        # Direct MPV mode
-        try:
-            pt = self.ipc.get_float_property("playback-time")
-            if pt is None:
-                pt = self.ipc.get_float_property("time-pos")
-            if pt is not None:
-                self.time_pos = max(0.0, pt)
+        # 2. Direct MPV active
+        if self.active_engine == "direct":
+            if not self.ipc:
+                self._ensure_mpv(raw_pcm_mode=False)
+                self.ipc = MPVIPCClient(SOCKET_PATH)
 
-            dur = self.ipc.get_float_property("duration")
-            if dur is not None and dur > 0:
-                self.duration = dur
+            try:
+                pt = self.ipc.get_float_property("playback-time")
+                if pt is None:
+                    pt = self.ipc.get_float_property("time-pos")
+                if pt is not None:
+                    self.time_pos = max(0.0, pt)
 
-            p = self.ipc.get_bool_property("pause")
-            if p is not None:
-                self.is_paused = p
+                dur = self.ipc.get_float_property("duration")
+                if dur is not None and dur > 0:
+                    self.duration = dur
 
-            # Check if track ended
-            eof = self.ipc.get_bool_property("eof-reached", default=False)
-            idle = self.ipc.get_bool_property("idle-active", default=False)
-            if self.time_pos > 0.5 and (eof or idle):
-                next_idx = self.current_queue_idx + 1
-                if next_idx < len(self.queue_tracks):
-                    self.cache_mgr.on_track_finished(self.current_queue_idx, self.queue_tracks[self.current_queue_idx])
-                    self._play_direct_track_at_index(next_idx)
-                    self.status_msg = f"▶ Playing: {self.now_playing}"
-                else:
-                    self.status_msg = "Queue ended."
-        except Exception:
-            pass
+                p = self.ipc.get_bool_property("pause")
+                if p is not None:
+                    self.is_paused = p
+
+                # Check if track ended
+                eof = self.ipc.get_bool_property("eof-reached", default=False)
+                idle = self.ipc.get_bool_property("idle-active", default=False)
+                if self.time_pos > 0.5 and (eof or idle):
+                    next_idx = self.current_queue_idx + 1
+                    if next_idx < len(self.queue_tracks):
+                        self.cache_mgr.on_track_finished(self.current_queue_idx, self.queue_tracks[self.current_queue_idx])
+                        if self.mode_idx in (1, 3) or self.pending_dj_handoff:
+                            self.pending_dj_handoff = False
+                            next_track = self.queue_tracks[next_idx]
+                            self.stop_playback(keep_queue=True)
+                            self.current_queue_idx = next_idx
+                            self.play_track_and_start_radio(next_track, existing_queue=self.queue_tracks, start_idx=next_idx)
+                        else:
+                            self._play_direct_track_at_index(next_idx)
+                            self.status_msg = f"▶ Playing: {self.now_playing}"
+                    else:
+                        self.status_msg = "Queue ended."
+            except Exception:
+                pass
 
         # Check for pending DJ handoff as current track nears its end
         try:
@@ -1191,9 +1272,9 @@ class TUIApp:
         self.cleanup()
 
 
-def main():
+def main(initial_mode_idx: int = 0):
     try:
-        curses.wrapper(lambda stdscr: TUIApp(stdscr).run())
+        curses.wrapper(lambda stdscr: TUIApp(stdscr, initial_mode_idx=initial_mode_idx).run())
     except KeyboardInterrupt:
         pass
 

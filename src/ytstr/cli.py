@@ -93,7 +93,14 @@ def main(argv: Optional[list] = None) -> int:
     if args.tui or args.gui or (not args.target and not args.list and not args.add and not args.remove):
         try:
             from ytstr.ui.tui import main as run_tui
-            run_tui()
+            mode_idx = 0
+            if args.light_mix:
+                mode_idx = 1
+            elif args.stream:
+                mode_idx = 2
+            elif args.no_mix:
+                mode_idx = 0
+            run_tui(initial_mode_idx=mode_idx)
             return 0
         except Exception as e:
             error(f"Failed to launch TUI: {e}")
