@@ -291,3 +291,43 @@ def test_tui_playback_modes_and_live_switching():
         app._handle_mode_switch()
         assert app.mode_idx == 0
         assert app.pending_dj_handoff is False
+
+
+def test_tui_rebuild_items_from_sections():
+    """Verify sections with 'items' or 'contents' parse properly and don't throw KeyError."""
+    stdscr = make_mock_stdscr()
+    with patch("curses.curs_set"), \
+         patch("curses.use_default_colors"), \
+         patch("curses.has_colors", return_value=True), \
+         patch("curses.init_pair"), \
+         patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
+         patch.object(TUIApp, "fetch_recommended_async"):
+        app = TUIApp(stdscr)
+
+        t1 = Track(id="track1", title="Track 1", duration_sec=180.0)
+        t2 = Track(id="track2", title="Track 2", duration_sec=210.0)
+
+        # Mix of "items" (YTMusicClient style) and "contents" (raw YTM style)
+        sections = [
+            {"title": "Listen Again", "items": [t1]},
+            {"title": "Mixed For You", "contents": [t2]},
+            {"title": "Empty Section", "items": []},
+            "invalid_section",
+        ]
+
+        app._rebuild_items_from_sections(sections)
+
+        # Verify headers and tracks
+        assert len(app.items) == 4
+        assert app.items[0] == {"type": "section_header", "title": "Listen Again"}
+        assert app.items[1] == t1
+        assert app.items[2] == {"type": "section_header", "title": "Mixed For You"}
+        assert app.items[3] == t2
+        assert app.selected_idx == 1  # Should default to first playable track!
+
+        # Activating section header should step into first track
+        app.selected_idx = 0
+        with patch.object(app, "play_track_and_start_radio") as mock_play:
+            app._activate_selected()
+            mock_play.assert_called_once_with(t1)

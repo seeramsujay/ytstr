@@ -95,6 +95,16 @@ class TUIApp:
         self._quit_flag = False
         self._fetching_radio = False
 
+        # Suppress uncaught thread tracebacks from corrupting the curses screen
+        def _thread_excepthook(args):
+            try:
+                err_path = "/tmp/ytstr_thread_error.log"
+                with open(err_path, "a") as f:
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Thread {args.thread.name}: {args.exc_type.__name__}: {args.exc_value}\n")
+            except Exception:
+                pass
+        threading.excepthook = _thread_excepthook
+
         self.global_listener = None
         self._start_global_media_listener()
         self._setup_curses()
@@ -493,6 +503,12 @@ class TUIApp:
             self._handle_login_action(item)
             return
 
+        if isinstance(item, dict) and item.get("type") == "section_header":
+            if self.selected_idx + 1 < len(self.items):
+                self.selected_idx += 1
+                self._activate_selected()
+            return
+
         if self.current_tab == TAB_QUEUE and isinstance(item, Track):
             target_idx = self.selected_idx
             if self.mode_idx in (1, 3):
@@ -589,20 +605,23 @@ class TUIApp:
             track_id = track.id
 
             def worker():
-                radio_tracks = self.client.get_watch_playlist_tracks(track_id, limit=35)
-                if radio_tracks:
-                    filtered = [t for t in radio_tracks if t.id != track_id]
-                    self.queue_tracks.extend(filtered)
-                    if self.dj_player:
-                        self.dj_player.append_tracks(filtered)
-                    self._update_next_track()
-                    self.status_msg = f"▶ Playing: {track.display_title()} | 📻 Radio: {len(filtered)} tracks queued"
+                try:
+                    radio_tracks = self.client.get_watch_playlist_tracks(track_id, limit=35)
+                    if radio_tracks:
+                        filtered = [t for t in radio_tracks if t.id != track_id]
+                        self.queue_tracks.extend(filtered)
+                        if self.dj_player:
+                            self.dj_player.append_tracks(filtered)
+                        self._update_next_track()
+                        self.status_msg = f"▶ Playing: {track.display_title()} | 📻 Radio: {len(filtered)} tracks queued"
 
-                    if self.current_tab == TAB_QUEUE:
-                        self.items = list(self.queue_tracks)
-                else:
-                    self.next_playing = None
-                    self.status_msg = f"▶ Playing: {track.display_title()}"
+                        if self.current_tab == TAB_QUEUE:
+                            self.items = list(self.queue_tracks)
+                    else:
+                        self.next_playing = None
+                        self.status_msg = f"▶ Playing: {track.display_title()}"
+                except Exception as e:
+                    self.status_msg = f"▶ Playing: {track.display_title()} (Radio error: {e})"
 
             threading.Thread(target=worker, daemon=True, name="ytstr-initial-radio").start()
 
@@ -708,18 +727,22 @@ class TUIApp:
         self.in_playlist_name = title
 
         def worker():
-            tracks = self.client.get_playlist_tracks(playlist_id)
-            self.is_loading = False
-            if tracks:
-                self.items = tracks
-                self.selected_idx = 0
-                self.scroll_offset = 0
-                self.status_msg = f"Viewing playlist: '{title}' ({len(tracks)} tracks)"
-            else:
-                self.items = []
-                self.status_msg = f"No tracks found in '{title}'."
+            try:
+                tracks = self.client.get_playlist_tracks(playlist_id)
+                self.is_loading = False
+                if tracks:
+                    self.items = tracks
+                    self.selected_idx = 0
+                    self.scroll_offset = 0
+                    self.status_msg = f"Viewing playlist: '{title}' ({len(tracks)} tracks)"
+                else:
+                    self.items = []
+                    self.status_msg = f"No tracks found in '{title}'."
+            except Exception as e:
+                self.is_loading = False
+                self.status_msg = f"Failed opening '{title}': {e}"
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="ytstr-pl-drilldown").start()
 
     def _exit_playlist_view(self) -> None:
         """Return from playlist drill-down view back to top-level playlists."""
@@ -741,15 +764,18 @@ class TUIApp:
             self.status_msg = f"Queuing playlist '{title}'..."
 
             def worker():
-                tracks = self.client.get_playlist_tracks(pl_id)
-                if tracks:
-                    first = tracks[0]
-                    self.play_track_and_start_radio(first, existing_queue=tracks)
-                    self.status_msg = f"▶ Playing '{title}' ({len(tracks)} tracks queued)"
-                else:
-                    self.status_msg = f"Could not load playlist '{title}'."
+                try:
+                    tracks = self.client.get_playlist_tracks(pl_id)
+                    if tracks:
+                        first = tracks[0]
+                        self.play_track_and_start_radio(first, existing_queue=tracks)
+                        self.status_msg = f"▶ Playing '{title}' ({len(tracks)} tracks queued)"
+                    else:
+                        self.status_msg = f"Could not load playlist '{title}'."
+                except Exception as e:
+                    self.status_msg = f"Failed playing '{title}': {e}"
 
-            threading.Thread(target=worker, daemon=True).start()
+            threading.Thread(target=worker, daemon=True, name="ytstr-pl-play").start()
 
     def _play_external_target(self, target: str, title: str) -> None:
         """Fallback to direct MPV playback for custom target URLs."""
@@ -855,16 +881,20 @@ class TUIApp:
         self.status_msg = self.loading_text
 
         def worker():
-            tracks = self.client.search(inp, filter_type="songs", limit=30)
-            self.is_loading = False
-            self.search_results = tracks
-            if self.current_tab == TAB_SEARCH:
-                self.items = list(tracks)
-                self.selected_idx = 0
-                self.scroll_offset = 0
-            self.status_msg = f"Search '{inp}': found {len(tracks)} tracks."
+            try:
+                tracks = self.client.search(inp, filter_type="songs", limit=30)
+                self.is_loading = False
+                self.search_results = tracks
+                if self.current_tab == TAB_SEARCH:
+                    self.items = list(tracks)
+                    self.selected_idx = 0
+                    self.scroll_offset = 0
+                self.status_msg = f"Search '{inp}': found {len(tracks)} tracks."
+            except Exception as e:
+                self.is_loading = False
+                self.status_msg = f"Search error: {e}"
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="ytstr-search").start()
 
     def fetch_recommended_async(self) -> None:
         """Background worker to fetch personalized Home sections."""
@@ -872,23 +902,41 @@ class TUIApp:
         self.loading_text = "Fetching personalized recommendations..."
 
         def worker():
-            sections = self.client.get_home_sections(limit=6)
-            self.is_loading = False
-            self.recommended_sections = sections
-            if self.current_tab == TAB_RECOMMENDED:
-                self._rebuild_items_from_sections(sections)
-                self.status_msg = "Loaded personalized recommendations."
+            try:
+                sections = self.client.get_home_sections(limit=6)
+                self.is_loading = False
+                self.recommended_sections = sections
+                if self.current_tab == TAB_RECOMMENDED:
+                    self._rebuild_items_from_sections(sections)
+                    if self.items:
+                        self.status_msg = "Loaded personalized recommendations."
+                    else:
+                        self.status_msg = "No recommendations found. Press '/' to search catalog."
+            except Exception as e:
+                self.is_loading = False
+                self.status_msg = f"Recommendations error: {e}"
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="ytstr-fetch-recommended").start()
 
     def _rebuild_items_from_sections(self, sections: List[Dict[str, Any]]) -> None:
         """Flatten categorized sections into scrollable list with visual category headers."""
         flattened: List[Any] = []
         for sec in sections:
-            flattened.append({"type": "section_header", "title": sec["title"]})
-            flattened.extend(sec["contents"])
+            if not isinstance(sec, dict):
+                continue
+            title = sec.get("title", "Recommended")
+            items = sec.get("items")
+            if items is None:
+                items = sec.get("contents") or []
+            if not items:
+                continue
+            flattened.append({"type": "section_header", "title": title})
+            flattened.extend(items)
         self.items = flattened
-        self.selected_idx = 0
+        if len(flattened) > 1 and isinstance(flattened[0], dict) and flattened[0].get("type") == "section_header":
+            self.selected_idx = 1
+        else:
+            self.selected_idx = 0
         self.scroll_offset = 0
 
     def fetch_playlists_async(self) -> None:
@@ -897,16 +945,20 @@ class TUIApp:
         self.loading_text = "Fetching your playlists..."
 
         def worker():
-            pls = self.client.get_user_playlists()
-            self.is_loading = False
-            self.my_playlists = pls
-            if self.current_tab == TAB_PLAYLISTS and not self.in_playlist_name:
-                self.items = list(pls)
-                self.selected_idx = 0
-                self.scroll_offset = 0
-                self.status_msg = f"Loaded {len(pls)} user playlists."
+            try:
+                pls = self.client.get_user_playlists()
+                self.is_loading = False
+                self.my_playlists = pls
+                if self.current_tab == TAB_PLAYLISTS and not self.in_playlist_name:
+                    self.items = list(pls)
+                    self.selected_idx = 0
+                    self.scroll_offset = 0
+                    self.status_msg = f"Loaded {len(pls)} user playlists."
+            except Exception as e:
+                self.is_loading = False
+                self.status_msg = f"Failed to load playlists: {e}"
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="ytstr-fetch-playlists").start()
 
     def fetch_liked_async(self) -> None:
         """Background worker to fetch Liked Songs library."""
@@ -914,16 +966,20 @@ class TUIApp:
         self.loading_text = "Fetching Liked Songs library..."
 
         def worker():
-            liked = self.client.get_liked_songs(limit=100)
-            self.is_loading = False
-            self.liked_tracks = liked
-            if self.current_tab == TAB_LIKED:
-                self.items = list(liked)
-                self.selected_idx = 0
-                self.scroll_offset = 0
-                self.status_msg = f"Loaded {len(liked)} Liked Songs."
+            try:
+                liked = self.client.get_liked_songs(limit=100)
+                self.is_loading = False
+                self.liked_tracks = liked
+                if self.current_tab == TAB_LIKED:
+                    self.items = list(liked)
+                    self.selected_idx = 0
+                    self.scroll_offset = 0
+                    self.status_msg = f"Loaded {len(liked)} Liked Songs."
+            except Exception as e:
+                self.is_loading = False
+                self.status_msg = f"Failed to load liked songs: {e}"
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="ytstr-fetch-liked").start()
 
     def _build_login_items(self) -> None:
         """Populate Account tab with interactive authentication actions."""
