@@ -91,12 +91,18 @@ class TUIApp:
         self.is_loading = False
         self.loading_text = ""
         self.search_query = ""
+        self._quit_flag = False
+        self._fetching_radio = False
 
         self.global_listener = None
         self._start_global_media_listener()
         self._setup_curses()
         self._ensure_mpv(raw_pcm_mode=False)
         self.fetch_recommended_async()
+
+        # Start continuous sliding-window cache worker (next 2 songs + previous song < 30 MB)
+        self._cache_thread = threading.Thread(target=self._cache_worker, daemon=True, name="ytstr-tui-cache")
+        self._cache_thread.start()
 
     def _setup_curses(self) -> None:
         """Initialize curses screen, colors, and input polling options."""
@@ -157,6 +163,7 @@ class TUIApp:
 
     def cleanup(self) -> None:
         """Clean up MPV, workers, and temporary sockets on exit."""
+        self._quit_flag = True
         if self.global_listener:
             try:
                 self.global_listener.stop()
@@ -185,18 +192,9 @@ class TUIApp:
             self._exit_playlist_view()
             return True
 
-        # Direct tab switching: 1-6
-        if ch in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6')):
+        # Tab switching (1-6)
+        if ord('1') <= ch <= ord('6'):
             self._switch_tab(ch - ord('1'))
-            return True
-        if ch == 9:  # Tab key
-            self._switch_tab((self.current_tab + 1) % len(TAB_NAMES))
-            return True
-        if ch == curses.KEY_BTAB:  # Shift-Tab
-            self._switch_tab((self.current_tab - 1) % len(TAB_NAMES))
-            return True
-        if ch in (ord('u'), ord('U')):
-            self._switch_tab(TAB_QUEUE)
             return True
 
         # Up / Down / PageUp / PageDown / j / k
@@ -287,21 +285,73 @@ class TUIApp:
 
     def _skip_next(self) -> None:
         """Skip to next track in queue or playlist."""
-        if self.dj_player and self.mode_idx in (1, 3):
-            self.dj_player.skip_to_next = True
-            self.status_msg = "Skipped to next track (>)."
+        next_idx = self.current_queue_idx + 1
+        if 0 <= next_idx < len(self.queue_tracks):
+            self.current_queue_idx = next_idx
+            next_track = self.queue_tracks[next_idx]
+            if self.dj_player and self.mode_idx in (1, 3):
+                self.dj_player.jump_to(next_idx)
+            else:
+                self._play_direct_track_at_index(next_idx)
+            self.now_playing = next_track.display_title()
+            self._update_next_track()
+            self.status_msg = f"⏭️ Skipped to: {next_track.display_title()}"
+            if self.current_tab == TAB_QUEUE:
+                self.selected_idx = next_idx
         elif self.ipc:
             self.ipc.playlist_next()
-            self.status_msg = "Skipped to next track (>)."
+            self.status_msg = "End of queue reached."
 
     def _skip_prev(self) -> None:
-        """Skip to previous track in queue or playlist."""
-        if self.dj_player and self.mode_idx in (1, 3):
-            self.dj_player.skip_to_prev = True
-            self.status_msg = "Skipped to previous track (<)."
-        elif self.ipc:
-            self.ipc.playlist_prev()
-            self.status_msg = "Skipped to previous track (<)."
+        """Rewind within track or jump to previous track in queue."""
+        # If currently playing track has progressed more than 3.0 seconds, rewind track to beginning
+        if self.time_pos > 3.0:
+            if self.ipc:
+                self.ipc.seek(0.0, "absolute")
+                self.time_pos = 0.0
+                self.status_msg = "⏮️ Rewound track to beginning."
+                return
+
+        # Otherwise step backwards in the queue
+        prev_idx = self.current_queue_idx - 1
+        if 0 <= prev_idx < len(self.queue_tracks):
+            prev_track = self.queue_tracks[prev_idx]
+            self.current_queue_idx = prev_idx
+            if self.dj_player and self.mode_idx in (1, 3):
+                self.dj_player.jump_to(prev_idx)
+            else:
+                self._play_direct_track_at_index(prev_idx)
+            self.now_playing = prev_track.display_title()
+            self._update_next_track()
+            self.status_msg = f"⏮️ Rewound to: {prev_track.display_title()}"
+            if self.current_tab == TAB_QUEUE:
+                self.selected_idx = prev_idx
+        else:
+            if self.ipc:
+                self.ipc.seek(0.0, "absolute")
+            self.status_msg = "Already at first track in queue."
+
+    def _play_direct_track_at_index(self, idx: int) -> None:
+        """Play track at specified queue index using cache if available or stream URL."""
+        if not (0 <= idx < len(self.queue_tracks)):
+            return
+        track = self.queue_tracks[idx]
+        self.current_queue_idx = idx
+        self.now_playing = track.display_title()
+        self.duration = track.duration_sec
+        self.time_pos = 0.0
+        self._update_next_track()
+
+        cached = self.cache_mgr.find_cached_file(track)
+        target = str(cached) if (cached and cached.exists()) else track.web_url
+
+        self._ensure_mpv(raw_pcm_mode=False)
+        if self.ipc:
+            self.ipc.load_file(target, mode="replace")
+            # Populate upcoming queue items into MPV playlist
+            for t in self.queue_tracks[idx + 1:]:
+                c = self.cache_mgr.find_cached_file(t)
+                self.ipc.load_file(str(c) if (c and c.exists()) else t.web_url, mode="append")
 
     def _adjust_volume(self, delta: float) -> None:
         """Adjust mpv audio volume."""
@@ -331,8 +381,8 @@ class TUIApp:
                 def warm_up():
                     next_idx = self.current_queue_idx + 1
                     if 0 <= next_idx < len(self.queue_tracks):
-                        target_path = self.cache_mgr.get_track_cache_path(next_idx, "opus")
-                        if not self.cache_mgr.track_is_cached(next_idx):
+                        target_path = self.cache_mgr.get_track_cache_path(self.queue_tracks[next_idx], "opus")
+                        if not self.cache_mgr.track_is_cached(self.queue_tracks[next_idx]):
                             self.downloader.download_track(self.queue_tracks[next_idx], target_path)
                 threading.Thread(target=warm_up, daemon=True).start()
         else:
@@ -377,11 +427,11 @@ class TUIApp:
             self._build_login_items()
 
     def _move_selection(self, delta: int) -> None:
-        """Move cursor up or down within item boundaries."""
+        """Move cursor selection up or down with wrapping bounds."""
         if not self.items:
+            self.selected_idx = 0
             return
-        new_idx = self.selected_idx + delta
-        self.selected_idx = max(0, min(new_idx, len(self.items) - 1))
+        self.selected_idx = max(0, min(len(self.items) - 1, self.selected_idx + delta))
 
     def _activate_selected(self) -> None:
         """Perform primary action on currently selected item."""
@@ -396,16 +446,16 @@ class TUIApp:
 
         if self.current_tab == TAB_QUEUE and isinstance(item, Track):
             target_idx = self.selected_idx
-            if self.dj_player:
-                self.stop_playback(keep_queue=True)
-                self.current_queue_idx = target_idx
-                self.play_track_and_start_radio(item, existing_queue=self.queue_tracks[target_idx:])
-            elif self.ipc:
-                self.ipc.set_property("playlist-pos", target_idx)
-                self.current_queue_idx = target_idx
-                self.now_playing = item.display_title()
-                self._update_next_track()
-                self.status_msg = f"Jumped to: {item.display_title()}"
+            if self.dj_player and self.mode_idx in (1, 3):
+                self.dj_player.jump_to(target_idx)
+            else:
+                self._play_direct_track_at_index(target_idx)
+            self.current_queue_idx = target_idx
+            self.now_playing = item.display_title()
+            self.duration = item.duration_sec
+            self.time_pos = 0.0
+            self._update_next_track()
+            self.status_msg = f"▶ Jumped to: {item.display_title()}"
             return
 
         if isinstance(item, Track):
@@ -434,11 +484,18 @@ class TUIApp:
             self.status_msg = "Logged out. Credentials cleared."
             self._build_login_items()
 
-    def play_track_and_start_radio(self, track: Track, existing_queue: Optional[List[Track]] = None) -> None:
+    def play_track_and_start_radio(
+        self,
+        track: Track,
+        existing_queue: Optional[List[Track]] = None,
+        start_idx: int = 0,
+    ) -> None:
         """Play track immediately in MPV or DJPlayer and automatically queue its radio recommendations."""
         self.stop_playback(keep_queue=False)
         self.now_playing = track.display_title()
-        self.next_playing = "Loading radio queue..." if not existing_queue else (existing_queue[1].display_title() if len(existing_queue) > 1 else None)
+        self.next_playing = "Loading radio queue..." if not existing_queue else (
+            existing_queue[start_idx + 1].display_title() if len(existing_queue) > start_idx + 1 else None
+        )
         self.is_paused = False
         self.time_pos = 0.0
         self.duration = track.duration_sec
@@ -448,7 +505,7 @@ class TUIApp:
 
         if existing_queue:
             self.queue_tracks = list(existing_queue)
-            self.current_queue_idx = 0
+            self.current_queue_idx = start_idx
         else:
             self.queue_tracks = [track]
             self.current_queue_idx = 0
@@ -463,15 +520,11 @@ class TUIApp:
                 crossfade_sec=DEFAULT_CROSSFADE_SEC,
                 on_track_change=self._on_dj_track_change,
                 custom_socket=SOCKET_PATH,
+                start_idx=self.current_queue_idx,
             )
             self.dj_player.start()
         else:
-            self._ensure_mpv(raw_pcm_mode=False)
-            if self.ipc:
-                self.ipc.load_file(track.web_url, mode="replace")
-                if existing_queue and len(existing_queue) > 1:
-                    for t in existing_queue[1:]:
-                        self.ipc.load_file(t.web_url, mode="append")
+            self._play_direct_track_at_index(self.current_queue_idx)
 
         # Asynchronously fetch radio if existing_queue wasn't provided
         if not existing_queue:
@@ -484,10 +537,6 @@ class TUIApp:
                     self.queue_tracks.extend(filtered)
                     if self.dj_player:
                         self.dj_player.append_tracks(filtered)
-                    elif self.ipc:
-                        for t in filtered:
-                            self.ipc.load_file(t.web_url, mode="append")
-
                     self._update_next_track()
                     self.status_msg = f"▶ Playing: {track.display_title()} | 📻 Radio: {len(filtered)} tracks queued"
 
@@ -497,7 +546,78 @@ class TUIApp:
                     self.next_playing = None
                     self.status_msg = f"▶ Playing: {track.display_title()}"
 
-            threading.Thread(target=worker, daemon=True).start()
+            threading.Thread(target=worker, daemon=True, name="ytstr-initial-radio").start()
+
+    def _cache_worker(self) -> None:
+        """
+        Background cache worker for active playback:
+        Prefetches next two songs and previous song (< 30 MB),
+        and dynamically expands the radio queue when approaching queue end.
+        """
+        while not self._quit_flag:
+            curr_idx = self.current_queue_idx
+            tracks = list(self.queue_tracks)
+            total = len(tracks)
+
+            if total == 0 or curr_idx < 0 or curr_idx >= total or self.mode_idx == 2:
+                time.sleep(0.4)
+                continue
+
+            # Check if radio queue needs expansion (nearing end)
+            if total - curr_idx <= 5 and not self._fetching_radio:
+                self._expand_radio_queue()
+
+            # Targets:
+            # 1. Current track
+            # 2. Next track 1 (curr_idx + 1)
+            # 3. Next track 2 (curr_idx + 2)
+            # 4. Previous track (curr_idx - 1)
+            targets = [curr_idx, curr_idx + 1, curr_idx + 2]
+            if curr_idx > 0:
+                targets.append(curr_idx - 1)
+
+            downloaded_something = False
+            for idx in targets:
+                if self._quit_flag or self.current_queue_idx != curr_idx:
+                    break
+                if 0 <= idx < total:
+                    track = tracks[idx]
+                    if not self.cache_mgr.track_is_cached(track):
+                        target_path = self.cache_mgr.get_track_cache_path(track, "opus")
+                        self.downloader.download_track(track, target_path)
+                        downloaded_something = True
+                        break
+
+            # Enforce sliding window pruning with 30MB limit
+            self.cache_mgr.prune_window(curr_idx, tracks)
+
+            if not downloaded_something:
+                time.sleep(0.35)
+
+    def _expand_radio_queue(self) -> None:
+        """Fetch additional radio recommendations when approaching queue end."""
+        if self._fetching_radio or not self.queue_tracks:
+            return
+        self._fetching_radio = True
+        seed_track = self.queue_tracks[-1]
+
+        def worker():
+            try:
+                radio_tracks = self.client.get_watch_playlist_tracks(seed_track.id, limit=25)
+                if radio_tracks:
+                    existing_ids = {t.id for t in self.queue_tracks}
+                    filtered = [t for t in radio_tracks if t.id not in existing_ids]
+                    if filtered:
+                        self.queue_tracks.extend(filtered)
+                        if self.dj_player:
+                            self.dj_player.append_tracks(filtered)
+                        if self.current_tab == TAB_QUEUE:
+                            self.items = list(self.queue_tracks)
+                        self._update_next_track()
+            finally:
+                self._fetching_radio = False
+
+        threading.Thread(target=worker, daemon=True, name="ytstr-radio-expand").start()
 
     def _on_dj_track_change(self, idx: int, track: Track, transition: str = "") -> None:
         """Callback from DJ engine when a new track boundary is reached."""
@@ -536,16 +656,15 @@ class TUIApp:
                 self.items = tracks
                 self.selected_idx = 0
                 self.scroll_offset = 0
-                self.status_msg = f"Opened '{title}' ({len(tracks)} tracks). Press Enter to play track, Backspace to exit."
+                self.status_msg = f"Viewing playlist: '{title}' ({len(tracks)} tracks)"
             else:
-                self.status_msg = f"Could not load tracks for '{title}'."
-                self.in_playlist_name = None
-                self.items = self.playlist_back_items
+                self.items = []
+                self.status_msg = f"No tracks found in '{title}'."
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _exit_playlist_view(self) -> None:
-        """Return from playlist track list to playlist view."""
+        """Return from playlist drill-down view back to top-level playlists."""
         if self.playlist_back_items:
             self.items = self.playlist_back_items
             self.selected_idx = self.playlist_back_selected
@@ -605,7 +724,7 @@ class TUIApp:
 
         # If removing the currently playing track, tell mpv to skip to next
         if target_idx == self.current_queue_idx:
-            if self.dj_player:
+            if self.dj_player and self.mode_idx in (1, 3):
                 self.dj_player.skip_to_next = True
             elif self.ipc:
                 self.ipc.playlist_next()
@@ -638,157 +757,167 @@ class TUIApp:
             return
         item = self.items[self.selected_idx]
         if isinstance(item, Track):
-            self.status_msg = f"Downloading '{item.display_title()}' to ~/Music..."
+            music_dir = os.path.expanduser("~/Music")
+            os.makedirs(music_dir, exist_ok=True)
+            target = os.path.join(music_dir, f"{item.display_title()}.opus")
+            self.status_msg = f"Downloading '{item.display_title()[:25]}' to ~/Music..."
 
             def worker():
-                save_dir = os.path.expanduser("~/Music")
-                os.makedirs(save_dir, exist_ok=True)
-                target = os.path.join(save_dir, f"{item.title}.opus")
                 ok = self.downloader.download_track(item, target)
-                self.status_msg = f"Saved '{item.title}' to ~/Music" if ok else f"Failed to save '{item.title}'"
+                self.status_msg = f"✓ Saved to ~/Music/{item.display_title()[:20]}.opus" if ok else f"✗ Failed downloading '{item.display_title()[:20]}'"
 
             threading.Thread(target=worker, daemon=True).start()
 
     def _prompt_search(self) -> None:
-        """Open curses line-input prompt to search YouTube Music."""
+        """Prompt user for query in footer and fetch catalog search results."""
         curses.echo()
         curses.curs_set(1)
         max_y, max_x = self.stdscr.getmaxyx()
-        self.stdscr.addstr(max_y - 1, 0, " " * (max_x - 1))
-        self.stdscr.addstr(max_y - 1, 0, "🔍 Search YouTube Music: ", curses.A_BOLD | curses.color_pair(5))
+        prompt = "Search YouTube Music: "
+        self.stdscr.addstr(max_y - 1, 0, " " * (max_x - 1), curses.color_pair(6))
+        self.stdscr.addstr(max_y - 1, 0, prompt, curses.color_pair(5) | curses.A_BOLD)
         self.stdscr.refresh()
 
         try:
-            query_bytes = self.stdscr.getstr(max_y - 1, 25, 60)
-            query = query_bytes.decode("utf-8").strip()
+            inp = self.stdscr.getstr(max_y - 1, len(prompt), 60).decode("utf-8").strip()
         except Exception:
-            query = ""
+            inp = ""
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
 
-        curses.noecho()
-        curses.curs_set(0)
+        if not inp:
+            self.status_msg = "Search canceled."
+            return
 
-        if query:
-            self.search_query = query
-            self._switch_tab(TAB_SEARCH)
-            self.is_loading = True
-            self.loading_text = f"Searching for '{query}'..."
-
-            def worker():
-                results = self.client.search(query, limit=25)
-                self.is_loading = False
-                self.search_results = results
-                if self.current_tab == TAB_SEARCH:
-                    self.items = list(results)
-                    self.selected_idx = 0
-                    self.scroll_offset = 0
-                    self.status_msg = f"Found {len(results)} search results for '{query}'."
-
-            threading.Thread(target=worker, daemon=True).start()
-        else:
-            self.status_msg = "Search cancelled."
-
-    def _build_login_items(self) -> None:
-        """Populate items for account tab."""
-        is_auth = self.auth_mgr.is_authenticated()
-        self.items = [
-            {"title": "⚡ 1-Click Auto-Detect Login (Zen, Chrome, Firefox...)", "action": "auto_login", "desc": "Imports session cookies from installed browser profiles automatically"},
-            {"title": "🦊 1-Click Zen Browser Login", "action": "zen_login", "desc": "Directly extract authenticated YouTube cookies from Zen profile"},
-            {"title": "🌐 Open https://music.youtube.com in Browser", "action": "open_browser", "desc": "Launch browser so you can log into your Google Account"},
-        ]
-        if is_auth:
-            self.items.append({"title": "🚪 Log Out / Clear Saved Credentials", "action": "logout", "desc": "Delete cached headers and reset to anonymous session"})
-
-    def _run_browser_login_async(self, browser_name: str) -> None:
-        """Run browser cookie extraction in background."""
+        self.search_query = inp
+        self.current_tab = TAB_SEARCH
         self.is_loading = True
-        self.loading_text = f"Importing session cookies ({browser_name})..."
+        self.loading_text = f"Searching catalog for '{inp}'..."
+        self.status_msg = self.loading_text
 
         def worker():
-            ok = self.auth_mgr.setup_from_browser(browser_name)
+            tracks = self.client.search(inp, filter_type="songs", limit=30)
             self.is_loading = False
-            if ok:
-                self.client._init_ytm()
-                self.status_msg = "Successfully authenticated with YouTube Music! Reloading library..."
-                self.fetch_recommended_async()
-                self.fetch_playlists_async()
-            else:
-                self.status_msg = f"Could not extract cookies from {browser_name}. Ensure you are logged into YouTube in that browser."
+            self.search_results = tracks
+            if self.current_tab == TAB_SEARCH:
+                self.items = list(tracks)
+                self.selected_idx = 0
+                self.scroll_offset = 0
+            self.status_msg = f"Search '{inp}': found {len(tracks)} tracks."
 
         threading.Thread(target=worker, daemon=True).start()
 
     def fetch_recommended_async(self) -> None:
-        """Fetch personalized home feed sections."""
+        """Background worker to fetch personalized Home sections."""
         self.is_loading = True
         self.loading_text = "Fetching personalized recommendations..."
 
         def worker():
-            sections = self.client.get_personalized_feed()
+            sections = self.client.get_home_sections(limit=6)
             self.is_loading = False
-            if sections:
-                self.recommended_sections = sections
-                if self.current_tab == TAB_RECOMMENDED:
-                    self._rebuild_items_from_sections(sections)
-                    self.status_msg = f"Loaded {len(sections)} personalized sections."
-            else:
-                self.status_msg = "Could not fetch recommendations. Check your network or login."
+            self.recommended_sections = sections
+            if self.current_tab == TAB_RECOMMENDED:
+                self._rebuild_items_from_sections(sections)
+                self.status_msg = "Loaded personalized recommendations."
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _rebuild_items_from_sections(self, sections: List[Dict[str, Any]]) -> None:
-        """Flatten nested feed sections into item list."""
+        """Flatten categorized sections into scrollable list with visual category headers."""
         flattened: List[Any] = []
         for sec in sections:
-            title = sec.get("title", "Section")
-            items = sec.get("items", [])
-            if items:
-                flattened.append({"type": "section_header", "title": title})
-                flattened.extend(items)
+            flattened.append({"type": "section_header", "title": sec["title"]})
+            flattened.extend(sec["contents"])
         self.items = flattened
-        self.selected_idx = 1 if len(flattened) > 1 else 0
+        self.selected_idx = 0
+        self.scroll_offset = 0
 
     def fetch_playlists_async(self) -> None:
-        """Fetch user playlists from YouTube Music."""
+        """Background worker to fetch user playlists + local saved playlists."""
         self.is_loading = True
-        self.loading_text = "Fetching library playlists..."
+        self.loading_text = "Fetching your playlists..."
 
         def worker():
-            playlists = self.client.get_user_playlists()
+            pls = self.client.get_user_playlists()
             self.is_loading = False
-            self.my_playlists = playlists
-            if self.current_tab == TAB_PLAYLISTS:
-                self.items = list(playlists)
-                self.status_msg = f"Loaded {len(playlists)} library playlists."
+            self.my_playlists = pls
+            if self.current_tab == TAB_PLAYLISTS and not self.in_playlist_name:
+                self.items = list(pls)
+                self.selected_idx = 0
+                self.scroll_offset = 0
+                self.status_msg = f"Loaded {len(pls)} user playlists."
 
         threading.Thread(target=worker, daemon=True).start()
 
     def fetch_liked_async(self) -> None:
-        """Fetch user liked songs."""
+        """Background worker to fetch Liked Songs library."""
         self.is_loading = True
-        self.loading_text = "Fetching Liked Songs..."
+        self.loading_text = "Fetching Liked Songs library..."
 
         def worker():
-            tracks = self.client.get_liked_songs(limit=100)
+            liked = self.client.get_liked_songs(limit=100)
             self.is_loading = False
-            self.liked_tracks = tracks
+            self.liked_tracks = liked
             if self.current_tab == TAB_LIKED:
-                self.items = list(tracks)
-                self.status_msg = f"Loaded {len(tracks)} liked tracks."
+                self.items = list(liked)
+                self.selected_idx = 0
+                self.scroll_offset = 0
+                self.status_msg = f"Loaded {len(liked)} Liked Songs."
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_login_items(self) -> None:
+        """Populate Account tab with interactive authentication actions."""
+        logged_in = self.auth_mgr.is_authenticated()
+        status_desc = "Session Authenticated (Full Access)" if logged_in else "Anonymous Mode (Public Catalog Only)"
+        items = [
+            {"action": "status", "title": "Current Status", "desc": status_desc},
+            {"action": "auto_login", "title": "Auto-Detect Session Cookies", "desc": "Scan Zen, Firefox, Chrome, Chromium & Brave"},
+            {"action": "zen_login", "title": "Zen Browser Session Import", "desc": "Import cookies directly from active Zen Browser profile"},
+            {"action": "open_browser", "title": "Open YouTube Music in Browser", "desc": "Launch browser to sign in to your Google Account"},
+        ]
+        if logged_in:
+            items.append({"action": "logout", "title": "Log Out", "desc": "Clear stored session credentials and reset client"})
+        self.items = items
+        self.selected_idx = 1 if not logged_in else 0
+        self.scroll_offset = 0
+
+    def _run_browser_login_async(self, browser_mode: str) -> None:
+        """Background worker to extract cookies from specified browser."""
+        self.is_loading = True
+        self.loading_text = "Scanning browsers for YouTube Music authentication cookies..."
+
+        def worker():
+            if browser_mode == "zen":
+                ok = self.auth_mgr.login_from_zen()
+            else:
+                ok = self.auth_mgr.login_from_browser()
+
+            self.is_loading = False
+            if ok:
+                self.client._init_ytm()
+                self.status_msg = "✓ Authentication successful! Personalized access enabled."
+                self.fetch_recommended_async()
+            else:
+                self.status_msg = "✗ Could not extract session cookies. Ensure you are signed in at music.youtube.com."
+            if self.current_tab == TAB_LOGIN:
+                self._build_login_items()
 
         threading.Thread(target=worker, daemon=True).start()
 
     def toggle_pause(self) -> None:
-        """Toggle play/pause state across direct and DJ engines."""
-        if self.dj_player:
+        """Toggle playback pause state across either Direct MPV or Auto-DJ player."""
+        if self.dj_player and self.mode_idx in (1, 3):
             self.dj_player.toggle_pause = True
-            self.is_paused = not self.is_paused
-            self.status_msg = "Paused." if self.is_paused else "Resumed."
-        elif self.ipc and os.path.exists(SOCKET_PATH):
+        elif self.ipc:
             self.ipc.cycle_pause()
-            self.is_paused = not self.is_paused
-            self.status_msg = "Paused." if self.is_paused else "Resumed."
+        self.is_paused = not self.is_paused
+        state_str = "Paused" if self.is_paused else "Resumed"
+        self.status_msg = f"Playback {state_str}."
 
     def stop_playback(self, keep_queue: bool = False) -> None:
-        """Stop audio playback and clean up active engines."""
+        """Cleanly tear down MPV player or DJPlayer without corrupting the terminal."""
         if self.dj_player:
             try:
                 self.dj_player.stop()
@@ -796,7 +925,7 @@ class TUIApp:
                 pass
             self.dj_player = None
 
-        if self.ipc and os.path.exists(SOCKET_PATH):
+        if self.ipc:
             try:
                 self.ipc.stop()
                 self.ipc.close()
@@ -830,12 +959,12 @@ class TUIApp:
 
         if self.dj_player and self.mode_idx in (1, 3):
             st = self.dj_player.get_playback_status()
-            self.time_pos = st["time_pos"]
-            self.duration = st["duration"]
-            self.is_paused = st["is_paused"]
-            if st["track"]:
+            self.time_pos = st.get("time_pos", 0.0)
+            self.duration = st.get("duration", 0.0)
+            self.is_paused = st.get("paused", False)
+            if st.get("track"):
                 self.now_playing = st["track"].display_title()
-                self.current_queue_idx = st["index"]
+                self.current_queue_idx = st.get("playing_idx", self.current_queue_idx)
                 self._update_next_track()
                 if st.get("transition"):
                     self.status_msg = f"▶ Playing: {self.now_playing} | 🎛️ Auto-DJ: {st['transition']}"
@@ -845,33 +974,31 @@ class TUIApp:
 
         # Direct MPV mode
         try:
-            pt = self.ipc.get_property("time-pos")
-            if pt is not None and not isinstance(pt, (int, float, str)):
-                pt = None
+            pt = self.ipc.get_float_property("playback-time")
+            if pt is None:
+                pt = self.ipc.get_float_property("time-pos")
             if pt is not None:
-                self.time_pos = max(0.0, float(pt))
+                self.time_pos = max(0.0, pt)
 
-            dur = self.ipc.get_property("duration")
-            if dur is not None and not isinstance(dur, (int, float, str)):
-                dur = None
-            if dur is not None:
-                d_val = float(dur)
-                if d_val > 0:
-                    self.duration = d_val
+            dur = self.ipc.get_float_property("duration")
+            if dur is not None and dur > 0:
+                self.duration = dur
 
-            p = self.ipc.get_property("pause")
-            if p is not None and isinstance(p, bool):
+            p = self.ipc.get_bool_property("pause")
+            if p is not None:
                 self.is_paused = p
 
-            pos = self.ipc.get_property("playlist-pos")
-            if pos is not None and isinstance(pos, int):
-                if pos >= 0 and pos != self.current_queue_idx and pos < len(self.queue_tracks):
-                    self.current_queue_idx = pos
-                    current_track = self.queue_tracks[pos]
-                    self.now_playing = current_track.display_title()
-                    self._update_next_track()
-                    if self.current_tab == TAB_QUEUE:
-                        self.items = list(self.queue_tracks)
+            # Check if track ended
+            eof = self.ipc.get_bool_property("eof-reached", default=False)
+            idle = self.ipc.get_bool_property("idle-active", default=False)
+            if self.time_pos > 0.5 and (eof or idle):
+                next_idx = self.current_queue_idx + 1
+                if next_idx < len(self.queue_tracks):
+                    self.cache_mgr.on_track_finished(self.current_queue_idx, self.queue_tracks[self.current_queue_idx])
+                    self._play_direct_track_at_index(next_idx)
+                    self.status_msg = f"▶ Playing: {self.now_playing}"
+                else:
+                    self.status_msg = "Queue ended."
         except Exception:
             pass
 
@@ -886,7 +1013,7 @@ class TUIApp:
                     self.status_msg = f"🎛️ Auto-DJ handoff: Transitioning to {next_track.display_title()}..."
                     self.stop_playback(keep_queue=True)
                     self.current_queue_idx = next_idx
-                    self.play_track_and_start_radio(next_track, existing_queue=self.queue_tracks[next_idx:])
+                    self.play_track_and_start_radio(next_track, existing_queue=self.queue_tracks, start_idx=next_idx)
         except Exception:
             pass
 

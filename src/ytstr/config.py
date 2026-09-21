@@ -23,6 +23,11 @@ CHUNK_DURATION_SEC = 30.0
 MAX_BUFFER_AHEAD_SEC = 25.0
 MAX_PREFETCH_TRACKS = 2  # Strict boundary on forward prefetch to bound disk/memory
 
+# Hysteresis Streaming Thresholds
+STREAM_CHUNK_SEC: float = 6.0
+LOW_WATERMARK_SEC: float = 8.0
+HIGH_WATERMARK_SEC: float = 22.0
+
 # ANSI Terminal Colors
 RED = "\033[0;31m"
 GREEN = "\033[0;32m"

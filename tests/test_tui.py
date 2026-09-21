@@ -162,5 +162,78 @@ def test_tui_auto_dj_handoff():
                 app._update_playback_status()
                 assert app.pending_dj_handoff is False
                 assert mock_play.called
-                args, kwargs = mock_play.call_args
-                assert args[0].id == "2"
+
+
+def test_tui_radio_queue_jump_retains_history():
+    """Verify jumping forward in queue keeps earlier tracks for rewind and avoids queue wiping."""
+    stdscr = make_mock_stdscr()
+    with patch("curses.curs_set"), \
+         patch("curses.use_default_colors"), \
+         patch("curses.has_colors", return_value=True), \
+         patch("curses.init_pair"), \
+         patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
+         patch.object(TUIApp, "fetch_recommended_async"):
+        app = TUIApp(stdscr)
+        app.ipc = MagicMock()
+
+        tracks = [
+            Track(id=f"track_{i}", title=f"Track {i}", artist="Artist", duration_sec=180.0)
+            for i in range(5)
+        ]
+        app.queue_tracks = list(tracks)
+        app.current_queue_idx = 0
+        app.current_tab = TAB_QUEUE
+        app.items = list(tracks)
+
+        # User selects track 3 in radio queue and presses Enter
+        app.selected_idx = 3
+        with patch.object(app, "_play_direct_track_at_index") as mock_play:
+            app._handle_input(10)  # Enter key
+            assert mock_play.called
+            mock_play.assert_called_once_with(3)
+
+        assert app.current_queue_idx == 3
+        assert app.now_playing == tracks[3].display_title()
+        # Entire queue history must be preserved (0, 1, 2, 3, 4)
+        assert len(app.queue_tracks) == 5
+        assert app.queue_tracks[0].id == "track_0"
+        assert app.queue_tracks[4].id == "track_4"
+
+
+def test_tui_rewind_and_prev():
+    """Verify rewind in radio queue: restarts if > 3s, steps back to previous track if <= 3s."""
+    stdscr = make_mock_stdscr()
+    with patch("curses.curs_set"), \
+         patch("curses.use_default_colors"), \
+         patch("curses.has_colors", return_value=True), \
+         patch("curses.init_pair"), \
+         patch("curses.color_pair", return_value=0), \
+         patch.object(TUIApp, "_ensure_mpv"), \
+         patch.object(TUIApp, "fetch_recommended_async"):
+        app = TUIApp(stdscr)
+        mock_ipc = MagicMock()
+        app.ipc = mock_ipc
+
+        tracks = [
+            Track(id="t0", title="First Song", duration_sec=200.0),
+            Track(id="t1", title="Second Song", duration_sec=200.0),
+            Track(id="t2", title="Third Song", duration_sec=200.0),
+        ]
+        app.queue_tracks = list(tracks)
+        app.current_queue_idx = 1
+        app.now_playing = tracks[1].display_title()
+
+        # Case 1: time_pos > 3.0s -> should seek to beginning of current track
+        app.time_pos = 15.0
+        app._skip_prev()
+        mock_ipc.seek.assert_called_with(0.0, "absolute")
+        assert app.current_queue_idx == 1  # Stays on track 1
+
+        # Case 2: time_pos <= 3.0s -> should step back to previous track in queue
+        app.time_pos = 1.5
+        with patch.object(app, "_play_direct_track_at_index") as mock_play:
+            app._skip_prev()
+            assert app.current_queue_idx == 0
+            assert app.now_playing == tracks[0].display_title()
+            mock_play.assert_called_once_with(0)

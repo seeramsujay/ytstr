@@ -12,6 +12,6 @@ uv run pyinstaller --onefile --name ytstr \
     --collect-all pynput \
     src/ytstr/__main__.py
 
-cp dist/ytstr ./ytstr
+cp --remove-destination dist/ytstr ./ytstr
 chmod +x ./ytstr
 echo "✓ Standalone binary generated at: $(pwd)/ytstr ($(du -h ./ytstr | cut -f1))"
