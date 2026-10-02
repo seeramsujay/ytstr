@@ -8,6 +8,8 @@ import time
 import tty
 from typing import Any, Callable, Optional
 
+from ytstr.config import global_media_keys_enabled
+
 try:
     from pynput import keyboard
 except ImportError:
@@ -41,7 +43,7 @@ class KeyboardListener:
 
     def start(self):
         """Start listening for key events."""
-        if keyboard is not None:
+        if keyboard is not None and global_media_keys_enabled():
             self._start_global_listener()
 
         self._run_tty_loop()

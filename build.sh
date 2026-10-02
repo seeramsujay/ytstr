@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Build Standalone Linux Executable for ytstr
+# Build Standalone Executable for ytstr (Linux ELF & macOS Mach-O)
 # ==============================================================================
 set -e
 
@@ -12,6 +12,7 @@ uv run pyinstaller --onefile --name ytstr \
     --collect-all pynput \
     src/ytstr/__main__.py
 
-cp --remove-destination dist/ytstr ./ytstr
+rm -f ./ytstr
+cp dist/ytstr ./ytstr
 chmod +x ./ytstr
 echo "✓ Standalone binary generated at: $(pwd)/ytstr ($(du -h ./ytstr | cut -f1))"

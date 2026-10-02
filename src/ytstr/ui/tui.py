@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from ytstr.config import DEFAULT_CROSSFADE_SEC, PLAYLIST_FILE, VERSION
+from ytstr.config import DEFAULT_CROSSFADE_SEC, PLAYLIST_FILE, VERSION, global_media_keys_enabled
 from ytstr.core.types import Track
 from ytstr.downloader.cache import CacheManager
 from ytstr.downloader.ytdlp import Downloader
@@ -123,6 +123,19 @@ class TUIApp:
             pass
         curses.use_default_colors()
         self.stdscr.timeout(200)
+        self.stdscr.keypad(True)
+        if curses.has_colors():
+            try:
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_RED, -1)     # Accent / logo / headers
+                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Selected row
+                curses.init_pair(3, curses.COLOR_GREEN, -1)   # Green / playing
+                curses.init_pair(4, curses.COLOR_CYAN, -1)    # Playlists
+                curses.init_pair(5, curses.COLOR_YELLOW, -1)  # Warnings / prompts
+                curses.init_pair(6, curses.COLOR_WHITE, -1)   # Normal text
+            except Exception:
+                pass
 
     @property
     def active_engine(self) -> str:
@@ -146,17 +159,6 @@ class TUIApp:
             return self.dj_player.ipc
         return self.ipc
 
-        if curses.has_colors():
-            try:
-                curses.init_pair(1, curses.COLOR_RED, -1)     # Accent / logo / headers
-                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Selected row
-                curses.init_pair(3, curses.COLOR_GREEN, -1)   # Green / playing
-                curses.init_pair(4, curses.COLOR_CYAN, -1)    # Playlists
-                curses.init_pair(5, curses.COLOR_YELLOW, -1)  # Warnings / prompts
-                curses.init_pair(6, curses.COLOR_WHITE, -1)   # Normal text
-            except Exception:
-                pass
-
     def _ensure_mpv(self, raw_pcm_mode: bool = False) -> None:
         """Ensure background MPV process is active and listening on IPC socket."""
         if self.mpv_process and self.mpv_process.poll() is None:
@@ -168,8 +170,12 @@ class TUIApp:
             pass
 
     def _start_global_media_listener(self) -> None:
-        """Intercept hardware keyboard media keys (Play/Pause, Next, Prev, Volume)."""
-        if not pynput_keyboard:
+        """Intercept hardware keyboard media keys (Play/Pause, Next, Prev, Volume).
+
+        Only enabled on Linux (or when explicitly opted in), since pynput's
+        listener aborts the process on macOS and cannot capture its media keys.
+        """
+        if not pynput_keyboard or not global_media_keys_enabled():
             return
 
         def on_press(key):
@@ -220,9 +226,45 @@ class TUIApp:
 
     def _handle_navigation_keys(self, ch: int) -> bool:
         """Handle screen navigation, scrolling, and tab switching."""
-        # Back navigation from playlist drill-down: Backspace, Esc, or 'h'
-        if self.in_playlist_name and ch in (127, 8, 27, ord('h'), ord('H'), curses.KEY_BACKSPACE):
+        # Check for escape sequences like Shift-Tab (\x1b[Z)
+        if ch == 27:
+            try:
+                self.stdscr.nodelay(True)
+                ch2 = self.stdscr.getch()
+                if ch2 == ord('['):
+                    ch3 = self.stdscr.getch()
+                    if ch3 == ord('Z'):  # Back-tab (Shift+Tab)
+                        self._switch_tab((self.current_tab - 1) % len(TAB_NAMES))
+                        return True
+            except curses.error:
+                pass
+            finally:
+                try:
+                    self.stdscr.nodelay(False)
+                    self.stdscr.timeout(200)
+                except Exception:
+                    pass
+
+            if self.in_playlist_name:
+                self._exit_playlist_view()
+                return True
+
+        # Back navigation from playlist drill-down: Backspace or 'h'
+        if self.in_playlist_name and ch in (127, 8, ord('h'), ord('H'), curses.KEY_BACKSPACE):
             self._exit_playlist_view()
+            return True
+
+        # Tab key switching: Tab advances, Shift+Tab retreats
+        if ch in (9, ord('\t')):
+            self._switch_tab((self.current_tab + 1) % len(TAB_NAMES))
+            return True
+        if ch in (getattr(curses, 'KEY_BTAB', 353), 353):
+            self._switch_tab((self.current_tab - 1) % len(TAB_NAMES))
+            return True
+
+        # Direct queue shortcut ('u' / 'U' as documented in README)
+        if ch in (ord('u'), ord('U')):
+            self._switch_tab(TAB_QUEUE)
             return True
 
         # Tab switching (1-6)
@@ -1289,7 +1331,7 @@ class TUIApp:
     def _draw_footer(self, max_y: int, max_x: int) -> None:
         """Render keybindings footer bar."""
         footer_y = max_y - 1
-        footer_str = " [Enter] Play/Drill  [Space] Pause  [←/→] Seek  [>/<] Skip  [d] Drop  [r] Radio  [m] Mode  [/] Search  [q] Quit "
+        footer_str = " [Tab/1-6] Tabs  [Enter] Play/Drill  [Space] Pause  [←/→] Seek  [>/<] Skip  [d] Drop  [r] Radio  [m] Mode  [/] Search  [q] Quit "
         self.stdscr.addstr(footer_y, 0, footer_str[:max_x - 1], curses.A_REVERSE | curses.color_pair(4))
 
     def _render_progress_bar(self, width: int = 20) -> str:

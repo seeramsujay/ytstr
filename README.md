@@ -25,7 +25,7 @@
 
 ## ✨ Overview
 
-`ytstr` delivers an uncompromising audio experience right from the Linux terminal:
+`ytstr` delivers an uncompromising audio experience right from your **macOS or Linux** terminal:
 - **Ultra-Low Resource Footprint**: Engineered with strict memory boundaries (< 30 MB peak RAM) using direct MPV IPC streaming, zero unnecessary disk churn, and bounded sliding-window caches.
 - **Interactive Curses TUI**: Effortlessly browse personalized YouTube Music feeds, library playlists, liked songs, live continuous radio queues, and search directly inside a rich terminal interface.
 - **1-Click Browser Authentication**: Seamlessly authenticates with your active YouTube Music account from **Zen Browser**, **Firefox**, **Chrome**, **Brave**, **LibreWolf**, or **Edge**—no manual cookie exports or header pasting required.

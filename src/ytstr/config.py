@@ -2,7 +2,13 @@
 Configuration, constant paths, and terminal styling parameters for ytstr.
 """
 import os
+import platform
 from pathlib import Path
+
+# Ensure standard package manager binary directories are on PATH (especially on macOS)
+for _bin_path in ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", os.path.expanduser("~/.local/bin")]:
+    if os.path.isdir(_bin_path) and _bin_path not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = f"{_bin_path}{os.pathsep}{os.environ.get('PATH', '')}"
 
 # Application Metadata
 APP_NAME = "ytstr"
@@ -38,6 +44,23 @@ CYAN = "\033[0;36m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 NC = "\033[0m"
+
+
+def global_media_keys_enabled() -> bool:
+    """
+    Whether hardware media-key interception via pynput is safe to enable.
+
+    pynput's global keyboard listener is only reliable on Linux. On macOS the
+    media keys are reserved by the system "Now Playing" center and creating a
+    pynput listener aborts the process, so it is disabled by default.
+    Override explicitly with YTSTR_MEDIA_KEYS=1 (enable) or =0 (disable).
+    """
+    override = os.environ.get("YTSTR_MEDIA_KEYS", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return platform.system() == "Linux"
 
 
 def ensure_config_dir() -> Path:

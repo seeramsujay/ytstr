@@ -2,7 +2,9 @@
 Unit tests for persistent, thread-safe MPV IPC Client.
 """
 import json
+import os
 import socket
+import tempfile
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -60,7 +62,10 @@ def test_mpv_ipc_high_level_controls():
 
 
 def test_mpv_ipc_real_unix_socket_request_matching(tmp_path):
-    sock_path = str(tmp_path / "test_mpv.sock")
+    # macOS treats tmp_path (deep inside /private/var/folders) as too long for
+    # sun_path (104 bytes), so use a short-lived directory at the OS tmp root.
+    short_tmp = tempfile.mkdtemp(prefix="ytstr_test_", dir="/tmp")
+    sock_path = os.path.join(short_tmp, "mpv.sock")
 
     # Mock server handling mpv json-ipc protocol
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

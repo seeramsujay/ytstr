@@ -28,7 +28,8 @@ def test_tui_initialization():
     with patch("curses.curs_set"), \
          patch("curses.use_default_colors"), \
          patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
+         patch("curses.start_color"), \
+         patch("curses.init_pair") as mock_init_pair, \
          patch("curses.color_pair", return_value=0), \
          patch.object(TUIApp, "_ensure_mpv"), \
          patch.object(TUIApp, "fetch_recommended_async"):
@@ -38,6 +39,8 @@ def test_tui_initialization():
         assert app.mode_idx == 0
         assert app.selected_idx == 0
         assert app.now_playing is None
+        assert stdscr.keypad.called
+        assert mock_init_pair.call_count >= 6
 
 
 def test_tui_navigation_and_modes():
@@ -45,6 +48,7 @@ def test_tui_navigation_and_modes():
     with patch("curses.curs_set"), \
          patch("curses.use_default_colors"), \
          patch("curses.has_colors", return_value=True), \
+         patch("curses.start_color"), \
          patch("curses.init_pair"), \
          patch("curses.color_pair", return_value=0), \
          patch.object(TUIApp, "_ensure_mpv"), \
@@ -53,7 +57,30 @@ def test_tui_navigation_and_modes():
          patch.object(TUIApp, "fetch_liked_async"):
         app = TUIApp(stdscr)
 
-        # Tab switching
+        # Tab key switching (9 / ord('\t'))
+        assert app.current_tab == TAB_RECOMMENDED  # 0
+        app._handle_input(9)  # Tab -> Playlists (1)
+        assert app.current_tab == TAB_PLAYLISTS
+        app._handle_input(ord('\t'))  # Tab -> Liked (2)
+        assert app.current_tab == TAB_LIKED
+
+        # Shift+Tab key switching (KEY_BTAB / 353)
+        app._handle_input(curses.KEY_BTAB if hasattr(curses, "KEY_BTAB") else 353)
+        assert app.current_tab == TAB_PLAYLISTS
+        app._handle_input(353)
+        assert app.current_tab == TAB_RECOMMENDED
+        app._handle_input(353)  # Wraps around backwards to Account (5)
+        assert app.current_tab == TAB_LOGIN
+
+        # Tab wrapping around forward to Recommended (0)
+        app._handle_input(9)
+        assert app.current_tab == TAB_RECOMMENDED
+
+        # Direct queue shortcut 'u' / 'U'
+        app._handle_input(ord('u'))
+        assert app.current_tab == TAB_QUEUE
+
+        # Number key Tab switching
         app._handle_input(ord('2'))
         assert app.current_tab == TAB_PLAYLISTS
 
@@ -66,6 +93,13 @@ def test_tui_navigation_and_modes():
         app._handle_input(ord('6'))
         assert app.current_tab == TAB_LOGIN
         assert len(app.items) >= 3
+
+        # Shift-Tab escape sequence (\x1b [ Z)
+        stdscr.getch.side_effect = [ord('['), ord('Z')]
+        app._handle_input(27)
+        assert app.current_tab == TAB_SEARCH
+        stdscr.getch.side_effect = None
+        stdscr.getch.return_value = -1
 
         # Cycle playback mode
         prev_mode = app.mode_idx

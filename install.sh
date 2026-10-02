@@ -88,19 +88,17 @@ uv sync --quiet --all-extras
 mkdir -p "$HOME/.local/bin"
 
 # CLI launcher
-cat << 'EOF' > "$HOME/.local/bin/ytstr"
+cat << EOF > "$HOME/.local/bin/ytstr"
 #!/usr/bin/env bash
-exec uv --directory "$SOURCE_DIR_PLACEHOLDER" run ytstr "$@"
+exec uv --directory "$SOURCE_DIR" run ytstr "\$@"
 EOF
-sed -i "s|\$SOURCE_DIR_PLACEHOLDER|$SOURCE_DIR|g" "$HOME/.local/bin/ytstr"
 chmod +x "$HOME/.local/bin/ytstr"
 
 # TUI launcher
-cat << 'EOF' > "$HOME/.local/bin/ytstr-tui"
+cat << EOF > "$HOME/.local/bin/ytstr-tui"
 #!/usr/bin/env bash
-exec uv --directory "$SOURCE_DIR_PLACEHOLDER" run ytstr-tui "$@"
+exec uv --directory "$SOURCE_DIR" run ytstr-tui "\$@"
 EOF
-sed -i "s|\$SOURCE_DIR_PLACEHOLDER|$SOURCE_DIR|g" "$HOME/.local/bin/ytstr-tui"
 chmod +x "$HOME/.local/bin/ytstr-tui"
 
 # Backward compatibility launcher
@@ -109,16 +107,28 @@ ln -sf "$HOME/.local/bin/ytstr-tui" "$HOME/.local/bin/ytstr-gui"
 # 6. Automatically Add ~/.local/bin to PATH in Shell Configs
 ADDED_TO_PROFILE=false
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+IS_MACOS=false
+[ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
 
-# List candidate shell rc / profile files
+# List candidate shell rc / profile files (prefer zsh on macOS)
 SHELL_FILES=()
-[ -f "$HOME/.bashrc" ] && SHELL_FILES+=("$HOME/.bashrc")
-[ -f "$HOME/.zshrc" ] && SHELL_FILES+=("$HOME/.zshrc")
-[ -f "$HOME/.profile" ] && SHELL_FILES+=("$HOME/.profile")
+if [ "$IS_MACOS" = true ]; then
+    [ -f "$HOME/.zshrc" ] && SHELL_FILES+=("$HOME/.zshrc")
+    [ -f "$HOME/.profile" ] && SHELL_FILES+=("$HOME/.profile")
+    [ -f "$HOME/.bash_profile" ] && SHELL_FILES+=("$HOME/.bash_profile")
+else
+    [ -f "$HOME/.bashrc" ] && SHELL_FILES+=("$HOME/.bashrc")
+    [ -f "$HOME/.zshrc" ] && SHELL_FILES+=("$HOME/.zshrc")
+    [ -f "$HOME/.profile" ] && SHELL_FILES+=("$HOME/.profile")
+fi
 
-# If no standard shell rc files exist, default to creating ~/.bashrc
+# If no standard shell rc files exist, create the current platform's default
 if [ ${#SHELL_FILES[@]} -eq 0 ]; then
-    SHELL_FILES=("$HOME/.bashrc")
+    if [ "$IS_MACOS" = true ]; then
+        SHELL_FILES=("$HOME/.zshrc")
+    else
+        SHELL_FILES=("$HOME/.bashrc")
+    fi
 fi
 
 for rc in "${SHELL_FILES[@]}"; do
@@ -131,8 +141,11 @@ for rc in "${SHELL_FILES[@]}"; do
     fi
 done
 
+SOURCE_HINT="$HOME/.bashrc"
+[ "$IS_MACOS" = true ] && SOURCE_HINT="$HOME/.zshrc"
+
 if [ "$ADDED_TO_PROFILE" = true ]; then
-    echo -e "${CYAN}→ Run: ${BOLD}source ~/.bashrc${NC}${CYAN} (or restart your terminal) to update PATH in current session.${NC}"
+    echo -e "${CYAN}→ Run: ${BOLD}source $SOURCE_HINT${NC}${CYAN} (or restart your terminal) to update PATH in current session.${NC}"
 fi
 
 # 7. Verify Installation

@@ -3,6 +3,8 @@ Authentication management for YouTube Music (Automatic Browser Extraction, Brows
 """
 import json
 import os
+import platform
+import subprocess
 import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -35,22 +37,30 @@ AUTH_COOKIE_KEYS = {
 }
 
 # Custom profile roots for Firefox forks like Zen Browser, Floorp, LibreWolf, Waterfox
+# (Linux, Flatpak, and macOS profile locations — macOS stores profiles under
+# ~/Library/Application Support/<browser>)
 FIREFOX_FORKS: Dict[str, List[str]] = {
     "zen": [
         os.path.expanduser("~/.zen"),
         os.path.expanduser("~/.var/app/app.zen_browser.zen/.zen"),
         os.path.expanduser("~/.config/zen"),
+        os.path.expanduser("~/Library/Application Support/zen"),
+        os.path.expanduser("~/Library/Application Support/Zen Browser"),
+        os.path.expanduser("~/Library/Application Support/Zen"),
     ],
     "librewolf": [
         os.path.expanduser("~/.librewolf"),
         os.path.expanduser("~/.var/app/io.gitlab.librewolf-community/.librewolf"),
+        os.path.expanduser("~/Library/Application Support/LibreWolf"),
     ],
     "floorp": [
         os.path.expanduser("~/.floorp"),
         os.path.expanduser("~/.var/app/one.ablaze.floorp/.floorp"),
+        os.path.expanduser("~/Library/Application Support/Floorp"),
     ],
     "waterfox": [
         os.path.expanduser("~/.waterfox"),
+        os.path.expanduser("~/Library/Application Support/Waterfox"),
     ],
 }
 
@@ -59,6 +69,7 @@ CANDIDATE_BROWSERS = [
     "firefox",
     "chrome",
     "brave",
+    "safari",
     "edge",
     "chromium",
     "opera",
@@ -67,6 +78,22 @@ CANDIDATE_BROWSERS = [
     "floorp",
     "waterfox",
 ]
+
+# Native macOS application bundle names for browsers
+MACOS_BROWSER_APPS: Dict[str, List[str]] = {
+    "zen": ["Zen", "Zen Browser"],
+    "safari": ["Safari"],
+    "chrome": ["Google Chrome"],
+    "firefox": ["Firefox"],
+    "brave": ["Brave Browser"],
+    "edge": ["Microsoft Edge"],
+    "arc": ["Arc"],
+    "opera": ["Opera"],
+    "vivaldi": ["Vivaldi"],
+    "librewolf": ["LibreWolf"],
+    "floorp": ["Floorp"],
+    "waterfox": ["Waterfox"],
+}
 
 
 class AuthManager:
@@ -97,9 +124,66 @@ class AuthManager:
             return str(self.auth_path)
         return None
 
-    def open_browser_for_login(self, url: str = "https://music.youtube.com") -> bool:
-        """Open default system browser to YouTube Music login page."""
+    def open_browser_for_login(
+        self,
+        browser_name: str = "auto",
+        url: str = "https://music.youtube.com",
+    ) -> bool:
+        """
+        Open specified or default system browser to YouTube Music login page.
+        Supports native macOS app launching ('open -a <app> <url>'), Linux desktop tools,
+        and stdlib webbrowser fallback.
+        """
+        # Support argument order flexibility: open_browser_for_login(url) or open_browser_for_login(browser, url)
+        if browser_name.startswith("http://") or browser_name.startswith("https://"):
+            url, browser_name = browser_name, "auto"
+
+        b_key = browser_name.lower().strip()
+
+        # macOS native app opening
+        if platform.system() == "Darwin":
+            if b_key in MACOS_BROWSER_APPS:
+                for app_name in MACOS_BROWSER_APPS[b_key]:
+                    try:
+                        res = subprocess.run(
+                            ["open", "-a", app_name, url],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        if res.returncode == 0:
+                            return True
+                    except Exception:
+                        pass
+
+            # Fallback to default browser on macOS
+            try:
+                res = subprocess.run(
+                    ["open", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if res.returncode == 0:
+                    return True
+            except Exception:
+                pass
+
+        # Linux direct binary or xdg-open
+        if platform.system() == "Linux" and b_key != "auto":
+            try:
+                subprocess.Popen([b_key, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                pass
+
+        # Standard library webbrowser fallback
         try:
+            if b_key != "auto":
+                try:
+                    controller = webbrowser.get(b_key)
+                    if controller.open(url, new=2):
+                        return True
+                except Exception:
+                    pass
             return webbrowser.open(url, new=2)
         except Exception:
             return False
@@ -180,6 +264,15 @@ class AuthManager:
 
                 return True, f"Successfully logged in from {b.capitalize()}!"
 
+            except PermissionError as pe:
+                if b == "safari":
+                    last_err = (
+                        "Safari: Access to Safari cookies requires Full Disk Access on macOS. "
+                        "Go to System Settings > Privacy & Security > Full Disk Access and add your terminal application."
+                    )
+                else:
+                    last_err = f"{b.capitalize()}: {pe}"
+                continue
             except Exception as e:
                 last_err = f"{b.capitalize()}: {e}"
                 continue
@@ -187,10 +280,20 @@ class AuthManager:
         if b_name == "auto":
             return (
                 False,
-                "No active YouTube session found across installed browsers (Zen, Firefox, Chrome, Brave, Edge, etc.). "
+                "No active YouTube session found across installed browsers (Zen, Safari, Firefox, Chrome, Brave, Edge, etc.). "
                 "Please sign in to https://music.youtube.com in your browser, then re-run: ytstr --login",
             )
         return False, last_err or f"Could not extract cookies from {browser_name.capitalize()}."
+
+    def login_from_zen(self) -> bool:
+        """Compatibility wrapper: import session cookies from Zen Browser."""
+        ok, _ = self.import_cookies_from_browser("zen")
+        return ok
+
+    def login_from_browser(self, browser_name: str = "auto") -> bool:
+        """Compatibility wrapper: import session cookies from specified browser."""
+        ok, _ = self.import_cookies_from_browser(browser_name)
+        return ok
 
     def setup_from_browser(self, browser_name: str = "auto") -> bool:
         """
