@@ -12,7 +12,7 @@ import socket
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +255,16 @@ class MPVIPCClient:
         """Stop playback immediately."""
         res = self.send_command(["stop"])
         return bool(res and res.get("error") == "success")
+
+
+def wait_for_socket(ipc_socket: str, timeout: float = 3.0) -> bool:
+    """Block until mpv has created its IPC socket (or timeout elapses)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(ipc_socket):
+            return True
+        time.sleep(0.05)
+    return os.path.exists(ipc_socket)
 
 
 def spawn_mpv_process(

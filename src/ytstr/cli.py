@@ -6,7 +6,7 @@ import os
 import sys
 from typing import Optional
 
-from ytstr.config import GREEN, NC, VERSION, YELLOW
+from ytstr.config import GREEN, NC, VERSION
 from ytstr.core.player import YtstrCoordinator
 from ytstr.core.playlist import add_playlist, parse_playlists, remove_playlist
 from ytstr.core.types import PlaybackMode
@@ -79,8 +79,8 @@ def main(argv: Optional[list] = None) -> int:
     if args.login:
         browser_choice = args.login
         info(f"Connecting to YouTube Music via browser ({browser_choice})...")
-        auth_mgr.open_browser_for_login()
-        info("Default browser opened to https://music.youtube.com. Attempting session extraction...")
+        auth_mgr.open_browser_for_login(browser_choice)
+        info("Browser opened to https://music.youtube.com. Attempting session extraction...")
         ok, msg = auth_mgr.import_cookies_from_browser(browser_choice)
         if ok:
             success(f"✓ {msg}")
@@ -90,7 +90,7 @@ def main(argv: Optional[list] = None) -> int:
             info("Make sure you are logged into YouTube in your browser, then re-run: ytstr --login")
             return 1
 
-    if args.tui or args.gui or (not args.target and not args.list and not args.add and not args.remove):
+    if args.tui or args.gui or (not args.target and not args.list and not args.add and args.remove is None):
         try:
             from ytstr.ui.tui import main as run_tui
             mode_idx = 0

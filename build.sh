@@ -5,7 +5,7 @@
 set -e
 
 echo "→ Building standalone binary ./ytstr..."
-uv run pyinstaller --onefile --name ytstr \
+uv run --with pyinstaller pyinstaller --onefile --name ytstr \
     --paths src \
     --collect-all ytmusicapi \
     --collect-all yt_dlp \

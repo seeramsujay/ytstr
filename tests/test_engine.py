@@ -2,7 +2,7 @@
 Unit tests for spectral DecisionEngine feature analysis and decision rules.
 """
 from pydub import AudioSegment
-from pydub.generators import Sine, WhiteNoise
+from pydub.generators import Sine
 
 from ytstr.audio.engine import DecisionEngine
 

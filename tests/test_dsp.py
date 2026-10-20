@@ -2,7 +2,6 @@
 Unit tests for audio DSP mathematical functions and processing curves.
 """
 import math
-import pytest
 from pydub import AudioSegment
 from pydub.generators import Sine
 

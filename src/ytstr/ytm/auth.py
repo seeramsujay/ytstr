@@ -9,7 +9,7 @@ import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from yt_dlp.cookies import YDLLogger, _extract_firefox_cookies, extract_cookies_from_browser
+from yt_dlp.cookies import extract_cookies_from_browser
 import ytmusicapi
 from ytmusicapi.auth.browser import initialize_headers
 
@@ -213,7 +213,8 @@ class AuthManager:
                     for search_dir in FIREFOX_FORKS[b]:
                         if os.path.exists(search_dir):
                             try:
-                                cookie_jar = _extract_firefox_cookies(search_dir, None, YDLLogger())
+                                # A filesystem path as profile makes yt-dlp search that root
+                                cookie_jar = extract_cookies_from_browser("firefox", profile=search_dir)
                                 if cookie_jar and len(cookie_jar) > 0:
                                     break
                             except Exception:
@@ -231,12 +232,12 @@ class AuthManager:
                 for cookie in cookie_jar:
                     domain = getattr(cookie, "domain", "")
                     if "google.com" in domain and "youtube.com" not in domain:
-                        if cookie.name in AUTH_COOKIE_KEYS:
+                        if cookie.name in AUTH_COOKIE_KEYS and cookie.value:
                             yt_cookies[cookie.name] = cookie.value
                 for cookie in cookie_jar:
                     domain = getattr(cookie, "domain", "")
                     if "youtube.com" in domain:
-                        if cookie.name in AUTH_COOKIE_KEYS:
+                        if cookie.name in AUTH_COOKIE_KEYS and cookie.value:
                             yt_cookies[cookie.name] = cookie.value
 
                 # Verify critical authentication cookies exist

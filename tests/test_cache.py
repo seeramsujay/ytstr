@@ -49,7 +49,7 @@ def test_cache_manager_window_retention_and_30mb_limit():
         ]
 
         # Populate cache files for tracks 0..5
-        for i, t in enumerate(tracks):
+        for t in tracks:
             path = mgr.get_track_cache_path(t, "opus")
             path.write_bytes(b"A" * 2048)
 

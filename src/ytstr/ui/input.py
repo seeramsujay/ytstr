@@ -40,6 +40,7 @@ class KeyboardListener:
         self.on_seek_backward = on_seek_backward
 
         self._running = True
+        self._global_listener: Any = None
 
     def start(self):
         """Start listening for key events."""
@@ -49,6 +50,8 @@ class KeyboardListener:
         self._run_tty_loop()
 
     def _start_global_listener(self):
+        assert keyboard is not None
+
         def on_press(key: Any):
             if not self._running:
                 return False
@@ -67,11 +70,11 @@ class KeyboardListener:
                 pass
 
         try:
-            listener = keyboard.Listener(on_press=on_press)
-            listener.daemon = True
-            listener.start()
+            self._global_listener = keyboard.Listener(on_press=on_press)
+            self._global_listener.daemon = True
+            self._global_listener.start()
         except Exception:
-            pass
+            self._global_listener = None
 
     def _run_tty_loop(self):
         if not sys.stdin.isatty():
@@ -87,7 +90,7 @@ class KeyboardListener:
                 r, _, _ = select.select([sys.stdin], [], [], 0.3)
                 if r:
                     ch = sys.stdin.read(1)
-                    if ch == "":  # Escape sequence for arrow keys
+                    if ch == "\x1b":  # Escape sequence for arrow keys
                         seq = sys.stdin.read(2)
                         if seq == "[C":  # Right Arrow
                             if self.on_seek_forward:
@@ -120,3 +123,9 @@ class KeyboardListener:
 
     def stop(self):
         self._running = False
+        if self._global_listener is not None:
+            try:
+                self._global_listener.stop()
+            except Exception:
+                pass
+            self._global_listener = None

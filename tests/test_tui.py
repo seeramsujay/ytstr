@@ -314,6 +314,8 @@ def test_tui_playback_modes_and_live_switching():
         # In Mode 2 (Direct Stream), play track must fetch direct URL with no disk caching
         with patch.object(app.downloader, "get_direct_stream_url", return_value="https://googlevideo.com/stream"):
             app._play_direct_track_at_index(1)
+            # Stream URL resolution runs off the UI thread
+            app._loader_thread.join(timeout=2.0)
             mock_ipc.load_file.assert_called_with("https://googlevideo.com/stream", mode="replace")
 
         # Mode switch to Mode 3 (Auto-DJ Spectral)

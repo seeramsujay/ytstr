@@ -1,7 +1,7 @@
 """
 Unit tests for CLI argument routing and command execution.
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from ytstr.cli import main
 
 

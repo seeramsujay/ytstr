@@ -4,7 +4,7 @@ Unit tests for YouTube Music client, authentication, and parsing.
 from http.cookiejar import Cookie
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from ytstr.core.types import Track
 from ytstr.ytm.auth import AuthManager

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import subprocess
 import threading
 import time
@@ -114,11 +113,24 @@ class DJPlayer:
                 return True
         return False
 
+    def remove_current_track(self, index: int) -> bool:
+        """Remove the audible track at index and continue with the track that follows it."""
+        with self._lock:
+            if not 0 <= index < len(self.tracks):
+                return False
+            self.tracks.pop(index)
+            # The following track has shifted into this slot; restart the stream there
+            self.jump_to_idx = min(index, len(self.tracks))
+            return True
+
     def _launch_mpv(self) -> None:
         """Spawns an MPV instance listening for raw PCM over stdin."""
+        if self.ipc:
+            self.ipc.close()
         if self.mpv_process:
             try:
                 self.mpv_process.kill()
+                self.mpv_process.wait(timeout=1.0)
             except Exception:
                 pass
         self.mpv_process = spawn_mpv_process(self.ipc_socket, raw_pcm_mode=True)
@@ -153,10 +165,7 @@ class DJPlayer:
                 if self._quit_flag or self.jump_to_idx is not None:
                     break
                 if 0 <= idx < total_tracks:
-                    track = tracks_copy[idx]
-                    if not self.cache_mgr.track_is_cached(track):
-                        target_path = self.cache_mgr.get_track_cache_path(track, "opus")
-                        self.downloader.download_track(track, target_path)
+                    if self.cache_mgr.download_if_needed(tracks_copy[idx], self.downloader):
                         downloaded_something = True
                         break  # Yield loop to re-evaluate playing index
 
@@ -212,15 +221,10 @@ class DJPlayer:
             curr_idx = self.playing_idx
         curr_time_s = 0.0
         pending_overlap: Optional[AudioSegment] = None
+        announced_idx: Optional[int] = None
+        draining = False  # Hysteresis state: True after HIGH_WATERMARK until LOW_WATERMARK
 
         while not self._quit_flag:
-            with self._lock:
-                total_tracks = len(self.tracks)
-
-            if curr_idx >= total_tracks:
-                time.sleep(0.5)
-                continue
-
             # Process direct jump
             if self.jump_to_idx is not None:
                 with self._lock:
@@ -233,18 +237,21 @@ class DJPlayer:
                 self._precomputed_transition = None
                 self.timeline.clear()
                 self.total_written_s = 0.0
+                announced_idx = None
                 continue
 
             # Process user controls
             if self.skip_to_next:
                 self.skip_to_next = False
                 self._launch_mpv()
-                curr_idx += 1
+                with self._lock:
+                    curr_idx = min(curr_idx + 1, len(self.tracks))
                 curr_time_s = 0.0
                 pending_overlap = None
                 self._precomputed_transition = None
                 self.timeline.clear()
                 self.total_written_s = 0.0
+                announced_idx = None
                 continue
 
             if self.skip_to_prev:
@@ -256,12 +263,21 @@ class DJPlayer:
                 self._precomputed_transition = None
                 self.timeline.clear()
                 self.total_written_s = 0.0
+                announced_idx = None
                 continue
 
             if self.toggle_pause:
                 self.toggle_pause = False
                 if self.ipc:
                     self.ipc.cycle_pause()
+
+            with self._lock:
+                total_tracks = len(self.tracks)
+
+            if curr_idx >= total_tracks:
+                # End of queue: idle until radio appends tracks or the user jumps back
+                time.sleep(0.25)
+                continue
 
             # Bounded Hysteresis backpressure control: check MPV playback time
             mpv_time_s = 0.0
@@ -275,7 +291,11 @@ class DJPlayer:
 
             buffered_s = self.total_written_s - mpv_time_s
             if buffered_s > HIGH_WATERMARK_SEC:
-                # Sleep briefly and check buffer until it drops below watermark
+                draining = True
+            elif buffered_s < LOW_WATERMARK_SEC:
+                draining = False
+            if draining:
+                # Let mpv drain the buffer down to LOW_WATERMARK before writing more
                 time.sleep(0.25)
                 continue
 
@@ -286,6 +306,11 @@ class DJPlayer:
             # Wait for track file to become available in cache
             cached_file = self.cache_mgr.find_cached_file(curr_track)
             if not cached_file:
+                if self.cache_mgr.is_unavailable(curr_track):
+                    # Download repeatedly failed: skip the unplayable track
+                    curr_idx += 1
+                    curr_time_s = 0.0
+                    continue
                 time.sleep(0.15)
                 continue
 
@@ -308,12 +333,13 @@ class DJPlayer:
                     "transition": self.last_transition,
                 })
 
-            # Check if MPV playback-time reached current track to update callbacks
-            with self._lock:
-                if self.playing_idx != curr_idx:
+            # Announce each track once when streaming of it begins
+            if announced_idx != curr_idx:
+                announced_idx = curr_idx
+                with self._lock:
                     self.playing_idx = curr_idx
-                    if self.on_track_change:
-                        self.on_track_change(curr_idx, curr_track, self.last_transition)
+                if self.on_track_change:
+                    self.on_track_change(curr_idx, curr_track, self.last_transition)
 
             # Precompute upcoming transition when approaching tail (15s window)
             if not is_last and remaining_s <= 15.0:
@@ -343,6 +369,7 @@ class DJPlayer:
                     self.total_written_s += len(chunk) / 1000.0
                     del chunk
 
+                next_start_s = 0.0
                 if not is_last:
                     # Retrieve precomputed transition or compute immediately
                     if (
@@ -356,7 +383,9 @@ class DJPlayer:
                         for _ in range(60):
                             if self._quit_flag or self.skip_to_next or self.skip_to_prev or self.jump_to_idx is not None:
                                 break
-                            if next_track_to_check and self.cache_mgr.track_is_cached(next_track_to_check):
+                            if not next_track_to_check or self.cache_mgr.is_unavailable(next_track_to_check):
+                                break
+                            if self.cache_mgr.track_is_cached(next_track_to_check):
                                 break
                             time.sleep(0.1)
 
@@ -373,12 +402,9 @@ class DJPlayer:
                         # Write transition chunk seamlessly
                         self._write_pcm_to_mpv(overlap.raw_data)
                         self.total_written_s += len(overlap) / 1000.0
-                        curr_time_s = eff_fade / 1000.0
+                        # The overlap already played the head of the next track
+                        next_start_s = eff_fade / 1000.0
                         del overlap
-                    else:
-                        curr_time_s = 0.0
-
-                    gc.collect()
 
                 # Notify cache manager that track finished
                 with self._lock:
@@ -386,12 +412,12 @@ class DJPlayer:
                         self.cache_mgr.on_track_finished(curr_idx, self.tracks[curr_idx])
 
                 curr_idx += 1
-                curr_time_s = 0.0
+                curr_time_s = next_start_s
                 gc.collect()
 
-    def _write_pcm_to_mpv(self, raw_data: bytes) -> bool:
+    def _write_pcm_to_mpv(self, raw_data: Optional[bytes]) -> bool:
         """Write raw PCM byte buffer directly into MPV's stdin pipe."""
-        if not self.mpv_process or not self.mpv_process.stdin:
+        if not raw_data or not self.mpv_process or not self.mpv_process.stdin:
             return False
         try:
             self.mpv_process.stdin.write(raw_data)

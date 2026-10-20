@@ -13,7 +13,10 @@ from typing import Callable, List, Optional
 from ytstr.core.types import Track
 from ytstr.downloader.cache import CacheManager
 from ytstr.downloader.ytdlp import Downloader
-from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process
+from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process, wait_for_socket
+
+# Seconds to wait for mpv to start playing a loaded track before skipping it
+LOAD_TIMEOUT_SEC = 20.0
 
 
 class DirectPlayer:
@@ -50,6 +53,7 @@ class DirectPlayer:
     def start(self) -> threading.Thread:
         """Initialize mpv process and worker threads."""
         self.mpv_process = spawn_mpv_process(self.cache_mgr.ipc_socket, raw_pcm_mode=False)
+        wait_for_socket(self.cache_mgr.ipc_socket)
         self.ipc = MPVIPCClient(self.cache_mgr.ipc_socket)
 
         if not self.direct_stream:
@@ -90,10 +94,7 @@ class DirectPlayer:
                 if self._quit_flag or self.jump_to_idx is not None:
                     break
                 if 0 <= idx < total_tracks:
-                    track = self.tracks[idx]
-                    if not self.cache_mgr.track_is_cached(track):
-                        target_path = self.cache_mgr.get_track_cache_path(track, "opus")
-                        self.downloader.download_track(track, target_path)
+                    if self.cache_mgr.download_if_needed(self.tracks[idx], self.downloader):
                         downloaded_something = True
                         break
 
@@ -152,6 +153,7 @@ class DirectPlayer:
             # Playback monitoring loop for current track
             track_ended = False
             has_started = False
+            load_time = time.monotonic()
 
             while not self._quit_flag and not track_ended:
                 if self.jump_to_idx is not None:
@@ -184,6 +186,12 @@ class DirectPlayer:
                         has_started = True
 
                     if has_started and (eof_reached or idle_active):
+                        track_ended = True
+                        self.playing_idx += 1
+                        break
+
+                    # Unplayable track (load failure): skip instead of stalling forever
+                    if not has_started and idle_active and time.monotonic() - load_time > LOAD_TIMEOUT_SEC:
                         track_ended = True
                         self.playing_idx += 1
                         break

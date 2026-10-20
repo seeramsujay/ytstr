@@ -2,6 +2,8 @@
 Terminal UI formatting, badges, and playing banners.
 """
 import sys
+from typing import Optional
+
 from ytstr.config import BOLD, CYAN, DIM, GREEN, MAGENTA, NC, RED, YELLOW
 from ytstr.core.types import PlaybackMode, Track
 
@@ -44,7 +46,7 @@ def print_banner(version: str, mode: PlaybackMode, save_dir: str = ""):
 
 
 def print_track_card(
-    index: int, total: int, track: Track, next_track: Track = None, transition: str = ""
+    index: int, total: int, track: Track, next_track: Optional[Track] = None, transition: str = ""
 ):
     """Print standard playing track banner."""
     print(f"\n{CYAN}━━━━━━━━━━━━━━━━━━━━ PLAYING ━━━━━━━━━━━━━━━━━━━━{NC}")

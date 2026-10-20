@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
-import ytmusicapi
 from ytmusicapi import YTMusic
 
 from ytstr.core.types import Track
@@ -217,7 +216,7 @@ class YouTubeMusicClient:
 
         tracks: List[Track] = []
         try:
-            results = self._ytm.search(query, filter=filter_type, limit=limit)
+            results = self._ytm.search(query, filter=filter_type, limit=limit)  # type: ignore[arg-type]
             if isinstance(results, list):
                 for r in results:
                     if not r or not isinstance(r, dict):
@@ -229,9 +228,9 @@ class YouTubeMusicClient:
             pass
         return tracks
 
-    def search(self, query: str, limit: int = 25) -> List[Track]:
+    def search(self, query: str, filter_type: str = "songs", limit: int = 25) -> List[Track]:
         """Convenience alias for search_tracks."""
-        return self.search_tracks(query, filter_type="songs", limit=limit)
+        return self.search_tracks(query, filter_type=filter_type, limit=limit)
 
     def get_playlist_tracks(self, playlist_id: str) -> List[Track]:
         """Extract tracks from a YouTube Music playlist."""

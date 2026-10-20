@@ -1,7 +1,6 @@
 """
 Unit tests for all 8 DJ transitions and transition dispatching.
 """
-from pydub import AudioSegment
 from pydub.generators import Sine
 
 from ytstr.audio.transitions import (

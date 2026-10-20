@@ -7,19 +7,19 @@ from __future__ import annotations
 
 import curses
 import os
-import signal
 import subprocess
-import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ytstr.config import DEFAULT_CROSSFADE_SEC, PLAYLIST_FILE, VERSION, global_media_keys_enabled
+from ytstr.config import DEFAULT_CROSSFADE_SEC, VERSION, global_media_keys_enabled
+from ytstr.core.playlist import parse_playlists
 from ytstr.core.types import Track
-from ytstr.downloader.cache import CacheManager
+from ytstr.downloader.cache import CacheManager, sanitize_filename
 from ytstr.downloader.ytdlp import Downloader
 from ytstr.playback.dj_player import DJPlayer
-from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process
+from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process, wait_for_socket
 from ytstr.ytm.auth import AuthManager
 from ytstr.ytm.client import YouTubeMusicClient
 
@@ -40,6 +40,9 @@ TAB_NAMES = ["🎵 Recommended", "📁 My Playlists", "❤️ Liked Songs", "�
 
 MODES = ["--no-mix", "--light-mix", "--stream", ""]
 MODE_LABELS = ["Direct Low-RAM", "Light Mix", "Direct Stream", "Auto-DJ (Spectral)"]
+
+# Seconds to wait for mpv to start playing a loaded track before skipping it
+DIRECT_LOAD_TIMEOUT_SEC = 20.0
 
 
 class TUIApp:
@@ -80,6 +83,13 @@ class TUIApp:
         self.ipc = MPVIPCClient(SOCKET_PATH)
         self.dj_player: Optional[DJPlayer] = None
         self.pending_dj_handoff = False
+
+        # Direct-mode load tracking: tracks are resolved off the UI thread
+        self._engine_lock = threading.RLock()
+        self._load_gen = 0
+        self._loader_thread: Optional[threading.Thread] = None
+        self._direct_started = False
+        self._direct_load_time: Optional[float] = None
 
         self.now_playing: Optional[str] = None
         self.next_playing: Optional[str] = None
@@ -165,7 +175,7 @@ class TUIApp:
             return
         try:
             self.mpv_process = spawn_mpv_process(SOCKET_PATH, raw_pcm_mode=raw_pcm_mode)
-            time.sleep(0.15)
+            wait_for_socket(SOCKET_PATH)
         except Exception:
             pass
 
@@ -249,8 +259,8 @@ class TUIApp:
                 self._exit_playlist_view()
                 return True
 
-        # Back navigation from playlist drill-down: Backspace or 'h'
-        if self.in_playlist_name and ch in (127, 8, ord('h'), ord('H'), curses.KEY_BACKSPACE):
+        # Back navigation from playlist drill-down: Backspace
+        if self.in_playlist_name and ch in (127, 8, curses.KEY_BACKSPACE):
             self._exit_playlist_view()
             return True
 
@@ -311,7 +321,7 @@ class TUIApp:
         if ch in (ord('>'), ord('.'), ord('n'), ord('N')):
             self._skip_next()
             return True
-        if ch in (ord('<'), ord(','), ord('p'), ord('P')):
+        if ch in (ord('<'), ord(','), ord('p')):
             self._skip_prev()
             return True
         if ch in (ord('0'), ord('+'), ord('=')):
@@ -434,23 +444,39 @@ class TUIApp:
         self.duration = track.duration_sec
         self.time_pos = 0.0
         self._update_next_track()
+        self.active_engine = "direct"
 
-        # In Mode 2 (Direct Stream): zero-disk direct stream URL
-        if self.mode_idx == 2:
-            target = self.downloader.get_direct_stream_url(track.id) or track.web_url
-        else:
+        with self._engine_lock:
+            self._load_gen += 1
+            gen = self._load_gen
+            self._direct_started = False
+            self._direct_load_time = None
+
+        # In Mode 2 (Direct Stream) always stream; otherwise prefer the disk cache
+        if self.mode_idx != 2:
             cached = self.cache_mgr.find_cached_file(track)
             if cached and cached.exists():
-                target = str(cached)
-            else:
-                target = self.downloader.get_direct_stream_url(track.id) or track.web_url
+                self._load_direct_target(str(cached), gen)
+                return
 
-        self.active_engine = "direct"
-        self._ensure_mpv(raw_pcm_mode=False)
-        if not self.ipc:
-            self.ipc = MPVIPCClient(SOCKET_PATH)
-        if self.ipc:
+        # Resolving a stream URL hits the network: keep it off the UI thread
+        def resolve():
+            target = self.downloader.get_direct_stream_url(track.id) or track.web_url
+            self._load_direct_target(target, gen)
+
+        self._loader_thread = threading.Thread(target=resolve, daemon=True, name="ytstr-direct-resolve")
+        self._loader_thread.start()
+
+    def _load_direct_target(self, target: str, gen: int) -> None:
+        """Load a resolved file/URL into the direct mpv instance unless superseded."""
+        with self._engine_lock:
+            if gen != self._load_gen or self._quit_flag:
+                return
+            self._ensure_mpv(raw_pcm_mode=False)
+            if not self.ipc:
+                self.ipc = MPVIPCClient(SOCKET_PATH)
             self.ipc.load_file(target, mode="replace")
+            self._direct_load_time = time.monotonic()
 
     def _adjust_volume(self, delta: float) -> None:
         """Adjust mpv audio volume."""
@@ -488,10 +514,8 @@ class TUIApp:
                 def warm_up():
                     next_idx = self.current_queue_idx + 1
                     if 0 <= next_idx < len(self.queue_tracks):
-                        target_path = self.cache_mgr.get_track_cache_path(self.queue_tracks[next_idx], "opus")
-                        if not self.cache_mgr.track_is_cached(self.queue_tracks[next_idx]):
-                            self.downloader.download_track(self.queue_tracks[next_idx], target_path)
-                threading.Thread(target=warm_up, daemon=True).start()
+                        self.cache_mgr.download_if_needed(self.queue_tracks[next_idx], self.downloader)
+                threading.Thread(target=warm_up, daemon=True, name="ytstr-dj-warmup").start()
 
     def _switch_tab(self, new_tab: int) -> None:
         """Change active UI tab and load its contents if empty."""
@@ -509,7 +533,7 @@ class TUIApp:
             if not self.my_playlists:
                 self.fetch_playlists_async()
             else:
-                self.items = list(self.my_playlists)
+                self.items = list(self.my_playlists) + self._saved_playlist_items()
         elif new_tab == TAB_LIKED:
             if not self.liked_tracks:
                 self.fetch_liked_async()
@@ -576,9 +600,9 @@ class TUIApp:
             self.play_track_and_start_radio(item)
         elif isinstance(item, dict) and item.get("type") == "playlist":
             self._open_playlist_drilldown(item.get("id", ""), item.get("title", "Playlist"))
-        elif isinstance(item, tuple) and item[0] == "saved":
+        elif isinstance(item, tuple) and len(item) == 3 and item[0] == "saved":
             _, name, url = item
-            self._play_external_target(url, f"Saved: {name}")
+            self._play_external_target(url, name)
 
     def _handle_login_action(self, item: Any) -> None:
         """Execute selected authentication action."""
@@ -650,7 +674,13 @@ class TUIApp:
                 try:
                     radio_tracks = self.client.get_watch_playlist_tracks(track_id, limit=35)
                     if radio_tracks:
-                        filtered = [t for t in radio_tracks if t.id != track_id]
+                        # Dedupe so the TUI queue and DJ engine track lists stay index-aligned
+                        seen = {t.id for t in self.queue_tracks}
+                        filtered = []
+                        for t in radio_tracks:
+                            if t.id not in seen:
+                                seen.add(t.id)
+                                filtered.append(t)
                         self.queue_tracks.extend(filtered)
                         if self.dj_player:
                             self.dj_player.append_tracks(filtered)
@@ -700,10 +730,7 @@ class TUIApp:
                 if self._quit_flag or self.current_queue_idx != curr_idx:
                     break
                 if 0 <= idx < total:
-                    track = tracks[idx]
-                    if not self.cache_mgr.track_is_cached(track):
-                        target_path = self.cache_mgr.get_track_cache_path(track, "opus")
-                        self.downloader.download_track(track, target_path)
+                    if self.cache_mgr.download_if_needed(tracks[idx], self.downloader):
                         downloaded_something = True
                         break
 
@@ -820,10 +847,23 @@ class TUIApp:
             threading.Thread(target=worker, daemon=True, name="ytstr-pl-play").start()
 
     def _play_external_target(self, target: str, title: str) -> None:
-        """Fallback to direct MPV playback for custom target URLs."""
-        self._ensure_mpv(raw_pcm_mode=False)
-        if self.ipc:
-            self.ipc.load_file(target, mode="replace")
+        """Resolve a saved playlist URL / query into tracks and play it as a queue."""
+        self.status_msg = f"Loading saved playlist '{title}'..."
+
+        def worker():
+            tracks = self.downloader.fetch_playlist_tracks(target)
+            if tracks:
+                self.play_track_and_start_radio(tracks[0], existing_queue=tracks)
+                self.status_msg = f"▶ Playing '{title}' ({len(tracks)} tracks queued)"
+            else:
+                self.status_msg = f"Could not load saved playlist '{title}'."
+
+        threading.Thread(target=worker, daemon=True, name="ytstr-saved-play").start()
+
+    @staticmethod
+    def _saved_playlist_items() -> List[Tuple[str, str, str]]:
+        """Locally saved playlists (ytstr --add) as ("saved", name, url) items."""
+        return [("saved", p["name"], p["url"]) for p in parse_playlists()]
 
     def _remove_selected_from_queue(self) -> None:
         """Remove/skip selected song from upcoming radio queue."""
@@ -845,20 +885,23 @@ class TUIApp:
         removed_track = self.queue_tracks[target_idx]
         title = removed_track.display_title()
 
-        if self.dj_player:
-            self.dj_player.remove_track(target_idx)
-
-        # If removing the currently playing track, tell mpv to skip to next
         if target_idx == self.current_queue_idx:
-            if self.dj_player and self.mode_idx in (1, 3):
-                self.dj_player.skip_to_next = True
-            elif self.ipc:
-                self.ipc.playlist_next()
+            # Removing the playing track: drop it and continue with the one that follows
             del self.queue_tracks[target_idx]
+            if self.active_engine == "dj" and self.dj_player:
+                self.dj_player.remove_current_track(target_idx)
+            elif target_idx < len(self.queue_tracks):
+                self._play_direct_track_at_index(target_idx)
+            else:
+                self.stop_playback(keep_queue=True)
+                self.now_playing = None
             self.status_msg = f"Removed currently playing '{title[:25]}' and advanced."
+        elif target_idx < self.current_queue_idx and self.active_engine == "dj":
+            self.status_msg = "Cannot remove already-played tracks while Auto-DJ is mixing."
+            return
         else:
-            if self.ipc and not self.dj_player:
-                self.ipc.playlist_remove(target_idx)
+            if self.dj_player:
+                self.dj_player.remove_track(target_idx)
             del self.queue_tracks[target_idx]
             if target_idx < self.current_queue_idx:
                 self.current_queue_idx -= 1
@@ -883,16 +926,20 @@ class TUIApp:
             return
         item = self.items[self.selected_idx]
         if isinstance(item, Track):
-            music_dir = os.path.expanduser("~/Music")
-            os.makedirs(music_dir, exist_ok=True)
-            target = os.path.join(music_dir, f"{item.display_title()}.opus")
+            music_dir = Path(os.path.expanduser("~/Music"))
+            file_name = f"{sanitize_filename(item.display_title())}.opus"
+            target = music_dir / file_name
             self.status_msg = f"Downloading '{item.display_title()[:25]}' to ~/Music..."
 
             def worker():
-                ok = self.downloader.download_track(item, target)
-                self.status_msg = f"✓ Saved to ~/Music/{item.display_title()[:20]}.opus" if ok else f"✗ Failed downloading '{item.display_title()[:20]}'"
+                try:
+                    music_dir.mkdir(parents=True, exist_ok=True)
+                    ok = self.downloader.download_track(item, target)
+                except OSError:
+                    ok = False
+                self.status_msg = f"✓ Saved to ~/Music/{file_name}" if ok else f"✗ Failed downloading '{item.display_title()[:20]}'"
 
-            threading.Thread(target=worker, daemon=True).start()
+            threading.Thread(target=worker, daemon=True, name="ytstr-save").start()
 
     def _prompt_search(self) -> None:
         """Prompt user for query in footer and fetch catalog search results."""
@@ -989,13 +1036,14 @@ class TUIApp:
         def worker():
             try:
                 pls = self.client.get_user_playlists()
+                saved = self._saved_playlist_items()
                 self.is_loading = False
                 self.my_playlists = pls
                 if self.current_tab == TAB_PLAYLISTS and not self.in_playlist_name:
-                    self.items = list(pls)
+                    self.items = list(pls) + saved
                     self.selected_idx = 0
                     self.scroll_offset = 0
-                    self.status_msg = f"Loaded {len(pls)} user playlists."
+                    self.status_msg = f"Loaded {len(pls)} user playlists and {len(saved)} saved playlists."
             except Exception as e:
                 self.is_loading = False
                 self.status_msg = f"Failed to load playlists: {e}"
@@ -1060,7 +1108,7 @@ class TUIApp:
             if self.current_tab == TAB_LOGIN:
                 self._build_login_items()
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="ytstr-login").start()
 
     def toggle_pause(self) -> None:
         """Toggle playback pause state across either Direct MPV or Auto-DJ player."""
@@ -1074,6 +1122,26 @@ class TUIApp:
 
     def stop_playback(self, keep_queue: bool = False) -> None:
         """Cleanly tear down MPV player or DJPlayer without corrupting the terminal."""
+        with self._engine_lock:
+            # Invalidate any in-flight direct-mode load
+            self._load_gen += 1
+            self._direct_started = False
+            self._direct_load_time = None
+            self._stop_engines()
+
+        self.active_engine = "none"
+
+        if not keep_queue:
+            self.now_playing = None
+            self.next_playing = None
+            self.queue_tracks = []
+            self.current_queue_idx = -1
+            self.is_paused = False
+            self.time_pos = 0.0
+            self.duration = 0.0
+
+    def _stop_engines(self) -> None:
+        """Terminate the DJ engine and the direct mpv process."""
         if self.dj_player:
             try:
                 self.dj_player.stop()
@@ -1099,17 +1167,6 @@ class TUIApp:
                 except Exception:
                     pass
             self.mpv_process = None
-
-        self.active_engine = "none"
-
-        if not keep_queue:
-            self.now_playing = None
-            self.next_playing = None
-            self.queue_tracks = []
-            self.current_queue_idx = -1
-            self.is_paused = False
-            self.time_pos = 0.0
-            self.duration = 0.0
 
     def _update_playback_status(self) -> None:
         """Update playback time, duration, and track synchronization from MPV or DJPlayer."""
@@ -1141,32 +1198,39 @@ class TUIApp:
 
         # 2. Direct MPV active
         if self.active_engine == "direct":
-            if not self.ipc:
-                self._ensure_mpv(raw_pcm_mode=False)
-                self.ipc = MPVIPCClient(SOCKET_PATH)
+            with self._engine_lock:
+                if not self.ipc:
+                    self._ensure_mpv(raw_pcm_mode=False)
+                    self.ipc = MPVIPCClient(SOCKET_PATH)
 
             try:
-                pt = self.ipc.get_float_property("playback-time")
-                if pt is None:
-                    pt = self.ipc.get_float_property("time-pos")
-                if pt is not None:
-                    self.time_pos = max(0.0, pt)
+                # playback-time is unavailable while idle: keep the last known position then
+                pt = self.ipc.get_float_property("playback-time", default=-1.0)
+                if pt >= 0.0:
+                    self.time_pos = pt
+                    if pt > 0.5:
+                        self._direct_started = True
 
                 dur = self.ipc.get_float_property("duration")
-                if dur is not None and dur > 0:
+                if dur > 0:
                     self.duration = dur
 
-                p = self.ipc.get_bool_property("pause")
-                if p is not None:
-                    self.is_paused = p
+                self.is_paused = self.ipc.get_bool_property("pause")
 
-                # Check if track ended
+                # Check if track ended (or never started because loading failed)
                 eof = self.ipc.get_bool_property("eof-reached", default=False)
                 idle = self.ipc.get_bool_property("idle-active", default=False)
-                if self.time_pos > 0.5 and (eof or idle):
+                load_failed = (
+                    idle
+                    and not self._direct_started
+                    and self._direct_load_time is not None
+                    and time.monotonic() - self._direct_load_time > DIRECT_LOAD_TIMEOUT_SEC
+                )
+                if (self._direct_started and (eof or idle)) or load_failed:
                     next_idx = self.current_queue_idx + 1
                     if next_idx < len(self.queue_tracks):
-                        self.cache_mgr.on_track_finished(self.current_queue_idx, self.queue_tracks[self.current_queue_idx])
+                        if 0 <= self.current_queue_idx < len(self.queue_tracks):
+                            self.cache_mgr.on_track_finished(self.current_queue_idx, self.queue_tracks[self.current_queue_idx])
                         if self.mode_idx in (1, 3) or self.pending_dj_handoff:
                             self.pending_dj_handoff = False
                             next_track = self.queue_tracks[next_idx]
@@ -1288,13 +1352,14 @@ class TUIApp:
                 line_str = f"{prefix}{item.display_title()}"
                 attr = curses.color_pair(2) if is_sel else (curses.color_pair(3) if is_current else curses.color_pair(6))
             elif isinstance(item, dict) and item.get("type") == "playlist":
-                line_str = f" 📁 {item.get('title', 'Playlist')} ({item.get('count', '?')} tracks)"
+                count = item.get("count")
+                line_str = f" 📁 {item.get('title', 'Playlist')} ({count if count is not None else '?'} tracks)"
                 attr = curses.color_pair(2) if is_sel else curses.color_pair(4)
             elif isinstance(item, dict) and "action" in item:
                 line_str = f" {item.get('title', '')} — {item.get('desc', '')}"
                 attr = curses.color_pair(2) if is_sel else curses.color_pair(6)
-            elif isinstance(item, tuple) and len(item) == 2:
-                name, url = item
+            elif isinstance(item, tuple) and len(item) == 3:
+                _, name, url = item
                 line_str = f" ★ {name} ({url})"
                 attr = curses.color_pair(2) if is_sel else curses.color_pair(6)
 
@@ -1355,7 +1420,11 @@ class TUIApp:
         """Main event loop."""
         while True:
             self._update_playback_status()
-            self._draw()
+            try:
+                self._draw()
+            except curses.error:
+                # Terminal resized mid-draw or a wide glyph overflowed: redraw next tick
+                pass
 
             try:
                 ch = self.stdscr.getch()

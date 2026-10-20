@@ -3,6 +3,7 @@ Unified player coordinator connecting engines, cache, and user interfaces.
 """
 from __future__ import annotations
 
+import os
 import signal
 import sys
 from typing import List, Optional
@@ -38,7 +39,7 @@ class YtstrCoordinator:
 
         self.tracks: List[Track] = []
         self.downloader = Downloader()
-        self.cache_mgr = CacheManager(save_dir=save_dir)
+        self.cache_mgr = CacheManager(session_id=f"cli_{os.getpid()}", save_dir=save_dir)
 
         self.direct_player: Optional[DirectPlayer] = None
         self.dj_player: Optional[DJPlayer] = None
@@ -64,15 +65,19 @@ class YtstrCoordinator:
         self.stop()
         sys.exit(0)
 
-    def run(self) -> None:
-        """Fetch tracks, initialize engine, print banner, and enter playback loop."""
+    def run(self) -> int:
+        """Fetch tracks, initialize engine, print banner, and enter playback loop.
+
+        Returns:
+            Process exit code (0 on success, 1 if no tracks were found).
+        """
         info("Fetching audio tracks...")
         self.tracks = self.downloader.fetch_playlist_tracks(self.target)
 
         if not self.tracks:
             error("Could not find any tracks for target query or playlist.")
             self.cache_mgr.cleanup()
-            return
+            return 1
 
         success(f"Found {len(self.tracks)} tracks")
 
@@ -89,6 +94,7 @@ class YtstrCoordinator:
             self._start_dj_playback()
 
         self._start_keyboard_listener()
+        return 0
 
     def _on_track_change(self, idx: int, track: Track, transition: str = "") -> None:
         next_track = self.tracks[idx + 1] if idx + 1 < len(self.tracks) else None

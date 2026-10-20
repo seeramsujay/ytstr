@@ -7,10 +7,9 @@ import socket
 import tempfile
 import threading
 import time
-from unittest.mock import MagicMock, patch
-import pytest
+from unittest.mock import patch
 
-from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process
+from ytstr.playback.mpv_ipc import MPVIPCClient
 
 
 def test_mpv_ipc_typed_queries_mock():

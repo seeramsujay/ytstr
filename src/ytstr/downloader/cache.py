@@ -9,17 +9,20 @@ import logging
 import os
 import re
 import shutil
-import tempfile
+import threading
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
-from ytstr.config import CACHE_BASE_DIR, MAX_PREFETCH_TRACKS
+from ytstr.config import CACHE_BASE_DIR
 from ytstr.core.types import Track
 
 logger = logging.getLogger(__name__)
 
 # Strict 30 MB size threshold for keeping previous completed tracks in cache
 MAX_CACHE_TRACK_SIZE_BYTES: int = 30 * 1024 * 1024
+
+# Download attempts before a track is considered unplayable and skipped
+MAX_DOWNLOAD_ATTEMPTS: int = 2
 
 
 def sanitize_filename(name: str) -> str:
@@ -56,6 +59,33 @@ class CacheManager:
         self.ipc_socket = f"/tmp/ytstr_mpv_{self.session_id}.sock"
 
         self.raw_dir.mkdir(parents=True, exist_ok=True)
+
+        self._failed_attempts: Dict[str, int] = {}
+        self._failed_lock = threading.Lock()
+
+    def mark_download_failed(self, track: Track) -> None:
+        """Record a failed download attempt for a track."""
+        with self._failed_lock:
+            self._failed_attempts[track.id] = self._failed_attempts.get(track.id, 0) + 1
+
+    def is_unavailable(self, track: Track) -> bool:
+        """True if a track repeatedly failed to download and should be skipped."""
+        with self._failed_lock:
+            return self._failed_attempts.get(track.id, 0) >= MAX_DOWNLOAD_ATTEMPTS
+
+    def download_if_needed(self, track: Track, downloader) -> bool:
+        """
+        Download a track into the cache unless it is already cached or unavailable.
+
+        Returns:
+            True if a download was attempted (successful or not), False if skipped.
+        """
+        if self.track_is_cached(track) or self.is_unavailable(track):
+            return False
+        target_path = self.get_track_cache_path(track, "opus")
+        if not downloader.download_track(track, target_path):
+            self.mark_download_failed(track)
+        return True
 
     def get_track_cache_path(self, target: Union[int, str, Track], extension: str = "opus") -> Path:
         """
