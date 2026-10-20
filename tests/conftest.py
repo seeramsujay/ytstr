@@ -20,6 +20,5 @@ def _isolate_environment(tmp_path, monkeypatch):
 
     from ytstr.downloader.ytdlp import Downloader
 
-    monkeypatch.setattr(Downloader, "download_track", lambda self, track, dest_path: False)
-    monkeypatch.setattr(Downloader, "get_direct_stream_url", lambda self, video_id_or_url: None)
-    monkeypatch.setattr(Downloader, "fetch_playlist_tracks", lambda self, target: [])
+    # Every yt-dlp invocation goes through Downloader._run: make it a no-op failure
+    monkeypatch.setattr(Downloader, "_run", lambda self, args, timeout: None)

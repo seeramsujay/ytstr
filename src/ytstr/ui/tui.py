@@ -11,17 +11,19 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ytstr.config import DEFAULT_CROSSFADE_SEC, VERSION, global_media_keys_enabled
 from ytstr.core.playlist import parse_playlists
 from ytstr.core.types import Track
 from ytstr.downloader.cache import CacheManager, sanitize_filename
 from ytstr.downloader.ytdlp import Downloader
-from ytstr.playback.dj_player import DJPlayer
 from ytstr.playback.mpv_ipc import MPVIPCClient, spawn_mpv_process, wait_for_socket
 from ytstr.ytm.auth import AuthManager
 from ytstr.ytm.client import YouTubeMusicClient
+
+if TYPE_CHECKING:
+    from ytstr.playback.dj_player import DJPlayer
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -90,6 +92,8 @@ class TUIApp:
         self._loader_thread: Optional[threading.Thread] = None
         self._direct_started = False
         self._direct_load_time: Optional[float] = None
+        self._direct_mode_idx = 0  # Mode (0 or 2) the current direct track was loaded in
+        self.mix_label = ""  # Non-empty exactly while a DJ transition is audible
 
         self.now_playing: Optional[str] = None
         self.next_playing: Optional[str] = None
@@ -219,6 +223,7 @@ class TUIApp:
             except Exception:
                 pass
         self.stop_playback()
+        self.downloader.close()
         self.cache_mgr.cleanup()
         if os.path.exists(SOCKET_PATH):
             try:
@@ -445,6 +450,7 @@ class TUIApp:
         self.time_pos = 0.0
         self._update_next_track()
         self.active_engine = "direct"
+        self._direct_mode_idx = 2 if self.mode_idx == 2 else 0
 
         with self._engine_lock:
             self._load_gen += 1
@@ -496,13 +502,17 @@ class TUIApp:
             return
 
         if self.active_engine == "dj":
+            self.pending_dj_handoff = False
             if is_dj_mode:
                 if self.dj_player:
+                    self.dj_player.mix_enabled = True
                     self.dj_player.light_mix = (self.mode_idx == 1)
-                self.status_msg = f"🎛️ Switched to {mode_label}"
+                self.status_msg = f"🎛️ Switched to {mode_label}: applies from the next transition"
             else:
-                self.pending_dj_handoff = False
-                self.status_msg = f"Switched to {mode_label}: Current song continuing, switching mode on next track..."
+                if self.dj_player:
+                    # Finish the current song unmixed, then hand over to the direct player
+                    self.dj_player.mix_enabled = False
+                self.status_msg = f"Switched to {mode_label}: Current song finishes unmixed, then switches..."
         elif self.active_engine == "direct":
             if not is_dj_mode:
                 self.pending_dj_handoff = False
@@ -649,6 +659,9 @@ class TUIApp:
             self.current_queue_idx = 0
 
         if is_dj_mode:
+            # Imported on first use so the direct modes never load pydub or the DSP stack
+            from ytstr.playback.dj_player import DJPlayer
+
             is_light = (self.mode_idx == 1)
             self.active_engine = "dj"
             self.dj_player = DJPlayer(
@@ -772,8 +785,8 @@ class TUIApp:
         self.duration = track.duration_sec
         self.time_pos = 0.0
         self._update_next_track()
-        if transition:
-            self.status_msg = f"▶ Playing: {self.now_playing} | 🎛️ Auto-DJ: {transition}"
+        if transition and self.dj_player:
+            self.status_msg = f"▶ Playing: {self.now_playing} | 🎛️ {self.dj_player.mode_label}: {transition}"
         else:
             self.status_msg = f"▶ Playing: {self.now_playing}"
         if self.current_tab == TAB_QUEUE:
@@ -1130,6 +1143,7 @@ class TUIApp:
             self._stop_engines()
 
         self.active_engine = "none"
+        self.mix_label = ""
 
         if not keep_queue:
             self.now_playing = None
@@ -1179,6 +1193,9 @@ class TUIApp:
             self.time_pos = st.get("time_pos", 0.0)
             self.duration = st.get("duration", 0.0)
             self.is_paused = st.get("paused", False)
+            self.mix_label = (
+                f"🎛️ Mixing ({st.get('mode', '')}: {st.get('transition', '')})" if st.get("mixing") else ""
+            )
             if st.get("track"):
                 self.now_playing = st["track"].display_title()
                 new_idx = st.get("playing_idx", self.current_queue_idx)
@@ -1191,7 +1208,7 @@ class TUIApp:
                         self._play_direct_track_at_index(new_idx)
                         return
                 if st.get("transition"):
-                    self.status_msg = f"▶ Playing: {self.now_playing} | 🎛️ Auto-DJ: {st['transition']}"
+                    self.status_msg = f"▶ Playing: {self.now_playing} | 🎛️ {st.get('mode', 'Auto-DJ')}: {st['transition']}"
                 if self.current_tab == TAB_QUEUE:
                     self.items = list(self.queue_tracks)
             return
@@ -1282,7 +1299,7 @@ class TUIApp:
         auth_pair = curses.color_pair(3) if self.auth_mgr.is_authenticated() else curses.color_pair(5)
 
         header_left = f" ytstr v{VERSION} "
-        header_right = f"[{auth_status}]  [{MODE_LABELS[self.mode_idx]}] "
+        header_right = f"[{auth_status}]  [{self._mode_badge()}] "
 
         self.stdscr.attron(curses.A_BOLD)
         self.stdscr.addstr(0, 0, header_left, curses.color_pair(1))
@@ -1291,6 +1308,24 @@ class TUIApp:
         if len(header_right) < max_x - 30:
             self.stdscr.addstr(0, max_x - len(header_right), header_right, auth_pair)
         self.stdscr.attroff(curses.A_BOLD)
+
+    def _active_mode_label(self) -> Optional[str]:
+        """Label of the mode the audible playback is actually using (None if idle)."""
+        if self.active_engine == "dj" and self.dj_player:
+            if not self.dj_player.mix_enabled:
+                return "DJ (no mix)"
+            return MODE_LABELS[1] if self.dj_player.light_mix else MODE_LABELS[3]
+        if self.active_engine == "direct":
+            return MODE_LABELS[self._direct_mode_idx]
+        return None
+
+    def _mode_badge(self) -> str:
+        """Active mode, plus the selected mode it will switch to if they differ."""
+        selected = MODE_LABELS[self.mode_idx]
+        active = self._active_mode_label()
+        if active is None or active == selected:
+            return f"▶ {selected}" if active else selected
+        return f"▶ {active} → {selected}"
 
     def _draw_tabs(self, max_x: int) -> None:
         """Render interactive navigation tabs or breadcrumbs."""
@@ -1382,6 +1417,8 @@ class TUIApp:
             dur_fmt = self._fmt_sec(self.duration) if self.duration > 0 else "--:--"
 
             play_info = f" {state_icon}: {self.now_playing}  [{progress_bar}] {elapsed_fmt}/{dur_fmt}"
+            if self.mix_label:
+                play_info += f"  {self.mix_label}"
             if len(play_info) > max_x - 2:
                 play_info = play_info[:max_x - 5] + "..."
             self.stdscr.addstr(info_y, 0, play_info, curses.A_BOLD | curses.color_pair(3))

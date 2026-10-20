@@ -5,11 +5,96 @@ Contains equal-power fading curves, progressive filter sweeps, tape warp simulat
 and ffmpeg audio demuxing helpers.
 """
 import io
+import logging
 import math
 import subprocess
-from typing import Optional
+from typing import Callable, Optional
+
 from pydub import AudioSegment
-from pydub.effects import high_pass_filter
+from pydub.effects import high_pass_filter as _py_high_pass_filter
+from pydub.effects import low_pass_filter as _py_low_pass_filter
+
+try:
+    import audioop
+except ImportError:  # Python 3.13+ ships it via the audioop-lts package
+    import pyaudioop as audioop  # type: ignore[no-redef]
+
+logger = logging.getLogger(__name__)
+
+# Gains below this are treated as silence when building fade curves
+_SILENCE_DB = -120.0
+
+
+def ffmpeg_filter(audio: AudioSegment, filtergraph: str) -> AudioSegment:
+    """
+    Run an AudioSegment through an ffmpeg audio filtergraph in a single subprocess.
+
+    Filtering in ffmpeg (C) is orders of magnitude faster than pydub's per-sample
+    Python loops and keeps no extra copies in this process beyond input/output PCM.
+
+    Args:
+        audio: Source AudioSegment.
+        filtergraph: ffmpeg -af filtergraph (e.g. "highpass=f=250:p=1").
+
+    Returns:
+        Filtered AudioSegment with identical format.
+
+    Raises:
+        subprocess.CalledProcessError / OSError if ffmpeg fails.
+    """
+    if len(audio) == 0:
+        return audio
+    if audio.sample_width != 2:
+        audio = audio.set_sample_width(2)
+    fmt = ["-f", "s16le", "-ar", str(audio.frame_rate), "-ac", str(audio.channels)]
+    cmd = ["ffmpeg", "-v", "error", *fmt, "-i", "pipe:0", "-af", filtergraph, *fmt, "pipe:1"]
+    res = subprocess.run(cmd, input=audio.raw_data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+    return audio._spawn(res.stdout)
+
+
+def high_pass(audio: AudioSegment, cutoff_hz: float) -> AudioSegment:
+    """Single-pole high-pass filter (same response as pydub's) rendered by ffmpeg."""
+    try:
+        return ffmpeg_filter(audio, f"highpass=f={cutoff_hz}:p=1")
+    except (OSError, subprocess.CalledProcessError) as e:
+        logger.debug("ffmpeg high-pass failed, using pure-Python fallback: %s", e)
+        return _py_high_pass_filter(audio, cutoff_hz)
+
+
+def low_pass(audio: AudioSegment, cutoff_hz: float) -> AudioSegment:
+    """Single-pole low-pass filter (same response as pydub's) rendered by ffmpeg."""
+    try:
+        return ffmpeg_filter(audio, f"lowpass=f={cutoff_hz}:p=1")
+    except (OSError, subprocess.CalledProcessError) as e:
+        logger.debug("ffmpeg low-pass failed, using pure-Python fallback: %s", e)
+        return _py_low_pass_filter(audio, cutoff_hz)
+
+
+def apply_gain_curve(
+    audio: AudioSegment, gain_db_at: Callable[[int], float], grain_ms: int = 10
+) -> AudioSegment:
+    """
+    Apply a time-varying gain (in dB) in grain_ms steps with a single linear pass.
+
+    Args:
+        audio: Source AudioSegment.
+        gain_db_at: Function mapping a grain's start offset (ms) to its gain in dB.
+        grain_ms: Grain resolution in milliseconds.
+
+    Returns:
+        New AudioSegment with the gain curve applied.
+    """
+    if len(audio) == 0:
+        return audio
+    raw = audio.raw_data or b""
+    width = audio.sample_width
+    grain_bytes = max(1, int(audio.frame_rate * grain_ms / 1000)) * audio.frame_width
+    parts = []
+    for n, start in enumerate(range(0, len(raw), grain_bytes)):
+        gain_db = gain_db_at(n * grain_ms)
+        factor = 0.0 if gain_db <= _SILENCE_DB else 10 ** (gain_db / 20.0)
+        parts.append(audioop.mul(raw[start:start + grain_bytes], width, factor))
+    return audio._spawn(b"".join(parts))
 
 
 def get_audio_duration(file_path: str) -> float:
@@ -118,14 +203,11 @@ def equal_power_fade(audio: AudioSegment, duration_ms: int, is_fade_in: bool = T
     fade_audio = audio[:eff_ms] if is_fade_in else audio[-eff_ms:]
     remainder = audio[eff_ms:] if is_fade_in else audio[:-eff_ms]
 
-    faded_chunks = []
-    for i in range(0, len(fade_audio), chunk_size):
-        chunk = fade_audio[i:i + chunk_size]
+    def gain_at(i: int) -> float:
         t = i if is_fade_in else i + chunk_size
-        gain = get_equal_power_gain(t, eff_ms, is_fade_in)
-        faded_chunks.append(chunk.apply_gain(gain))
+        return get_equal_power_gain(t, eff_ms, is_fade_in)
 
-    faded_section = sum(faded_chunks) if faded_chunks else AudioSegment.empty()
+    faded_section = apply_gain_curve(fade_audio, gain_at, chunk_size)
     return (faded_section + remainder) if is_fade_in else (remainder + faded_section)
 
 
@@ -169,27 +251,26 @@ def progressive_high_pass(audio: AudioSegment, start_hz: int, end_hz: int, steps
     if step_len == 0:
         return audio
 
-    parts = []
-    for i in range(steps):
-        ratio = i / max(steps - 1, 1)
-        # Logarithmic frequency interpolation
-        cutoff = int(start_hz * (end_hz / start_hz) ** ratio)
-        cutoff = max(cutoff, 20)
-        chunk = audio[i * step_len:(i + 1) * step_len]
-        try:
-            chunk = high_pass_filter(chunk, cutoff)
-        except Exception:
-            pass
-        parts.append(chunk)
+    # Logarithmic frequency interpolation, one cutoff per step
+    cutoffs = [
+        max(int(start_hz * (end_hz / start_hz) ** (i / max(steps - 1, 1))), 20)
+        for i in range(steps)
+    ]
 
+    # Single ffmpeg pass: the filter's cutoff is retuned at each step boundary
+    commands = ";".join(
+        f"{i * step_len / 1000.0:.3f} highpass f {cutoff}" for i, cutoff in enumerate(cutoffs)
+    )
+    commands += f";{steps * step_len / 1000.0:.3f} highpass f {end_hz}"
+    try:
+        return ffmpeg_filter(audio, f"asendcmd=c='{commands}',highpass=f={cutoffs[0]}:p=1")
+    except (OSError, subprocess.CalledProcessError) as e:
+        logger.debug("ffmpeg filter sweep failed, using stepwise fallback: %s", e)
+
+    parts = [high_pass(audio[i * step_len:(i + 1) * step_len], c) for i, c in enumerate(cutoffs)]
     leftover = audio[steps * step_len:]
     if len(leftover) > 0:
-        try:
-            leftover = high_pass_filter(leftover, end_hz)
-        except Exception:
-            pass
-        parts.append(leftover)
-
+        parts.append(high_pass(leftover, end_hz))
     return sum(parts) if parts else audio
 
 

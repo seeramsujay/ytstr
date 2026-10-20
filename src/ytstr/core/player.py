@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from ytstr.config import DEFAULT_CROSSFADE_SEC, VERSION
 from ytstr.core.playlist import shuffle_tracks
@@ -14,10 +14,12 @@ from ytstr.core.types import PlaybackMode, Track
 from ytstr.downloader.cache import CacheManager
 from ytstr.downloader.ytdlp import Downloader
 from ytstr.playback.direct import DirectPlayer
-from ytstr.playback.dj_player import DJPlayer
 from ytstr.playback.mpv_ipc import MPVIPCClient
 from ytstr.ui.input import KeyboardListener
 from ytstr.ui.terminal import error, info, print_banner, print_track_card, success, warn
+
+if TYPE_CHECKING:
+    from ytstr.playback.dj_player import DJPlayer
 
 
 class YtstrCoordinator:
@@ -112,6 +114,9 @@ class YtstrCoordinator:
         self.direct_player.start()
 
     def _start_dj_playback(self) -> None:
+        # Imported here so the direct modes never load pydub or the DSP stack
+        from ytstr.playback.dj_player import DJPlayer
+
         is_light = (self.mode == PlaybackMode.LIGHT_MIX)
         self.dj_player = DJPlayer(
             tracks=self.tracks,
@@ -193,4 +198,5 @@ class YtstrCoordinator:
         if self.keyboard_listener:
             self.keyboard_listener.stop()
             self.keyboard_listener = None
+        self.downloader.close()
         self.cache_mgr.cleanup()

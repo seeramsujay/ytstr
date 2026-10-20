@@ -9,11 +9,14 @@ import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from yt_dlp.cookies import extract_cookies_from_browser
-import ytmusicapi
-from ytmusicapi.auth.browser import initialize_headers
-
 from ytstr.config import YTM_AUTH_FILE, ensure_config_dir
+
+
+def extract_cookies_from_browser(browser_name: str, profile: Optional[str] = None):
+    """Read a browser's cookie jar via yt-dlp (imported lazily: it costs ~25 MB RSS)."""
+    from yt_dlp.cookies import extract_cookies_from_browser as _extract
+
+    return _extract(browser_name, profile=profile)
 
 # Essential session & auth cookies for YouTube Music (prevents HTTP 413 Entity Too Large)
 AUTH_COOKIE_KEYS = {
@@ -251,6 +254,8 @@ class AuthManager:
                     continue
 
                 # Build clean ytmusicapi browser headers dictionary
+                from ytmusicapi.auth.browser import initialize_headers
+
                 cookie_str = "; ".join([f"{k}={v}" for k, v in yt_cookies.items()])
                 base_headers = dict(initialize_headers())
                 auth_data = {
@@ -310,6 +315,8 @@ class AuthManager:
         and save as ytmusicapi auth json.
         """
         try:
+            import ytmusicapi
+
             ytmusicapi.setup(filepath=str(self.auth_path), headers_raw=raw_headers)
             return self.is_authenticated()
         except Exception:

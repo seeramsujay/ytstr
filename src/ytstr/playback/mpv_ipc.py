@@ -5,6 +5,7 @@ automatic reconnection with backpressure recovery, and typed property queries.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import socket
 import subprocess
 import threading
 import time
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +268,50 @@ def wait_for_socket(ipc_socket: str, timeout: float = 3.0) -> bool:
     return os.path.exists(ipc_socket)
 
 
+# Options that trim mpv's memory: no Lua scripts / OSD / stats, no terminal I/O
+# (which would also compete with the TUI for keypresses) and bounded demuxer caches.
+# Names vary across mpv versions, so each is only passed if the local mpv knows it.
+LEAN_MPV_OPTIONS = [
+    "--terminal=no",
+    "--input-default-bindings=no",
+    "--load-scripts=no",
+    "--osc=no",
+    "--load-stats-overlay=no",
+    "--load-console=no",
+    "--load-osd-console=no",
+    "--load-auto-profiles=no",
+    "--load-select=no",
+    "--load-positioning=no",
+    "--load-commands=no",
+    "--audio-display=no",
+    "--demuxer-max-bytes=8MiB",
+    "--demuxer-max-back-bytes=6MiB",
+]
+
+
+@functools.lru_cache(maxsize=1)
+def supported_mpv_options() -> frozenset:
+    """Option names (without leading dashes) accepted by the installed mpv."""
+    try:
+        out = subprocess.run(
+            ["mpv", "--list-options"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10
+        ).stdout.decode("utf-8", errors="ignore")
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    return frozenset(
+        line.split()[0][2:] for line in out.splitlines() if line.startswith(" --")
+    )
+
+
+def lean_mpv_options(raw_pcm_mode: bool) -> List[str]:
+    """Memory-trimming mpv options supported by the installed mpv."""
+    supported = supported_mpv_options()
+    opts = [o for o in LEAN_MPV_OPTIONS if o[2:].split("=", 1)[0] in supported]
+    if raw_pcm_mode and "ytdl" in supported:
+        opts.append("--ytdl=no")  # PCM comes from stdin; the yt-dlp hook is never needed
+    return opts
+
+
 def spawn_mpv_process(
     ipc_socket: str,
     raw_pcm_mode: bool = False,
@@ -298,6 +343,7 @@ def spawn_mpv_process(
         f"--volume={volume}",
         "--term-osd=no",
         "--really-quiet",
+        *lean_mpv_options(raw_pcm_mode),
     ]
 
     if raw_pcm_mode:
@@ -317,6 +363,7 @@ def spawn_mpv_process(
 
     return subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,  # Never let mpv read the user's terminal
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

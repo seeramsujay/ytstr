@@ -6,8 +6,8 @@ and start of the incoming track to select the optimal transition style.
 """
 from typing import Optional, Tuple
 from pydub import AudioSegment
-from pydub.effects import high_pass_filter, low_pass_filter
 
+from ytstr.audio.dsp import high_pass, low_pass
 from ytstr.config import ANALYSIS_WINDOW_MS
 from ytstr.core.types import TransitionType
 
@@ -44,12 +44,12 @@ class DecisionEngine:
             return 0.0, 0.0, 0.0, 0.0
 
         try:
-            bass = float(low_pass_filter(chunk, 250).rms)
+            bass = float(low_pass(chunk, 250).rms)
         except Exception:
             bass = rms
 
         try:
-            treble = float(high_pass_filter(chunk, 2000).rms)
+            treble = float(high_pass(chunk, 2000).rms)
         except Exception:
             treble = rms
 

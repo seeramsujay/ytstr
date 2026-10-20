@@ -10,27 +10,75 @@ Implements all 8 transition styles:
 - Filter Wash: Resonant high-pass wash up to 2kHz (Complex outro masking)
 - Melt: Multi-tap echo dissolve with low-pass softening (Ambient, Psychedelic, Lo-Fi)
 - Tape Stop: Turntable motor warp crossfade (Universal safe fallback)
+
+Each transition receives the outgoing track's tail window (current_song) and the
+incoming track's head window (next_song) and returns (overlap, consumed_ms):
+the rendered overlap audio, and how many ms of each window it used. The caller
+plays the outgoing track up to its last consumed_ms, then the overlap, then
+resumes the incoming track at consumed_ms.
 """
 from typing import Callable, Dict, Optional, Tuple
 from pydub import AudioSegment
-from pydub.effects import high_pass_filter, low_pass_filter
 
 from ytstr.audio.dsp import (
+    apply_gain_curve,
     equal_power_fade,
     get_equal_power_gain,
+    high_pass,
+    low_pass,
     progressive_high_pass,
-    safe_clamp_fade,
     tape_start_effect,
     tape_stop_effect,
 )
 from ytstr.core.types import TransitionType
+
+CUT_IN_GUARD_MS = 15
+
+
+def _blend_ms(fade_ms: int) -> int:
+    return min(10000, max(fade_ms * 3, 6000))
+
+
+def _tape_ms(fade_ms: int) -> int:
+    return min(1500, max(fade_ms, 800))
+
+
+def transition_window_ms(trans_type: str, fade_ms: int) -> int:
+    """Length of audio each transition needs from the outgoing tail and incoming head."""
+    trans_type = str(trans_type).lower()
+    if trans_type == TransitionType.BLEND.value:
+        return _blend_ms(fade_ms)
+    if trans_type == TransitionType.CUT_IN.value:
+        return CUT_IN_GUARD_MS
+    if trans_type == TransitionType.FILTER_WASH.value:
+        return fade_ms + 2000
+    if trans_type == TransitionType.MELT.value:
+        return fade_ms + 4000
+    if trans_type == TransitionType.TAPE_STOP.value:
+        return _tape_ms(fade_ms)
+    return fade_ms  # fade, rise, bass_swap
+
+
+def max_transition_window_ms(fade_ms: int) -> int:
+    """Largest window any transition may need (tail reserve for Auto-DJ mode)."""
+    return max(transition_window_ms(t.value, fade_ms) for t in TransitionType)
+
+
+def _window(duration_ms: int, current_song: AudioSegment, next_song: AudioSegment) -> int:
+    """Clamp a transition length to the audio actually available in both windows."""
+    return max(0, min(duration_ms, len(current_song), len(next_song)))
+
+
+def ffmpeg_band(audio: AudioSegment) -> AudioSegment:
+    """1-2 kHz resonance band (2 kHz low-pass followed by 1 kHz high-pass)."""
+    return high_pass(low_pass(audio, 2000), 1000)
 
 
 def trans_fade(
     current_song: AudioSegment, next_song: AudioSegment, fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Classic equal-power sinusoidal crossfade."""
-    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    eff = _window(fade_ms, current_song, next_song)
     if eff == 0:
         return AudioSegment.empty(), 0
 
@@ -43,8 +91,7 @@ def trans_blend(
     current_song: AudioSegment, next_song: AudioSegment, fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Extended groove-lock blend (up to 10s) for steady rhythm matching."""
-    blend_ms = min(10000, max(fade_ms * 3, 6000))
-    eff = safe_clamp_fade(blend_ms, current_song, next_song)
+    eff = _window(_blend_ms(fade_ms), current_song, next_song)
     if eff == 0:
         return AudioSegment.empty(), 0
 
@@ -57,7 +104,7 @@ def trans_cut_in(
     current_song: AudioSegment, next_song: AudioSegment, _fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Immediate hard cut with 15ms anti-pop micro-fade."""
-    guard_ms = 15
+    guard_ms = CUT_IN_GUARD_MS
     if len(current_song) < guard_ms or len(next_song) < guard_ms:
         return AudioSegment.empty(), 0
 
@@ -70,22 +117,16 @@ def trans_rise(
     current_song: AudioSegment, next_song: AudioSegment, fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Equal-power crossfade combined with an active +4 dB gain swell on incoming."""
-    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    eff = _window(fade_ms, current_song, next_song)
     if eff == 0:
         return AudioSegment.empty(), 0
 
     fout = equal_power_fade(current_song[-eff:], eff, is_fade_in=False)
 
-    chunk_size = 10
-    in_audio = next_song[:eff]
-    boosted_chunks = []
-    for i in range(0, eff, chunk_size):
-        chunk = in_audio[i:i + chunk_size]
-        fade_gain = get_equal_power_gain(i, eff, is_fade_in=True)
-        swell_db = 4.0 * (i / max(eff - 1, 1))
-        boosted_chunks.append(chunk.apply_gain(fade_gain + swell_db))
+    def swell_gain(i: int) -> float:
+        return get_equal_power_gain(i, eff, is_fade_in=True) + 4.0 * (i / max(eff - 1, 1))
 
-    fin = sum(boosted_chunks) if boosted_chunks else in_audio
+    fin = apply_gain_curve(next_song[:eff], swell_gain, 10)
     return fout.overlay(fin), eff
 
 
@@ -93,17 +134,14 @@ def trans_bass_swap(
     current_song: AudioSegment, next_song: AudioSegment, fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Progressive HP sweep (80->800 Hz) on outgoing with 120 Hz LF kill on incoming."""
-    eff = safe_clamp_fade(fade_ms, current_song, next_song)
+    eff = _window(fade_ms, current_song, next_song)
     if eff == 0:
         return AudioSegment.empty(), 0
 
     out_part = progressive_high_pass(current_song[-eff:], 80, 800, steps=25)
     out_part = equal_power_fade(out_part, eff, is_fade_in=False)
 
-    try:
-        in_cleaned = high_pass_filter(next_song[:eff], 120)
-    except Exception:
-        in_cleaned = next_song[:eff]
+    in_cleaned = high_pass(next_song[:eff], 120)
 
     in_part = equal_power_fade(in_cleaned, eff, is_fade_in=True)
     return out_part.overlay(in_part), eff
@@ -113,7 +151,7 @@ def trans_filter_wash(
     current_song: AudioSegment, next_song: AudioSegment, fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Progressive HP sweep (80->2000 Hz) with 1-2 kHz resonance tracking."""
-    wash_ms = min(fade_ms + 2000, len(current_song) // 2, len(next_song) // 2)
+    wash_ms = _window(fade_ms + 2000, current_song, next_song)
     if wash_ms <= 0:
         return AudioSegment.empty(), 0
 
@@ -121,7 +159,7 @@ def trans_filter_wash(
     out_part = progressive_high_pass(raw_out, 80, 2000, steps=30)
 
     try:
-        resonance = high_pass_filter(low_pass_filter(raw_out, 2000), 1000) + 4
+        resonance = ffmpeg_band(raw_out) + 4
         half = wash_ms // 2
         silence = AudioSegment.silent(duration=half, frame_rate=raw_out.frame_rate)
         res_faded = silence + equal_power_fade(resonance[half:], wash_ms - half, is_fade_in=True)
@@ -138,7 +176,7 @@ def trans_melt(
     current_song: AudioSegment, next_song: AudioSegment, fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Multi-tap echo dissolve with 3 kHz low-pass atmospheric softening."""
-    melt_ms = min(fade_ms + 4000, len(current_song) // 2, len(next_song) // 2)
+    melt_ms = _window(fade_ms + 4000, current_song, next_song)
     if melt_ms <= 0:
         return AudioSegment.empty(), 0
 
@@ -150,10 +188,7 @@ def trans_melt(
             echo = AudioSegment.silent(duration=delay_ms) + echo[:-delay_ms]
             out_part = out_part.overlay(echo)
 
-    try:
-        out_part = low_pass_filter(out_part, 3000)
-    except Exception:
-        pass
+    out_part = low_pass(out_part, 3000)
 
     out_part = equal_power_fade(out_part, melt_ms, is_fade_in=False)
     in_part = equal_power_fade(next_song[:melt_ms], melt_ms, is_fade_in=True)
@@ -164,8 +199,7 @@ def trans_tape_stop(
     current_song: AudioSegment, next_song: AudioSegment, fade_ms: int
 ) -> Tuple[AudioSegment, int]:
     """Vinyl tape warp crossfade (outgoing winds down, incoming warps up)."""
-    short_ms = min(1500, max(fade_ms, 800))
-    eff = safe_clamp_fade(short_ms, current_song, next_song)
+    eff = _window(_tape_ms(fade_ms), current_song, next_song)
     if eff == 0:
         return AudioSegment.empty(), 0
 

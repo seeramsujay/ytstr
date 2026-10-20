@@ -11,7 +11,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/seeramsujay/ytstr?style=flat-square&color=00f5d4)](https://github.com/seeramsujay/ytstr/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square)](LICENSE)
 [![Python: >=3.9](https://img.shields.io/badge/Python->=3.9-3776ab.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![RAM Footprint: <30MB](https://img.shields.io/badge/RAM%20Peak-<30MB-brightgreen?style=flat-square&logo=speedtest&logoColor=white)](https://github.com/seeramsujay/ytstr#benchmarks)
+[![App RAM: <25MB](https://img.shields.io/badge/App%20RAM-<25MB-brightgreen?style=flat-square&logo=speedtest&logoColor=white)](https://github.com/seeramsujay/ytstr#-memory-benchmarks)
 [![Backend: mpv](https://img.shields.io/badge/Engine-Direct%20MPV-800080?style=flat-square)](https://mpv.io)
 [![Installer: One-Line](https://img.shields.io/badge/Install-1--Liner-orange?style=flat-square)](https://github.com/seeramsujay/ytstr#installation)
 
@@ -26,7 +26,7 @@
 ## ✨ Overview
 
 `ytstr` delivers an uncompromising audio experience right from your **macOS or Linux** terminal:
-- **Ultra-Low Resource Footprint**: Engineered with strict memory boundaries (< 30 MB peak RAM) using direct MPV IPC streaming, zero unnecessary disk churn, and bounded sliding-window caches.
+- **Ultra-Low Resource Footprint**: The ytstr process stays under 25 MB in every mode. yt-dlp runs in short-lived subprocesses, the DSP stack is only loaded for mixing modes, mpv runs with a trimmed configuration, and caches are bounded sliding windows.
 - **Interactive Curses TUI**: Effortlessly browse personalized YouTube Music feeds, library playlists, liked songs, live continuous radio queues, and search directly inside a rich terminal interface.
 - **1-Click Browser Authentication**: Seamlessly authenticates with your active YouTube Music account from **Zen Browser**, **Firefox**, **Chrome**, **Brave**, **LibreWolf**, or **Edge**—no manual cookie exports or header pasting required.
 - **Spectral Auto-DJ & Micro-Mixing**: An intelligent decision engine analyzing RMS, sub-bass (< 250 Hz), treble (> 2 kHz), and energy to execute 8 dynamic psychoacoustic transitions (Bass Swaps, Filter Washes, Tape Stops, Dynamic Rises, and Melts).
@@ -120,10 +120,31 @@ ytstr
 
 ## 📊 Memory Benchmarks
 
-All modes were audited with peak Resident Set Size (RSS) monitoring under continuous audio playback:
+### What each mode does
 
-| Playback Mode | Previous Architecture | **ytstr v2.1.0 (Optimized)** | Efficiency Gain |
-| :--- | :---: | :---: | :---: |
+| Mode | Audio path | Mixing | Loaded in the ytstr process |
+| :--- | :--- | :--- | :--- |
+| **Direct Low-RAM (`--no-mix`)** | mpv plays cached files directly | None: tracks play back-to-back | No DSP libraries |
+| **Direct Stream (`--stream`)** | mpv streams the audio URL; nothing written to disk | None | No DSP libraries |
+| **Light Mix (`--light-mix`)** | ytstr decodes 6 s chunks and pipes PCM to mpv | Equal-power crossfade only; never runs spectral analysis | pydub + ffmpeg filters |
+| **Auto-DJ (default)** | Same as Light Mix | Analyzes each song pair and picks 1 of 8 transitions at its natural length | pydub + ffmpeg filters |
+
+Transitions are rendered in the background about 30 s before each boundary. The outgoing song plays right up to where the overlap starts, and the incoming song resumes exactly where the overlap ends, so nothing is skipped or repeated. "Now playing" switches when the new song becomes audible, and the TUI shows `🎛️ Mixing (...)` exactly while a crossfade is audible.
+
+### Measured memory
+
+Proportional set size (PSS), Linux, mpv 0.37, continuous playback:
+
+| Mode | ytstr process (v2.1.0 before) | ytstr process (now) | mpv process | Buffer underruns (before → now) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Direct No-Mix** | 35 MB | **17 MB** | ~39 MB | 0 → 0 |
+| **Direct Stream** | 34 MB | **17 MB** | ~39 MB | 0 → 0 |
+| **Light Mix** | 38 MB | **20 MB** | ~49 MB | 100 → **0** |
+| **Auto-DJ** | 41 MB | **24 MB** | ~49 MB | 69 → **0** |
+
+Previously, each in-process download also grew the ytstr process permanently (36 → 71 MB after two songs). Now each download runs in its own yt-dlp subprocess, which uses about 60 MB for the few seconds it's active and frees all of it on exit. Spectral analysis dropped from ~22 s to ~0.6 s per transition, because the filters now run in ffmpeg instead of pure Python.
+
+--- | :---: | :---: | :---: |
 | **Direct No-Mix (`--no-mix`)** | 114.3 MB | **29.9 MB** | **-73.8% RAM** |
 | **Direct Stream (`--stream`)** | N/A | **29.6 MB** | **Zero Disk Writes** |
 | **Light Mix (`--light-mix`)** | 110.9 MB | **30.1 MB** | **-72.9% RAM** |
