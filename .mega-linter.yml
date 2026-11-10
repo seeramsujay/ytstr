@@ -1,0 +1,12 @@
+---
+# MegaLinter configuration file
+# Ref: https://megalinter.io/latest/configuration/
+APPLY_FIXES: none
+VALIDATE_ALL_CODE_BASE: true
+PRINT_ALPACA: false
+SHOW_ELAPSED_TIME: true
+
+ENABLE_LINTERS:
+  - PYTHON_BLACK
+  - PYTHON_RUFF
+  - PYTHON_FLAKE8

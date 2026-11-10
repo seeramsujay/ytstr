@@ -1,10 +1,11 @@
 """
 Unit tests for YouTube Music client, authentication, and parsing.
 """
-from http.cookiejar import Cookie
+
 import tempfile
+from http.cookiejar import Cookie
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from ytstr.core.types import Track
 from ytstr.ytm.auth import AuthManager
@@ -55,7 +56,7 @@ def test_auth_manager_browser_extraction():
         auth_file = Path(tmpdir) / "test_auth.json"
         auth = AuthManager(auth_path=auth_file)
 
-        mock_cookies = [\
+        mock_cookies = [
             make_mock_cookie("SAPISID", "valid_sapisid_token"),
             make_mock_cookie("SID", "valid_sid"),
             make_mock_cookie("__Secure-3PAPISID", "valid_secure_token"),

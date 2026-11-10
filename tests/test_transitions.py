@@ -1,7 +1,7 @@
 """
 Unit tests for all 8 DJ transitions and transition dispatching.
 """
-from pydub import AudioSegment
+
 from pydub.generators import Sine
 
 from ytstr.audio.transitions import (
@@ -26,10 +26,7 @@ def create_test_tracks(duration_ms=6000):
 
 def test_transitions_dispatch_all():
     """Verify all 8 transition keys are registered in the dispatch table."""
-    expected_keys = [
-        "fade", "blend", "cut_in", "rise", "bass_swap",
-        "filter_wash", "melt", "tape_stop"
-    ]
+    expected_keys = ["fade", "blend", "cut_in", "rise", "bass_swap", "filter_wash", "melt", "tape_stop"]
     for k in expected_keys:
         assert k in TRANSITIONS
 

@@ -57,3 +57,22 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-v --strict-markers"
 filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.black]
+line-length = 120
+target-version = ['py312']
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | node_modules
+)/
+'''
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

@@ -9,6 +9,7 @@ it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
+
 import os
 import shutil
 import sys
@@ -35,4 +36,5 @@ if src_dir not in sys.path:
 
 if __name__ == "__main__":
     from ytstr.cli import main
+
     sys.exit(main())

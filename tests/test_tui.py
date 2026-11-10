@@ -1,6 +1,7 @@
 """
 Unit tests for ytstr Terminal User Interface (TUI).
 """
+
 import curses
 from unittest.mock import MagicMock, patch
 
@@ -25,14 +26,16 @@ def make_mock_stdscr():
 
 def test_tui_initialization():
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.start_color"), \
-         patch("curses.init_pair") as mock_init_pair, \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.start_color"),
+        patch("curses.init_pair") as mock_init_pair,
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
 
         assert app.current_tab == TAB_RECOMMENDED
@@ -45,23 +48,25 @@ def test_tui_initialization():
 
 def test_tui_navigation_and_modes():
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.start_color"), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"), \
-         patch.object(TUIApp, "fetch_playlists_async"), \
-         patch.object(TUIApp, "fetch_liked_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.start_color"),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+        patch.object(TUIApp, "fetch_playlists_async"),
+        patch.object(TUIApp, "fetch_liked_async"),
+    ):
         app = TUIApp(stdscr)
 
         # Tab key switching (9 / ord('\t'))
         assert app.current_tab == TAB_RECOMMENDED  # 0
         app._handle_input(9)  # Tab -> Playlists (1)
         assert app.current_tab == TAB_PLAYLISTS
-        app._handle_input(ord('\t'))  # Tab -> Liked (2)
+        app._handle_input(ord("\t"))  # Tab -> Liked (2)
         assert app.current_tab == TAB_LIKED
 
         # Shift+Tab key switching (KEY_BTAB / 353)
@@ -77,25 +82,25 @@ def test_tui_navigation_and_modes():
         assert app.current_tab == TAB_RECOMMENDED
 
         # Direct queue shortcut 'u' / 'U'
-        app._handle_input(ord('u'))
+        app._handle_input(ord("u"))
         assert app.current_tab == TAB_QUEUE
 
         # Number key Tab switching
-        app._handle_input(ord('2'))
+        app._handle_input(ord("2"))
         assert app.current_tab == TAB_PLAYLISTS
 
-        app._handle_input(ord('3'))
+        app._handle_input(ord("3"))
         assert app.current_tab == TAB_LIKED
 
-        app._handle_input(ord('4'))
+        app._handle_input(ord("4"))
         assert app.current_tab == TAB_QUEUE
 
-        app._handle_input(ord('6'))
+        app._handle_input(ord("6"))
         assert app.current_tab == TAB_LOGIN
         assert len(app.items) >= 3
 
         # Shift-Tab escape sequence (\x1b [ Z)
-        stdscr.getch.side_effect = [ord('['), ord('Z')]
+        stdscr.getch.side_effect = [ord("["), ord("Z")]
         app._handle_input(27)
         assert app.current_tab == TAB_SEARCH
         stdscr.getch.side_effect = None
@@ -103,7 +108,7 @@ def test_tui_navigation_and_modes():
 
         # Cycle playback mode
         prev_mode = app.mode_idx
-        app._handle_input(ord('m'))
+        app._handle_input(ord("m"))
         assert app.mode_idx == (prev_mode + 1) % 4
 
         # Moving selection in list
@@ -112,21 +117,23 @@ def test_tui_navigation_and_modes():
             Track(id="2", title="Song 2", artist="Artist 2", duration_sec=200, url="http://2"),
         ]
         app.selected_idx = 0
-        app._handle_input(ord('j'))  # Down
+        app._handle_input(ord("j"))  # Down
         assert app.selected_idx == 1
-        app._handle_input(ord('k'))  # Up
+        app._handle_input(ord("k"))  # Up
         assert app.selected_idx == 0
 
 
 def test_tui_draw_no_crash():
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
         app.items = [
             Track(id="test1", title="Bohemian Rhapsody", artist="Queen", duration_sec=354, url="http://test"),
@@ -139,13 +146,15 @@ def test_tui_draw_no_crash():
 
 def test_tui_remove_from_queue():
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
         t1 = Track(id="1", title="Track 1")
         t2 = Track(id="2", title="Track 2")
@@ -157,20 +166,22 @@ def test_tui_remove_from_queue():
         app.selected_idx = 1  # Selected Track 2 (upcoming)
 
         # Press 'd' to remove Track 2
-        app._handle_input(ord('d'))
+        app._handle_input(ord("d"))
         assert len(app.queue_tracks) == 2
         assert app.queue_tracks[1].id == "3"
 
 
 def test_tui_auto_dj_handoff():
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
         app.ipc = MagicMock()
 
@@ -184,7 +195,7 @@ def test_tui_auto_dj_handoff():
         app.mode_idx = 0  # Direct Low-RAM
 
         # Cycle mode to 1 (Light Mix) -> should trigger pending_dj_handoff
-        app._handle_input(ord('m'))
+        app._handle_input(ord("m"))
         assert app.mode_idx == 1
         assert app.pending_dj_handoff is True
         assert "DJ engine warming up" in app.status_msg
@@ -201,20 +212,19 @@ def test_tui_auto_dj_handoff():
 def test_tui_radio_queue_jump_retains_history():
     """Verify jumping forward in queue keeps earlier tracks for rewind and avoids queue wiping."""
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
         app.ipc = MagicMock()
 
-        tracks = [
-            Track(id=f"track_{i}", title=f"Track {i}", artist="Artist", duration_sec=180.0)
-            for i in range(5)
-        ]
+        tracks = [Track(id=f"track_{i}", title=f"Track {i}", artist="Artist", duration_sec=180.0) for i in range(5)]
         app.queue_tracks = list(tracks)
         app.current_queue_idx = 0
         app.current_tab = TAB_QUEUE
@@ -238,13 +248,15 @@ def test_tui_radio_queue_jump_retains_history():
 def test_tui_rewind_and_prev():
     """Verify rewind in radio queue: restarts if > 3s, steps back to previous track if <= 3s."""
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
         mock_ipc = MagicMock()
         app.ipc = mock_ipc
@@ -276,13 +288,15 @@ def test_tui_rewind_and_prev():
 def test_tui_playback_modes_and_live_switching():
     """Verify cycling modes, direct stream zero-cache routing, and active_ipc behavior."""
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
         mock_ipc = MagicMock()
         app.ipc = mock_ipc
@@ -330,13 +344,15 @@ def test_tui_playback_modes_and_live_switching():
 def test_tui_rebuild_items_from_sections():
     """Verify sections with 'items' or 'contents' parse properly and don't throw KeyError."""
     stdscr = make_mock_stdscr()
-    with patch("curses.curs_set"), \
-         patch("curses.use_default_colors"), \
-         patch("curses.has_colors", return_value=True), \
-         patch("curses.init_pair"), \
-         patch("curses.color_pair", return_value=0), \
-         patch.object(TUIApp, "_ensure_mpv"), \
-         patch.object(TUIApp, "fetch_recommended_async"):
+    with (
+        patch("curses.curs_set"),
+        patch("curses.use_default_colors"),
+        patch("curses.has_colors", return_value=True),
+        patch("curses.init_pair"),
+        patch("curses.color_pair", return_value=0),
+        patch.object(TUIApp, "_ensure_mpv"),
+        patch.object(TUIApp, "fetch_recommended_async"),
+    ):
         app = TUIApp(stdscr)
 
         t1 = Track(id="track1", title="Track 1", duration_sec=180.0)

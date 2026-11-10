@@ -3,17 +3,17 @@ Thread-safe disk caching and sliding-window cache management for audio streams.
 Ensures memory safety (< 30 MB process memory) and prevents redundant network requests.
 Supports prioritized retention: active track, next 2 songs, and previous song (< 30 MB).
 """
+
 from __future__ import annotations
 
 import logging
 import os
 import re
 import shutil
-import tempfile
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 
-from ytstr.config import CACHE_BASE_DIR, MAX_PREFETCH_TRACKS
+from ytstr.config import CACHE_BASE_DIR
 from ytstr.core.types import Track
 
 logger = logging.getLogger(__name__)

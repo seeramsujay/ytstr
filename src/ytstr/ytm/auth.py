@@ -1,6 +1,7 @@
 """
 Authentication management for YouTube Music (Automatic Browser Extraction, Browser Open, and Manual Headers).
 """
+
 import json
 import os
 import platform
@@ -9,8 +10,8 @@ import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from yt_dlp.cookies import YDLLogger, _extract_firefox_cookies, extract_cookies_from_browser
 import ytmusicapi
+from yt_dlp.cookies import YDLLogger, _extract_firefox_cookies, extract_cookies_from_browser
 from ytmusicapi.auth.browser import initialize_headers
 
 from ytstr.config import YTM_AUTH_FILE, ensure_config_dir
@@ -240,10 +241,7 @@ class AuthManager:
                             yt_cookies[cookie.name] = cookie.value
 
                 # Verify critical authentication cookies exist
-                has_auth = any(
-                    k in yt_cookies
-                    for k in ["__Secure-3PAPISID", "SAPISID", "__Secure-1PAPISID", "SID"]
-                )
+                has_auth = any(k in yt_cookies for k in ["__Secure-3PAPISID", "SAPISID", "__Secure-1PAPISID", "SID"])
 
                 if not has_auth:
                     last_err = f"No active YouTube session found in {b.capitalize()}."

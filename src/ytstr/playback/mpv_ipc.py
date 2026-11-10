@@ -3,6 +3,7 @@ Resilient, high-performance MPV Unix Domain Socket IPC client and process superv
 Features persistent socket connections, thread-safe request-response multiplexing,
 automatic reconnection with backpressure recovery, and typed property queries.
 """
+
 from __future__ import annotations
 
 import json
@@ -12,7 +13,7 @@ import socket
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -291,13 +292,15 @@ def spawn_mpv_process(
     ]
 
     if raw_pcm_mode:
-        cmd.extend([
-            "--demuxer=rawaudio",
-            "--demuxer-rawaudio-format=s16le",
-            "--demuxer-rawaudio-rate=44100",
-            "--demuxer-rawaudio-channels=2",
-            "-",
-        ])
+        cmd.extend(
+            [
+                "--demuxer=rawaudio",
+                "--demuxer-rawaudio-format=s16le",
+                "--demuxer-rawaudio-rate=44100",
+                "--demuxer-rawaudio-channels=2",
+                "-",
+            ]
+        )
         return subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
