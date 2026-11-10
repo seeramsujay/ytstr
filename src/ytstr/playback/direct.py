@@ -3,6 +3,7 @@ Direct MPV playback engine for ultra-low RAM sequential playback (--no-mix & --s
 Bypasses Python audio decoding completely, achieving minimal memory footprint (< 25 MB RSS).
 Features prioritized sliding window caching, instant jump-to-index, and rewind capabilities.
 """
+
 from __future__ import annotations
 
 import subprocess

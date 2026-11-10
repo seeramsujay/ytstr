@@ -1,12 +1,14 @@
 """
 Unit tests for CacheManager bounded caching, sliding window pruning, and --save export.
 """
+
 import tempfile
 from pathlib import Path
+
 from ytstr.core.types import Track
 from ytstr.downloader.cache import (
-    CacheManager,
     MAX_CACHE_TRACK_SIZE_BYTES,
+    CacheManager,
     sanitize_filename,
 )
 
@@ -43,10 +45,7 @@ def test_cache_manager_window_retention_and_30mb_limit():
         mgr.raw_dir = Path(tmpdir) / "raw"
         mgr.raw_dir.mkdir(parents=True)
 
-        tracks = [
-            Track(id=f"track_{i}", title=f"Track {i}", artist="Artist")
-            for i in range(6)
-        ]
+        tracks = [Track(id=f"track_{i}", title=f"Track {i}", artist="Artist") for i in range(6)]
 
         # Populate cache files for tracks 0..5
         for i, t in enumerate(tracks):

@@ -3,11 +3,11 @@ Auto-DJ and Light-Mix audio player streaming raw PCM over stdin to MPV via Bound
 Features dynamic transitions, real-time volume ducking, timeline progress synchronization,
 jump-to-index support, and prioritized window caching (current, next two, previous < 30 MB).
 """
+
 from __future__ import annotations
 
 import gc
 import logging
-import os
 import subprocess
 import threading
 import time
@@ -21,7 +21,6 @@ from ytstr.audio.transitions import apply_transition
 from ytstr.config import (
     DEFAULT_CROSSFADE_SEC,
     HIGH_WATERMARK_SEC,
-    LOW_WATERMARK_SEC,
     STREAM_CHUNK_SEC,
 )
 from ytstr.core.types import Track, TransitionType
@@ -194,9 +193,7 @@ class DJPlayer:
             fade_chunk_in = get_audio_chunk(str(next_cached), 0.0, self.fade_s)
 
             if len(fade_chunk_out) > 0 and len(fade_chunk_in) > 0:
-                overlap, eff_fade = apply_transition(
-                    trans_type, fade_chunk_out, fade_chunk_in, self.crossfade_ms
-                )
+                overlap, eff_fade = apply_transition(trans_type, fade_chunk_out, fade_chunk_in, self.crossfade_ms)
                 self._precomputed_transition = (curr_idx, next_idx, overlap, eff_fade, trans_type)
         except Exception as e:
             logger.debug("Error precomputing transition: %s", e)
@@ -280,7 +277,7 @@ class DJPlayer:
                 continue
 
             with self._lock:
-                is_last = (curr_idx == len(self.tracks) - 1)
+                is_last = curr_idx == len(self.tracks) - 1
                 curr_track = self.tracks[curr_idx]
 
             # Wait for track file to become available in cache
@@ -300,13 +297,15 @@ class DJPlayer:
 
             # Record track timeline entry for accurate progress & now-playing synchronization
             if not any(entry["idx"] == curr_idx for entry in self.timeline):
-                self.timeline.append({
-                    "idx": curr_idx,
-                    "track": curr_track,
-                    "stream_start_s": self.total_written_s,
-                    "duration": track_dur_s,
-                    "transition": self.last_transition,
-                })
+                self.timeline.append(
+                    {
+                        "idx": curr_idx,
+                        "track": curr_track,
+                        "stream_start_s": self.total_written_s,
+                        "duration": track_dur_s,
+                        "transition": self.last_transition,
+                    }
+                )
 
             # Check if MPV playback-time reached current track to update callbacks
             with self._lock:
@@ -345,16 +344,18 @@ class DJPlayer:
 
                 if not is_last:
                     # Retrieve precomputed transition or compute immediately
-                    if (
-                        not self._precomputed_transition
-                        or self._precomputed_transition[0] != curr_idx
-                    ):
+                    if not self._precomputed_transition or self._precomputed_transition[0] != curr_idx:
                         with self._lock:
                             next_track_to_check = self.tracks[curr_idx + 1] if curr_idx + 1 < len(self.tracks) else None
 
                         # Ensure next track is ready
                         for _ in range(60):
-                            if self._quit_flag or self.skip_to_next or self.skip_to_prev or self.jump_to_idx is not None:
+                            if (
+                                self._quit_flag
+                                or self.skip_to_next
+                                or self.skip_to_prev
+                                or self.jump_to_idx is not None
+                            ):
                                 break
                             if next_track_to_check and self.cache_mgr.track_is_cached(next_track_to_check):
                                 break

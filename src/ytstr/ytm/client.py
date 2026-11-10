@@ -1,11 +1,12 @@
 """
 High-level YouTube Music client wrapping ytmusicapi with unified data models.
 """
+
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
-import ytmusicapi
+
 from ytmusicapi import YTMusic
 
 from ytstr.core.types import Track
@@ -104,13 +105,15 @@ class YouTubeMusicClient:
                     else:
                         pl_id = item.get("playlistId") or item.get("browseId")
                         if pl_id:
-                            items.append({
-                                "type": "playlist",
-                                "id": str(pl_id),
-                                "title": item.get("title", "Untitled Playlist"),
-                                "count": item.get("itemCount") or item.get("count"),
-                                "thumbnails": item.get("thumbnails", []),
-                            })
+                            items.append(
+                                {
+                                    "type": "playlist",
+                                    "id": str(pl_id),
+                                    "title": item.get("title", "Untitled Playlist"),
+                                    "count": item.get("itemCount") or item.get("count"),
+                                    "thumbnails": item.get("thumbnails", []),
+                                }
+                            )
                 except Exception:
                     continue
 
@@ -140,13 +143,15 @@ class YouTubeMusicClient:
                         continue
                     title = p.get("title", "Untitled Playlist")
                     count = p.get("count")
-                    playlists.append({
-                        "type": "playlist",
-                        "id": str(pl_id),
-                        "title": str(title),
-                        "count": count,
-                        "description": f"{count} tracks" if count else "Playlist",
-                    })
+                    playlists.append(
+                        {
+                            "type": "playlist",
+                            "id": str(pl_id),
+                            "title": str(title),
+                            "count": count,
+                            "description": f"{count} tracks" if count else "Playlist",
+                        }
+                    )
         except Exception:
             pass
         return playlists
@@ -195,11 +200,13 @@ class YouTubeMusicClient:
                     if not item or not isinstance(item, dict):
                         continue
                     if item.get("playlistId"):
-                        items.append({
-                            "type": "playlist",
-                            "id": item.get("playlistId"),
-                            "title": item.get("title", "Top Chart"),
-                        })
+                        items.append(
+                            {
+                                "type": "playlist",
+                                "id": item.get("playlistId"),
+                                "title": item.get("title", "Top Chart"),
+                            }
+                        )
                     else:
                         t = self._parse_item_to_track(item)
                         if t:

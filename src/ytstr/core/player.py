@@ -1,6 +1,7 @@
 """
 Unified player coordinator connecting engines, cache, and user interfaces.
 """
+
 from __future__ import annotations
 
 import signal
@@ -95,7 +96,7 @@ class YtstrCoordinator:
         print_track_card(idx, len(self.tracks), track, next_track, transition)
 
     def _start_direct_playback(self) -> None:
-        is_stream = (self.mode == PlaybackMode.STREAM)
+        is_stream = self.mode == PlaybackMode.STREAM
         self.direct_player = DirectPlayer(
             tracks=self.tracks,
             cache_manager=self.cache_mgr,
@@ -106,7 +107,7 @@ class YtstrCoordinator:
         self.direct_player.start()
 
     def _start_dj_playback(self) -> None:
-        is_light = (self.mode == PlaybackMode.LIGHT_MIX)
+        is_light = self.mode == PlaybackMode.LIGHT_MIX
         self.dj_player = DJPlayer(
             tracks=self.tracks,
             cache_manager=self.cache_mgr,

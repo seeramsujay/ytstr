@@ -1,12 +1,13 @@
 """
 Command-line interface and argument router for ytstr.
 """
+
 import argparse
 import os
 import sys
 from typing import Optional
 
-from ytstr.config import GREEN, NC, VERSION, YELLOW
+from ytstr.config import GREEN, NC, VERSION
 from ytstr.core.player import YtstrCoordinator
 from ytstr.core.playlist import add_playlist, parse_playlists, remove_playlist
 from ytstr.core.types import PlaybackMode
@@ -93,6 +94,7 @@ def main(argv: Optional[list] = None) -> int:
     if args.tui or args.gui or (not args.target and not args.list and not args.add and not args.remove):
         try:
             from ytstr.ui.tui import main as run_tui
+
             mode_idx = 0
             if args.light_mix:
                 mode_idx = 1

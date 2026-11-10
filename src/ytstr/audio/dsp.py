@@ -4,10 +4,12 @@ Digital Signal Processing (DSP) and psychoacoustic mathematical routines.
 Contains equal-power fading curves, progressive filter sweeps, tape warp simulations,
 and ffmpeg audio demuxing helpers.
 """
+
 import io
 import math
 import subprocess
 from typing import Optional
+
 from pydub import AudioSegment
 from pydub.effects import high_pass_filter
 
@@ -24,10 +26,13 @@ def get_audio_duration(file_path: str) -> float:
     """
     cmd = [
         "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        file_path
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path,
     ]
     try:
         res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8").strip()
@@ -52,15 +57,25 @@ def get_audio_chunk(file_path: str, start_s: float, duration_s: float) -> AudioS
         return AudioSegment.empty()
 
     cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        "-ss", str(max(0.0, start_s)),
-        "-t", str(duration_s),
-        "-i", file_path,
-        "-f", "wav",
-        "-acodec", "pcm_s16le",
-        "-ar", "44100",
-        "-ac", "2",
-        "pipe:1"
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-ss",
+        str(max(0.0, start_s)),
+        "-t",
+        str(duration_s),
+        "-i",
+        file_path,
+        "-f",
+        "wav",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "pipe:1",
     ]
     try:
         res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
@@ -120,7 +135,7 @@ def equal_power_fade(audio: AudioSegment, duration_ms: int, is_fade_in: bool = T
 
     faded_chunks = []
     for i in range(0, len(fade_audio), chunk_size):
-        chunk = fade_audio[i:i + chunk_size]
+        chunk = fade_audio[i : i + chunk_size]
         t = i if is_fade_in else i + chunk_size
         gain = get_equal_power_gain(t, eff_ms, is_fade_in)
         faded_chunks.append(chunk.apply_gain(gain))
@@ -175,14 +190,14 @@ def progressive_high_pass(audio: AudioSegment, start_hz: int, end_hz: int, steps
         # Logarithmic frequency interpolation
         cutoff = int(start_hz * (end_hz / start_hz) ** ratio)
         cutoff = max(cutoff, 20)
-        chunk = audio[i * step_len:(i + 1) * step_len]
+        chunk = audio[i * step_len : (i + 1) * step_len]
         try:
             chunk = high_pass_filter(chunk, cutoff)
         except Exception:
             pass
         parts.append(chunk)
 
-    leftover = audio[steps * step_len:]
+    leftover = audio[steps * step_len :]
     if len(leftover) > 0:
         try:
             leftover = high_pass_filter(leftover, end_hz)
@@ -220,21 +235,21 @@ def tape_stop_effect(audio: AudioSegment, duration_ms: int) -> AudioSegment:
 
     parts = []
     for i in range(steps):
-        chunk = tail[i * chunk_len:(i + 1) * chunk_len]
+        chunk = tail[i * chunk_len : (i + 1) * chunk_len]
         ratio = 1.0 - (i / steps) * 0.9  # 100% -> 10% speed
         new_frame_rate = max(int(chunk.frame_rate * ratio), 1000)
 
         try:
-            slowed = chunk._spawn(chunk.raw_data, overrides={
-                "frame_rate": new_frame_rate
-            }).set_frame_rate(chunk.frame_rate)
+            slowed = chunk._spawn(chunk.raw_data, overrides={"frame_rate": new_frame_rate}).set_frame_rate(
+                chunk.frame_rate
+            )
         except Exception:
             slowed = chunk
 
-        vol_drop = - (i / steps) * 15.0  # Drop up to -15dB
+        vol_drop = -(i / steps) * 15.0  # Drop up to -15dB
         parts.append(slowed + vol_drop)
 
-    leftover = tail[steps * chunk_len:]
+    leftover = tail[steps * chunk_len :]
     if len(leftover) > 0:
         parts.append(leftover - 15.0)
 
@@ -270,21 +285,21 @@ def tape_start_effect(audio: AudioSegment, duration_ms: int) -> AudioSegment:
 
     parts = []
     for i in range(steps):
-        chunk = head[i * chunk_len:(i + 1) * chunk_len]
+        chunk = head[i * chunk_len : (i + 1) * chunk_len]
         ratio = 0.1 + (i / steps) * 0.9  # 10% -> 100% speed
         new_frame_rate = max(int(chunk.frame_rate * ratio), 1000)
 
         try:
-            sped = chunk._spawn(chunk.raw_data, overrides={
-                "frame_rate": new_frame_rate
-            }).set_frame_rate(chunk.frame_rate)
+            sped = chunk._spawn(chunk.raw_data, overrides={"frame_rate": new_frame_rate}).set_frame_rate(
+                chunk.frame_rate
+            )
         except Exception:
             sped = chunk
 
         vol_boost = -15.0 * (1.0 - (i / steps))  # -15dB -> 0dB
         parts.append(sped + vol_boost)
 
-    leftover = head[steps * chunk_len:]
+    leftover = head[steps * chunk_len :]
     if len(leftover) > 0:
         parts.append(leftover)
 
@@ -313,13 +328,13 @@ def trim_to_energy(audio: AudioSegment, chunk_ms: int = 100, threshold_ratio: fl
 
     start_trim = 0
     for i in range(0, len(audio), chunk_ms):
-        if audio[i:i + chunk_ms].rms >= threshold:
+        if audio[i : i + chunk_ms].rms >= threshold:
             start_trim = max(0, i - chunk_ms)
             break
 
     end_trim = len(audio)
     for i in range(len(audio), 0, -chunk_ms):
-        if audio[i - chunk_ms:i].rms >= threshold:
+        if audio[i - chunk_ms : i].rms >= threshold:
             end_trim = min(len(audio), i + chunk_ms)
             break
 
