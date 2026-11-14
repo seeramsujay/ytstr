@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
 
       - name: MegaLinter
-        uses: oxsecurity/megalinter@v8
+        uses: oxsecurity/megalinter/cupcake@v8
         env:
           VALIDATE_ALL_CODE_BASE: true
           DEFAULT_BRANCH: master
