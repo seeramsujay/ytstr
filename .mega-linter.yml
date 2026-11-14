@@ -1,5 +1,5 @@
 # MegaLinter configuration
-VALIDATE_ALL_CODE_BASE: true
+VALIDATE_ALL_CODEBASE: true
 PRINT_ALPACA: false
 SHOW_ELAPSED_TIME: true
 FILEIO_REPORTER: false
