@@ -4,7 +4,9 @@ Spectral Energy Decision Engine for intelligent DJ transitions.
 Analyzes 5-second acoustic handoff windows at the end of the outgoing track
 and start of the incoming track to select the optimal transition style.
 """
+
 from typing import Optional, Tuple
+
 from pydub import AudioSegment
 from pydub.effects import high_pass_filter, low_pass_filter
 
@@ -54,10 +56,7 @@ class DecisionEngine:
             treble = rms
 
         window_ms = 500
-        energies = [
-            float(chunk[i:i + window_ms].rms)
-            for i in range(0, len(chunk), window_ms)
-        ]
+        energies = [float(chunk[i : i + window_ms].rms) for i in range(0, len(chunk), window_ms)]
         if len(energies) > 1:
             mean = sum(energies) / len(energies)
             variance = sum((e - mean) ** 2 for e in energies) / len(energies)
@@ -66,9 +65,7 @@ class DecisionEngine:
 
         return rms, bass, treble, variance
 
-    def select_transition(
-        self, current_song: Optional[AudioSegment], next_song: Optional[AudioSegment]
-    ) -> str:
+    def select_transition(self, current_song: Optional[AudioSegment], next_song: Optional[AudioSegment]) -> str:
         """
         Select the best-fit DJ transition style for the boundary between two tracks.
 
@@ -126,11 +123,11 @@ class DecisionEngine:
             return TransitionType.CUT_IN.value
 
         # Rule 6: Outgoing energy is erratic/chaotic -> Melt
-        if a_var > (a_rms ** 2) * 0.4:
+        if a_var > (a_rms**2) * 0.4:
             return TransitionType.MELT.value
 
         # Rule 7: Both tracks steady groove -> Blend
-        if a_var < (a_rms ** 2) * 0.08 and b_var < (b_rms ** 2) * 0.08:
+        if a_var < (a_rms**2) * 0.08 and b_var < (b_rms**2) * 0.08:
             return TransitionType.BLEND.value
 
         # Default fallback: safe equal-power crossfade

@@ -1,8 +1,10 @@
 """
 yt-dlp wrapper for metadata extraction, streaming URL resolution, and bounded downloading.
 """
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 import yt_dlp
 
 from ytstr.core.types import Track

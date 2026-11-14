@@ -1,6 +1,7 @@
 """
 Unit tests for playlist parsing, saving, adding, and removing.
 """
+
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -12,9 +13,7 @@ from ytstr.core.types import Track
 def test_parse_and_save_playlists():
     with tempfile.TemporaryDirectory() as tmpdir:
         fake_file = Path(tmpdir) / "playlists"
-        with patch("ytstr.core.playlist.PLAYLIST_FILE", fake_file), patch(
-            "ytstr.core.playlist.ensure_config_dir"
-        ):
+        with patch("ytstr.core.playlist.PLAYLIST_FILE", fake_file), patch("ytstr.core.playlist.ensure_config_dir"):
             # Save 2 playlists
             items = [
                 {"name": "Chill Beats", "url": "https://youtube.com/playlist?list=123"},

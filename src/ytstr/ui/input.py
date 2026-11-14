@@ -1,6 +1,7 @@
 """
 Terminal TTY raw keyboard listener and global media-key interception.
 """
+
 import select
 import sys
 import termios
@@ -59,9 +60,9 @@ class KeyboardListener:
                     self.on_next()
                 elif key in (keyboard.Key.media_previous, keyboard.Key.f7):
                     self.on_prev()
-                elif key == getattr(keyboard.Key, 'media_volume_up', None):
+                elif key == getattr(keyboard.Key, "media_volume_up", None):
                     self.on_volume_up()
-                elif key == getattr(keyboard.Key, 'media_volume_down', None):
+                elif key == getattr(keyboard.Key, "media_volume_down", None):
                     self.on_volume_down()
             except Exception:
                 pass

@@ -1,9 +1,11 @@
 """
 Unit tests for DJPlayer engine, bounded hysteresis, and dynamic queue management.
 """
-from unittest.mock import MagicMock, patch
+
+from unittest.mock import MagicMock
+
 from ytstr.core.types import Track
-from ytstr.playback.dj_player import DJPlayer, HIGH_WATERMARK_SEC, LOW_WATERMARK_SEC, STREAM_CHUNK_SEC
+from ytstr.playback.dj_player import HIGH_WATERMARK_SEC, LOW_WATERMARK_SEC, STREAM_CHUNK_SEC, DJPlayer
 
 
 def test_dj_player_init_and_queue_ops():
