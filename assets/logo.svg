@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160">
+  <defs>
+    <linearGradient id="ytstrGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff0055" />
+      <stop offset="50%" stop-color="#ff0000" />
+      <stop offset="100%" stop-color="#7928ca" />
+    </linearGradient>
+    <linearGradient id="barGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#ff0055" />
+      <stop offset="100%" stop-color="#00f5d4" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#ff0055" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <!-- Obsidian Dark Shell -->
+  <rect width="160" height="160" rx="36" fill="#090a0f" />
+  <rect x="2" y="2" width="156" height="156" rx="34" fill="none" stroke="#ff0055" stroke-opacity="0.2" stroke-width="2" />
+
+  <!-- Audio Stream Waveform Bars + Play Arrow Integration -->
+  <g filter="url(#glow)">
+    <!-- Equalizer Spectrum Bars (Symmetric Auto-DJ Wave) -->
+    <rect x="30" y="70" width="8" height="20" rx="4" fill="#ff0055" opacity="0.7" />
+    <rect x="44" y="52" width="8" height="56" rx="4" fill="url(#ytstrGrad)" />
+    <rect x="58" y="38" width="8" height="84" rx="4" fill="url(#barGrad)" />
+    
+    <!-- Central YouTube Stream Vector Wedge -->
+    <path d="M78 52 L116 80 L78 108 Z" fill="url(#ytstrGrad)" />
+    
+    <!-- Outer Sonic Resonance Rings -->
+    <path d="M124 64 C132 72 132 88 124 96" fill="none" stroke="#00f5d4" stroke-width="4" stroke-linecap="round" />
+    <path d="M136 54 C148 68 148 92 136 106" fill="none" stroke="#00f5d4" stroke-width="3" stroke-linecap="round" opacity="0.6" />
+  </g>
+</svg>
